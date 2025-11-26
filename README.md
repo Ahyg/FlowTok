@@ -36,6 +36,10 @@ ______
 
 We provide a training script for text-to-image (T2I) generation in [`train_flowtok.sh`](https://github.com/tacju/FlowTok/blob/main/train_flowtok.sh). 
 
+## Reproduced checkpoints
+
+We release our re-trained checkpoints for [FlowTok-XL](https://huggingface.co/turkeyju/FlowTok/blob/main/FlowTok-XL.pth), [FlowTok-H](https://huggingface.co/turkeyju/FlowTok/blob/main/FlowTok-H.pth) and [FlowTiTok-512](https://huggingface.co/turkeyju/FlowTok/blob/main/FlowTiTok_512.bin) at HuggingFace.
+
 ------
 
 ## Terms of use
