@@ -1,0 +1,11 @@
+python3 scripts/build_dataset.py \
+  --data-root /mnt/ssd_1/yghu/Data/71_3m/ \
+  --save-dir /mnt/ssd_1/yghu/Data/71_3m/ \
+  --dataset-pkl-name dataset_filelist.pkl \
+  --history-frames 0 \
+  --future-frame 0 \
+  --refresh-rate 10 \
+  --coverage-threshold 0.0 \
+  --split-mode blocks \
+  --block-size 96 \
+  --split-ratio 0.8,0.1,0.1

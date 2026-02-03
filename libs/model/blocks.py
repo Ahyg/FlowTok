@@ -318,9 +318,10 @@ class FlowTiTokEncoder(nn.Module):
                 "large": 16,
             }[self.model_size]
         
+        self.in_channels = config.vq_model.get("in_channels", 3)
         self.patch_embed = nn.Conv2d(
-            in_channels=3, out_channels=self.width,
-              kernel_size=self.patch_size, stride=self.patch_size, bias=True)
+            in_channels=self.in_channels, out_channels=self.width,
+            kernel_size=self.patch_size, stride=self.patch_size, bias=True)
 
         scale = self.width ** -0.5
         self.positional_embedding = VisionRotaryEmbeddingFast(self.width // self.num_heads // 2, self.grid_size)
@@ -406,12 +407,13 @@ class FlowTiTokDecoder(nn.Module):
             ))
         self.ln_post = nn.LayerNorm(self.width)
 
-        # Directly predicting RGB pixels
+        self.out_channels = config.vq_model.get("out_channels", 3)
+        # Directly predicting output pixels
         self.ffn = nn.Sequential(
-            nn.Conv2d(self.width, self.patch_size * self.patch_size * 3, 1, padding=0, bias=True),
+            nn.Conv2d(self.width, self.patch_size * self.patch_size * self.out_channels, 1, padding=0, bias=True),
             Rearrange('b (p1 p2 c) h w -> b c (h p1) (w p2)',
                 p1 = self.patch_size, p2 = self.patch_size),)
-        self.conv_out = nn.Conv2d(3, 3, 3, padding=1, bias=True)
+        self.conv_out = nn.Conv2d(self.out_channels, self.out_channels, 3, padding=1, bias=True)
 
         self.text_context_length = config.vq_model.get("text_context_length", 77)
         self.text_embed_dim = config.vq_model.get("text_embed_dim", 768)

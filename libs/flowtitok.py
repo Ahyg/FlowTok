@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -133,3 +134,12 @@ class FlowTiTok(nn.Module):
         z_quantized, result_dict = self.encode(x)
         decoded = self.decode(z_quantized, text_guidance)
         return decoded, result_dict
+
+    def save_pretrained_weight(self, output_dir, **kwargs):
+        os.makedirs(output_dir, exist_ok=True)
+        save_function = kwargs.get("save_function", torch.save)
+        save_function(self.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+
+    def load_pretrained_weight(self, checkpoint_path):
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        self.load_state_dict(state_dict, strict=True)
