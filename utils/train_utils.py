@@ -88,9 +88,19 @@ class AverageMeter(object):
         self.sum = 0
         self.count = 0
 
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
 
 def _nan_debug_enabled(config):
     return bool(getattr(config, "training", {}).get("nan_check", False))
+
+
+def _nan_skip_enabled(config):
+    return bool(getattr(config, "training", {}).get("nan_skip", False))
 
 
 def _finite_stats(tensor):
@@ -105,24 +115,22 @@ def _finite_stats(tensor):
         "mean": float(finite_vals.mean().item()),
     }
 
-
-def _check_finite_tensor(name, tensor, accelerator, logger):
+def _has_non_finite_tensor(name, tensor, accelerator, logger):
     if torch.isfinite(tensor).all():
-        return
+        return False
     local_flag = torch.tensor([1], device=accelerator.device, dtype=torch.int32)
     global_flag = accelerator.gather(local_flag).max().item()
     if global_flag > 0 and accelerator.is_main_process:
         stats = _finite_stats(tensor.detach())
         logger.error(f"[NaNCheck] Non-finite detected in {name}. Stats: {stats}")
-    accelerator.wait_for_everyone()
-    raise RuntimeError(f"Non-finite values detected in {name}.")
+    return True
 
 
-def _check_finite_posteriors(posteriors, accelerator, logger):
+def _has_non_finite_posteriors(posteriors, accelerator, logger):
     if not hasattr(posteriors, "mean") or not hasattr(posteriors, "logvar"):
-        return
+        return False
     if torch.isfinite(posteriors.mean).all() and torch.isfinite(posteriors.logvar).all():
-        return
+        return False
     local_flag = torch.tensor([1], device=accelerator.device, dtype=torch.int32)
     global_flag = accelerator.gather(local_flag).max().item()
     if global_flag > 0 and accelerator.is_main_process:
@@ -132,14 +140,7 @@ def _check_finite_posteriors(posteriors, accelerator, logger):
             f"[NaNCheck] Non-finite detected in posteriors. "
             f"mean_stats={mean_stats}, logvar_stats={logvar_stats}"
         )
-    accelerator.wait_for_everyone()
-    raise RuntimeError("Non-finite values detected in posteriors.")
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+    return True
 
 
 def create_pretrained_tokenizer(config, accelerator=None):
@@ -167,6 +168,7 @@ def _build_flowtitok_config(config):
     vq_model = OmegaConf.to_container(config.model.vq_model, resolve=True)
     vq_model.setdefault("use_rmsnorm", False)
     vq_model.setdefault("use_swiglu", True)
+    vq_model.setdefault("nan_debug", bool(config.training.get("nan_check", False)))
     dataset = {
         "crop_size": config.dataset.preprocessing.crop_size,
     }
@@ -630,9 +632,20 @@ def train_one_epoch(config, logger, accelerator,
             if model_type == "titok":
                 reconstructed_images, extra_results_dict = model(images)
                 if _nan_debug_enabled(config):
-                    _check_finite_tensor("train/images", images, accelerator, logger)
-                    _check_finite_tensor("train/recon", reconstructed_images, accelerator, logger)
-                    _check_finite_posteriors(extra_results_dict, accelerator, logger)
+                    non_finite = False
+                    non_finite |= _has_non_finite_tensor("train/images", images, accelerator, logger)
+                    non_finite |= _has_non_finite_tensor("train/recon", reconstructed_images, accelerator, logger)
+                    non_finite |= _has_non_finite_posteriors(extra_results_dict, accelerator, logger)
+                    if non_finite and _nan_skip_enabled(config):
+                        if accelerator.is_main_process:
+                            logger.warning("[NaNSkip] Skipping batch due to non-finite values (pre-loss).")
+                        optimizer.zero_grad(set_to_none=True)
+                        if discriminator_optimizer is not None:
+                            discriminator_optimizer.zero_grad(set_to_none=True)
+                        continue
+                    if non_finite:
+                        accelerator.wait_for_everyone()
+                        raise RuntimeError("Non-finite values detected (pre-loss).")
                 if proxy_codes is None:
                     autoencoder_loss, loss_dict = loss_module(
                         images,
@@ -650,9 +663,20 @@ def train_one_epoch(config, logger, accelerator,
             elif model_type in ["tatitok", "flowtitok"]:
                 reconstructed_images, extra_results_dict = model(images, text_guidance)
                 if _nan_debug_enabled(config):
-                    _check_finite_tensor("train/images", images, accelerator, logger)
-                    _check_finite_tensor("train/recon", reconstructed_images, accelerator, logger)
-                    _check_finite_posteriors(extra_results_dict, accelerator, logger)
+                    non_finite = False
+                    non_finite |= _has_non_finite_tensor("train/images", images, accelerator, logger)
+                    non_finite |= _has_non_finite_tensor("train/recon", reconstructed_images, accelerator, logger)
+                    non_finite |= _has_non_finite_posteriors(extra_results_dict, accelerator, logger)
+                    if non_finite and _nan_skip_enabled(config):
+                        if accelerator.is_main_process:
+                            logger.warning("[NaNSkip] Skipping batch due to non-finite values (pre-loss).")
+                        optimizer.zero_grad(set_to_none=True)
+                        if discriminator_optimizer is not None:
+                            discriminator_optimizer.zero_grad(set_to_none=True)
+                        continue
+                    if non_finite:
+                        accelerator.wait_for_everyone()
+                        raise RuntimeError("Non-finite values detected (pre-loss).")
                 autoencoder_loss, loss_dict = loss_module(
                     images,
                     reconstructed_images,
@@ -664,10 +688,21 @@ def train_one_epoch(config, logger, accelerator,
                 raise NotImplementedError
 
             if _nan_debug_enabled(config):
-                _check_finite_tensor("train/autoencoder_loss", autoencoder_loss, accelerator, logger)
+                non_finite = False
+                non_finite |= _has_non_finite_tensor("train/autoencoder_loss", autoencoder_loss, accelerator, logger)
                 for k, v in loss_dict.items():
                     if isinstance(v, torch.Tensor):
-                        _check_finite_tensor(f"train/loss_dict[{k}]", v, accelerator, logger)
+                        non_finite |= _has_non_finite_tensor(f"train/loss_dict[{k}]", v, accelerator, logger)
+                if non_finite and _nan_skip_enabled(config):
+                    if accelerator.is_main_process:
+                        logger.warning("[NaNSkip] Skipping batch due to non-finite values (loss).")
+                    optimizer.zero_grad(set_to_none=True)
+                    if discriminator_optimizer is not None:
+                        discriminator_optimizer.zero_grad(set_to_none=True)
+                    continue
+                if non_finite:
+                    accelerator.wait_for_everyone()
+                    raise RuntimeError("Non-finite values detected (loss).")
 
             # Gather the losses across all processes for logging.
             autoencoder_logs = {}
@@ -711,10 +746,19 @@ def train_one_epoch(config, logger, accelerator,
                 )
 
                 if _nan_debug_enabled(config):
-                    _check_finite_tensor("train/discriminator_loss", discriminator_loss, accelerator, logger)
+                    non_finite = False
+                    non_finite |= _has_non_finite_tensor("train/discriminator_loss", discriminator_loss, accelerator, logger)
                     for k, v in loss_dict_discriminator.items():
                         if isinstance(v, torch.Tensor):
-                            _check_finite_tensor(f"train/disc_loss_dict[{k}]", v, accelerator, logger)
+                            non_finite |= _has_non_finite_tensor(f"train/disc_loss_dict[{k}]", v, accelerator, logger)
+                    if non_finite and _nan_skip_enabled(config):
+                        if accelerator.is_main_process:
+                            logger.warning("[NaNSkip] Skipping batch due to non-finite values (discriminator).")
+                        discriminator_optimizer.zero_grad(set_to_none=True)
+                        continue
+                    if non_finite:
+                        accelerator.wait_for_everyone()
+                        raise RuntimeError("Non-finite values detected (discriminator).")
 
                 # Gather the losses across all processes for logging.
                 for k, v in loss_dict_discriminator.items():

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONFIG_PATH="/mnt/ssd_1/yghu/Code/FlowTok/configs/sat_flowtok_ae_bl77_vae.yaml"
-CHECKPOINT_PATH="/mnt/ssd_1/yghu/Experiments/sat_flowtok_ae_bl77_vae_run1/checkpoint-300000/unwrapped_model/pytorch_model.bin"
+CHECKPOINT_PATH="/mnt/ssd_1/yghu/Experiments/sat_flowtok_ae_bl77_vae_run1/checkpoint-550000/unwrapped_model/pytorch_model.bin"
 OUTPUT_DIR="/mnt/ssd_1/yghu/Experiments/sat_flowtok_ae_bl77_vae_run1/val_images"
 MAX_BATCHES=16
 

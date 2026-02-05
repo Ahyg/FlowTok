@@ -84,6 +84,7 @@ class FlowTiTok(nn.Module):
 
         self.return_quantized = config.vq_model.get("return_quantized", True)
         self.use_pretrained = config.vq_model.get("use_pretrained", True)
+        self.nan_debug = config.vq_model.get("nan_debug", False)
 
     def _init_weights(self, module):
         """ Initialize the weights.
@@ -116,13 +117,23 @@ class FlowTiTok(nn.Module):
 
     def encode(self, x):
         z = self.encoder(pixel_values=x, latent_tokens=self.latent_tokens)
+        if self.nan_debug and not torch.isfinite(z).all():
+            raise RuntimeError("Non-finite detected after encoder output.")
         posteriors = self.quantize(z)
+        if self.nan_debug:
+            if hasattr(posteriors, "mean") and hasattr(posteriors, "logvar"):
+                if (not torch.isfinite(posteriors.mean).all()) or (not torch.isfinite(posteriors.logvar).all()):
+                    raise RuntimeError("Non-finite detected in posteriors (mean/logvar).")
         z_quantized = posteriors.sample()
+        if self.nan_debug and not torch.isfinite(z_quantized).all():
+            raise RuntimeError("Non-finite detected after posterior sampling.")
         result_dict = posteriors
         return z_quantized, result_dict
 
     def decode(self, z_quantized, text_guidance):
         decoded = self.decoder(z_quantized, text_guidance)
+        if self.nan_debug and not torch.isfinite(decoded).all():
+            raise RuntimeError("Non-finite detected after decoder output.")
         return decoded
     
     def decode_tokens(self, tokens, text_guidance):

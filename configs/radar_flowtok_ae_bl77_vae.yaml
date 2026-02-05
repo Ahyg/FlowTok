@@ -35,7 +35,7 @@ losses:
     reconstruction_loss: "l2"
     reconstruction_weight: 1.0
     lecam_regularization_weight: 0.001
-    kl_weight: 1e-6
+    kl_weight: 0.0
     logvar_init: 0.0
 
 dataset:
@@ -55,8 +55,8 @@ dataset:
 optimizer:
     name: adamw 
     params:
-        learning_rate: 1e-4
-        discriminator_learning_rate: 1e-4
+        learning_rate: 2e-5
+        discriminator_learning_rate: 2e-5
         beta1: 0.9
         beta2: 0.999
         weight_decay: 1e-4
@@ -79,3 +79,5 @@ training:
     max_train_steps: 650_000
     num_generated_images: 2
     max_grad_norm: 1.0
+    nan_check: True
+    nan_skip: True 

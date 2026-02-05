@@ -143,6 +143,7 @@ class ResidualRoPEAttentionBlock(nn.Module):
         self.ln_1 = norm_layer(d_model)
         self.attn = RoPEAttention(d_model, n_head, grid_size)
         self.mlp_ratio = mlp_ratio
+        self.nan_debug = False
         # optionally we can disable the FFN
         if mlp_ratio > 0:
             self.ln_2 = norm_layer(d_model)
@@ -161,9 +162,25 @@ class ResidualRoPEAttentionBlock(nn.Module):
 
     def forward(self, x, rope):
         attn_output = self.attention(self.ln_1(x), rope)
+        if self.nan_debug and not torch.isfinite(attn_output).all():
+            raise RuntimeError("Non-finite detected in ResidualRoPEAttentionBlock attention output.")
         x = x + attn_output
         if self.mlp_ratio > 0:
-            x = x + self.mlp(self.ln_2(x))
+            ln_out = self.ln_2(x)
+            if self.nan_debug and not torch.isfinite(ln_out).all():
+                raise RuntimeError("Non-finite detected after ResidualRoPEAttentionBlock ln_2 output.")
+            mlp_out = self.mlp(ln_out)
+            if self.nan_debug and not torch.isfinite(mlp_out).all():
+                finite_mask = torch.isfinite(ln_out)
+                if finite_mask.any():
+                    ln_out_max = ln_out[finite_mask].abs().max().item()
+                    ln_out_mean = ln_out[finite_mask].mean().item()
+                    raise RuntimeError(
+                        "Non-finite detected in ResidualRoPEAttentionBlock MLP output. "
+                        f"ln_2 max_abs={ln_out_max:.6f}, mean={ln_out_mean:.6f}"
+                    )
+                raise RuntimeError("Non-finite detected in ResidualRoPEAttentionBlock MLP output.")
+            x = x + mlp_out
         return x
 
 
@@ -319,6 +336,7 @@ class FlowTiTokEncoder(nn.Module):
             }[self.model_size]
         
         self.in_channels = config.vq_model.get("in_channels", 3)
+        self.nan_debug = config.vq_model.get("nan_debug", False)
         self.patch_embed = nn.Conv2d(
             in_channels=self.in_channels, out_channels=self.width,
             kernel_size=self.patch_size, stride=self.patch_size, bias=True)
@@ -331,9 +349,11 @@ class FlowTiTokEncoder(nn.Module):
 
         self.transformer = nn.ModuleList()
         for i in range(self.num_layers):
-            self.transformer.append(ResidualRoPEAttentionBlock(
+            block = ResidualRoPEAttentionBlock(
                 self.width, self.num_heads, mlp_ratio=4.0, norm_layer=nn.LayerNorm, use_swiglu=True, grid_size=self.grid_size
-            ))
+            )
+            block.nan_debug = self.nan_debug
+            self.transformer.append(block)
 
         self.ln_post = nn.LayerNorm(self.width)
         self.conv_out = nn.Conv2d(self.width, self.token_size, kernel_size=1, bias=True)
@@ -342,6 +362,8 @@ class FlowTiTokEncoder(nn.Module):
         batch_size = pixel_values.shape[0]
         x = pixel_values
         x = self.patch_embed(x)
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after encoder patch_embed.")
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1) # shape = [*, grid ** 2, width]
 
@@ -350,13 +372,21 @@ class FlowTiTokEncoder(nn.Module):
         x = torch.cat([x, latent_tokens], dim=1)
 
         x = self.ln_pre(x)
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after encoder ln_pre.")
         for i in range(self.num_layers):
             x = self.transformer[i](x, self.positional_embedding)
+            if self.nan_debug and not torch.isfinite(x).all():
+                raise RuntimeError(f"Non-finite detected after encoder block {i}.")
         
         latent_tokens = x[:, self.grid_size**2:]
         latent_tokens = self.ln_post(latent_tokens)
+        if self.nan_debug and not torch.isfinite(latent_tokens).all():
+            raise RuntimeError("Non-finite detected after encoder ln_post.")
         latent_tokens = latent_tokens.reshape(batch_size, self.num_latent_tokens, self.width, 1).permute(0, 2, 1, 3)
         latent_tokens = self.conv_out(latent_tokens)
+        if self.nan_debug and not torch.isfinite(latent_tokens).all():
+            raise RuntimeError("Non-finite detected after encoder conv_out.")
         latent_tokens = latent_tokens.reshape(batch_size, self.token_size, 1, self.num_latent_tokens)
         return latent_tokens
 
@@ -373,6 +403,7 @@ class FlowTiTokDecoder(nn.Module):
         self.token_size = config.vq_model.token_size
         self.use_rmsnorm = config.vq_model.use_rmsnorm
         self.use_swiglu = config.vq_model.use_swiglu
+        self.nan_debug = config.vq_model.get("nan_debug", False)
 
         self.width = {
                 "small": 512,
@@ -402,9 +433,11 @@ class FlowTiTokDecoder(nn.Module):
         self.ln_pre = nn.LayerNorm(self.width)
         self.transformer = nn.ModuleList()
         for i in range(self.num_layers):
-            self.transformer.append(ResidualRoPEAttentionBlock(
+            block = ResidualRoPEAttentionBlock(
                 self.width, self.num_heads, mlp_ratio=4.0, norm_layer=nn.LayerNorm, use_swiglu=True, grid_size=self.grid_size
-            ))
+            )
+            block.nan_debug = self.nan_debug
+            self.transformer.append(block)
         self.ln_post = nn.LayerNorm(self.width)
 
         self.out_channels = config.vq_model.get("out_channels", 3)
@@ -425,25 +458,41 @@ class FlowTiTokDecoder(nn.Module):
         assert H == 1 and W == self.num_latent_tokens, f"{H}, {W}, {self.num_latent_tokens}"
         x = z_quantized.reshape(N, C*H, W).permute(0, 2, 1) # NLD
         x = self.decoder_embed(x)
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after decoder_embed.")
 
         batchsize, seq_len, _ = x.shape
 
         mask_tokens = self.mask_token.repeat(batchsize, self.grid_size**2, 1).to(x.dtype)
         x = x + self.latent_token_positional_embedding[:seq_len]
         x = torch.cat([mask_tokens, x], dim=1)
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after adding latent tokens.")
 
         text_guidance = self.text_guidance_proj(text_guidance)
         text_guidance = text_guidance + self.text_guidance_positional_embedding
         x = torch.cat([x, text_guidance], dim=1)
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after adding text guidance.")
         
         x = self.ln_pre(x)
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after decoder ln_pre.")
         for i in range(self.num_layers):
             x = self.transformer[i](x, self.positional_embedding)
+            if self.nan_debug and not torch.isfinite(x).all():
+                raise RuntimeError(f"Non-finite detected after decoder block {i}.")
 
         x = x[:, :self.grid_size**2] # remove cls embed
         x = self.ln_post(x)
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after decoder ln_post.")
         # N L D -> N D H W
         x = x.permute(0, 2, 1).reshape(batchsize, self.width, self.grid_size, self.grid_size)
         x = self.ffn(x.contiguous())
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after decoder ffn.")
         x = self.conv_out(x)
+        if self.nan_debug and not torch.isfinite(x).all():
+            raise RuntimeError("Non-finite detected after decoder conv_out.")
         return x
