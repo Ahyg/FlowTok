@@ -204,9 +204,14 @@ class FlowMatching(nn.Module):
         cond, # text tokens
         all_config,
         batch_img_clip=None,
+        valid_mask=None,
     ):
         timesteps = self.time_step_sampler.sample_time(x)
-        return self.p_losses_textVAE_flowtok(x, cond, timesteps, nnet, all_config, batch_img_clip=batch_img_clip)
+        return self.p_losses_textVAE_flowtok(
+            x, cond, timesteps, nnet, all_config,
+            batch_img_clip=batch_img_clip,
+            valid_mask=valid_mask,
+        )
     
     def p_losses_textVAE_flowtok(
         self,
@@ -216,6 +221,7 @@ class FlowMatching(nn.Module):
         nnet,
         all_config,
         batch_img_clip=None,
+        valid_mask=None,
     ):
         """
         CrossFLow training for DiT
@@ -224,6 +230,11 @@ class FlowMatching(nn.Module):
         kld_loss_weight = all_config.losses.kld_loss_weight
 
         x0, mu, log_var = nnet(cond, text_encoder = True)
+
+        # Initialize losses to zero for the common case where the weights are 0.
+        # This avoids UnboundLocalError when contrastive or KLD losses are disabled.
+        contrastive_loss = x0.new_zeros([])
+        kld_loss = x0.new_zeros([])
 
         if self.noising_type != "none":
             random_noise = torch.randn_like(x0)
@@ -272,7 +283,13 @@ class FlowMatching(nn.Module):
 
         prediction = nnet(x_noisy, t = t, null_indicator = null_indicator)[0]
 
-        loss_diff = self.mos(prediction - target_velocity)
+        # Optional mask for variable-length sequences (e.g. v2v with padding)
+        if valid_mask is not None:
+            # valid_mask: [B, L]; err: [B, L, C] -> flatten to [B, L] for mask
+            err = (prediction - target_velocity).pow(2).mean(dim=-1)  # [B, L]
+            loss_diff = (err * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+        else:
+            loss_diff = self.mos(prediction - target_velocity)
 
         loss = loss_diff + contrastive_loss + kld_loss
         loss_dict = {'diff_loss': loss_diff, 'contrastive_loss': contrastive_loss, 'kld_loss': kld_loss}

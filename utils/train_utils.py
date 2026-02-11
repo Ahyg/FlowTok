@@ -1573,7 +1573,7 @@ def load_checkpoint(checkpoint_path: Path, accelerator, logger, strict=True):
     # The model weights are saved under unwrapped_model/, while accelerator
     # state is saved by accelerator.save_state(). Load via accelerator state.
     accelerator.load_state(checkpoint_path, strict=strict)
-
+    
     with open(metadata_file, "r") as f:
         global_step = int(json.load(f)["global_step"])
 

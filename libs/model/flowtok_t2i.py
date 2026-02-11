@@ -146,20 +146,27 @@ class FlowTok(nn.Module):
         super().__init__()
         self.in_channels = config.channels
         self.out_channels = self.in_channels
+        self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_latent_tokens = num_latent_tokens
 
         self.x_embedder = nn.Linear(self.in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size)
-        
-        self.use_t2t_temperature = config.use_t2t_temperature
+
+        # Some legacy configs do not define `use_t2t_temperature`.
+        # Default to False for backward compatibility.
+        self.use_t2t_temperature = getattr(config, "use_t2t_temperature", False)
         if self.use_t2t_temperature:
             self.t2t_temperature = nn.Parameter(torch.log(torch.tensor(1/0.07)))
         else:
             self.t2t_temperature = None
 
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_latent_tokens, hidden_size), requires_grad=False)
+        # NOTE: 原版实现中 pos_embed 是一个固定长度为 num_latent_tokens 的参数，
+        # 这会限制只能处理固定长度的 token（单帧）。为了支持可变帧数（视频），
+        # 这里改为在前向时按当前序列长度动态生成 1D sin-cos 位置编码。
+        # 保留 num_latent_tokens 仅作为默认长度配置，不再用作严格限制。
+        self.pos_embed = None
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -196,10 +203,6 @@ class FlowTok(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_1d_sincos_pos_embed_from_grid(self.pos_embed.shape[-1], np.arange(self.num_latent_tokens))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
@@ -218,20 +221,25 @@ class FlowTok(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x):
+    def _build_pos_embed(self, seq_len: int, device: torch.device, dtype: torch.dtype):
         """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
+        Build positional embedding with explicit temporal (frame) signal for V2V.
+        - Spatial: token index within each frame (0 .. num_latent_tokens-1), repeated per frame.
+        - Temporal: frame index (0 .. T-1), same value for all 77 tokens in that frame.
+        So the model gets a clear "which frame" signal for temporal modeling.
+        For I2I (L=77), temporal is all 0; for V2V (L=T*77), temporal distinguishes frames.
         """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
+        L = seq_len
+        n_per_frame = self.num_latent_tokens
+        # Within-frame spatial position: 0,1,...,76, 0,1,...,76, ... (same pattern each frame)
+        spatial_pos = np.arange(L, dtype=np.float32) % n_per_frame
+        # Frame index: 0,0,...,0, 1,1,...,1, ... (77 same values per frame)
+        temporal_pos = (np.arange(L, dtype=np.float32) // n_per_frame)
 
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
+        spatial_embed = get_1d_sincos_pos_embed_from_grid(self.hidden_size, spatial_pos)   # (L, D)
+        temporal_embed = get_1d_sincos_pos_embed_from_grid(self.hidden_size, temporal_pos)  # (L, D)
+        pos_embed = torch.from_numpy(spatial_embed + temporal_embed).to(device=device, dtype=dtype).unsqueeze(0)  # [1, L, D]
+        return pos_embed
 
     def _forward(self, x, t, null_indicator):
         """
@@ -239,7 +247,14 @@ class FlowTok(nn.Module):
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        # x: [B, L, C_in]; L = 77 (I2I) or T*77 (V2V)
+        B, L, _ = x.shape
+        x = self.x_embedder(x)  # [B, L, D]
+
+        # Positional embedding: spatial (within-frame token index) + temporal (frame index)
+        pos_embed = self._build_pos_embed(seq_len=L, device=x.device, dtype=x.dtype)
+        x = x + pos_embed  # (N, L, D)
+
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(null_indicator)    # (N, D)
         c = t + y                                # (N, D)

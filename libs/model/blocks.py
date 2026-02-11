@@ -339,7 +339,7 @@ class FlowTiTokEncoder(nn.Module):
         self.nan_debug = config.vq_model.get("nan_debug", False)
         self.patch_embed = nn.Conv2d(
             in_channels=self.in_channels, out_channels=self.width,
-            kernel_size=self.patch_size, stride=self.patch_size, bias=True)
+              kernel_size=self.patch_size, stride=self.patch_size, bias=True)
 
         scale = self.width ** -0.5
         self.positional_embedding = VisionRotaryEmbeddingFast(self.width // self.num_heads // 2, self.grid_size)
@@ -469,6 +469,11 @@ class FlowTiTokDecoder(nn.Module):
         if self.nan_debug and not torch.isfinite(x).all():
             raise RuntimeError("Non-finite detected after adding latent tokens.")
 
+        if text_guidance is None:
+            text_guidance = torch.zeros(
+                N, self.text_context_length, self.text_embed_dim,
+                device=z_quantized.device, dtype=z_quantized.dtype,
+            )
         text_guidance = self.text_guidance_proj(text_guidance)
         text_guidance = text_guidance + self.text_guidance_positional_embedding
         x = torch.cat([x, text_guidance], dim=1)

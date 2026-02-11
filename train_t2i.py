@@ -2,7 +2,7 @@ import ml_collections
 import torch
 from torch import multiprocessing as mp
 from torchvision.utils import make_grid, save_image
-import utils
+import flow_utils as utils
 import accelerate
 from absl import logging
 import builtins

@@ -47,7 +47,30 @@ def main(args):
         seed=args.seed,
     )
 
-    if args.split_mode == "blocks":
+    if args.v2v:
+        # Real-time v2v: fixed-length clips, optional strict_consecutive and filter_radar
+        if args.split_mode == "blocks":
+            train_files, val_files, test_files = builder.build_filelist_v2v_by_blocks(
+                save_dir=args.save_dir,
+                file_name=args.dataset_pkl_name,
+                block_size=args.block_size,
+                split_ratio=args.split_ratio,
+                drop_last=args.drop_last,
+                clip_length=args.clip_length,
+                strict_consecutive=args.strict_consecutive,
+                filter_radar=args.filter_radar,
+            )
+        else:
+            train_files, val_files, test_files = builder.build_filelist_v2v_by_days(
+                save_dir=args.save_dir,
+                file_name=args.dataset_pkl_name,
+                split_ratio=args.split_ratio,
+                fixed_test_days=args.fixed_test_days,
+                clip_length=args.clip_length,
+                strict_consecutive=args.strict_consecutive,
+                filter_radar=args.filter_radar,
+            )
+    elif args.split_mode == "blocks":
         train_files, val_files, test_files = builder.build_filelist_by_blocks(
             save_dir=args.save_dir,
             file_name=args.dataset_pkl_name,
@@ -81,10 +104,16 @@ if __name__ == "__main__":
     parser.add_argument("--seed", default=42, type=int)
 
     parser.add_argument("--split-mode", default="blocks", choices=("blocks", "days"))
-    parser.add_argument("--block-size", default=96, type=int)
+    parser.add_argument("--block-size", default=96, type=int, help="(blocks split only) samples per block for train/val/test split; not video length")
     parser.add_argument("--split-ratio", default=(0.7, 0.2, 0.1), type=parse_float_tuple)
     parser.add_argument("--drop-last", action="store_true")
     parser.add_argument("--fixed-test-days", default=None, type=lambda s: s.split(","))
+
+    parser.add_argument("--v2v", action="store_true", help="Build aligned (sat_paths, radar_paths) for real-time v2v with fixed-length clips")
+    parser.add_argument("--clip-length", default=16, type=int, help="V2V: frames per video (each sample = one clip of this many frames)")
+    parser.add_argument("--no-strict-consecutive", dest="strict_consecutive", action="store_false", help="V2V: do not discard blocks with non-consecutive frames")
+    parser.add_argument("--no-filter-radar", dest="filter_radar", action="store_false", help="V2V: disable radar sparse filtering")
+    parser.set_defaults(strict_consecutive=True, filter_radar=True)
 
     main(parser.parse_args())
 

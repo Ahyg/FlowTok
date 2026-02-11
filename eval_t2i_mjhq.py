@@ -1,6 +1,6 @@
 import ml_collections
 import torch
-import utils
+import flow_utils as utils
 import accelerate
 from tqdm.auto import tqdm
 from absl import logging
