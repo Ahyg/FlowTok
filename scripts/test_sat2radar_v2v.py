@@ -369,8 +369,13 @@ def main():
                 else:
                     # If lightning channel not available, fall back to zeros
                     sat_lgt_2d = np.zeros_like(sat_ir_2d)
-                idx = batch_idx * B + i
-                out_path = os.path.join(args.out_dir, f"sample_{idx:06d}.png")
+                time_stem = ""
+                radar_paths = batch.get("radar_paths")
+                if radar_paths and i < len(radar_paths) and t0 < len(radar_paths[i]):
+                    p = radar_paths[i][t0]
+                    time_stem = os.path.splitext(os.path.basename(str(p)))[0].replace(os.sep, "_").replace(":", "_")
+                out_name = f"{time_stem}.png" if time_stem else f"batch{batch_idx}_i{i}.png"
+                out_path = os.path.join(args.out_dir, out_name)
                 _save_four_panel_sat_light_radar(
                     sat_ir_2d,
                     sat_lgt_2d,

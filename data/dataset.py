@@ -33,11 +33,16 @@ def collate_sat2radar_v2v(batch):
         radar_padded[i, :T_i] = radar_list[i]
         valid_mask[i, :T_i] = True
 
+    sat_paths = [b.get("sat_paths", []) for b in batch]
+    radar_paths = [b.get("radar_paths", []) for b in batch]
+
     return {
         "sat_video": sat_padded,
         "radar_video": radar_padded,
         "valid_mask": valid_mask,
         "n_frames": n_frames,
+        "sat_paths": sat_paths,
+        "radar_paths": radar_paths,
     }
 
 
@@ -269,6 +274,8 @@ class SatelliteRadarNpyDataset(Dataset):
                     "sat_video": torch.from_numpy(sat_video).float(),
                     "radar_video": torch.from_numpy(radar_video).float(),
                     "n_frames": T,
+                    "sat_paths": sat_paths,
+                    "radar_paths": radar_paths_seq,
                 }
 
             raise ValueError(f"Unsupported mode for paired (hist, radar): {self.mode}")
