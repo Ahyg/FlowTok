@@ -415,7 +415,7 @@ def train(config):
                         if accelerator.is_main_process:
                             save_path = os.path.join(
                                 config.sample_dir,
-                                f"{train_state.step}_grid.png",
+                                f"{train_state.step}_sat_lgt_gt_pred.png",
                             )
                             plt.imsave(save_path, stacked)
                 accelerator.wait_for_everyone()
