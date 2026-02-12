@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="/mnt/ssd_1/yghu/Code/FlowTok/configs/sat_flowtok_ae_bl77_vae.yaml"
-CHECKPOINT_PATH="/mnt/ssd_1/yghu/Experiments/sat_flowtok_ae_bl77_vae_run1/checkpoint-650000/ema_model/pytorch_model.bin"
-OUTPUT_DIR="/mnt/ssd_1/yghu/Experiments/sat_flowtok_ae_bl77_vae_run1/test_images"
+CONFIG_PATH="/mnt/ssd_1/yghu/Code/FlowTok/configs/sat_flowtitok_ae_bl77_vae.yaml"
+CHECKPOINT_PATH="/mnt/ssd_1/yghu/Experiments/sat_flowtitok_ae_bl77_vae_run1/checkpoint-650000/ema_model/pytorch_model.bin"
+OUTPUT_DIR="/mnt/ssd_1/yghu/Experiments/sat_flowtitok_ae_bl77_vae_run1/test_images"
 MAX_BATCHES_METRICS=-1
 MAX_BATCHES_IMAGES=32
 

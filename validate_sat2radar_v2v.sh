@@ -9,7 +9,7 @@ MODE="i2i"             # i2i or v2v
 MAX_BATCHES=10
 BATCH_SIZE=8
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3}
 
 python scripts/validate_sat2radar_v2v.py \
   --config "${CONFIG_PATH}" \

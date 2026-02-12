@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="/mnt/ssd_1/yghu/Code/FlowTok/configs/radar_flowtok_ae_bl77_vae.yaml"
+CONFIG_PATH="/mnt/ssd_1/yghu/Code/FlowTok/configs/radar_flowtitok_ae_bl77_vae.yaml"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3}
 export WANDB_MODE=disabled
 

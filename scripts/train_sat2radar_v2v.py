@@ -7,6 +7,11 @@ import torch
 from absl import app, flags, logging
 from absl import flags
 from ml_collections import config_flags, ConfigDict
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
+import cmweather
+import cmcrameri
 
 # Ensure project root is on sys.path so we can import local modules.
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -43,6 +48,45 @@ def encode_video_with_autoencoder(autoencoder, video, scale_factor: float):
     L = z.shape[1]
     z = z.view(B, T * L, z.shape[2])   # [B, T*L, C_tok]
     return z
+
+
+def _cmap_or_fallback(name, fallback="viridis"):
+    """Return a valid colormap name, falling back if needed."""
+    try:
+        plt.get_cmap(name)
+        return name
+    except ValueError:
+        print(f"[WARN] Colormap '{name}' not found, fallback to '{fallback}'")
+        return fallback
+
+
+def _apply_cmap(img2d, cmap_name, vmin, vmax):
+    """Apply matplotlib colormap to a 2D array and return RGB image."""
+    cmap = plt.get_cmap(cmap_name)
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    return cmap(norm(img2d))[..., :3]
+
+
+def _save_three_panel_sat_radar(
+    sat_2d,
+    gt_2d,
+    pred_2d,
+    cmap_sat,
+    cmap_rad,
+    ir_min,
+    ir_max,
+    z_min,
+    z_max,
+    out_path,
+):
+    """
+    Save a 3-panel composite [sat_IR | radar_gt | radar_pred] using AE-style colormaps.
+    """
+    sat_rgb = _apply_cmap(sat_2d, cmap_sat, ir_min, ir_max)
+    gt_rgb = _apply_cmap(gt_2d, cmap_rad, z_min, z_max)
+    pred_rgb = _apply_cmap(pred_2d, cmap_rad, z_min, z_max)
+    composite = np.concatenate([sat_rgb, gt_rgb, pred_rgb], axis=1)
+    plt.imsave(out_path, composite)
 
 
 def build_dataloader(config, mode: str, accelerator: accelerate.Accelerator):
@@ -299,7 +343,10 @@ def train(config):
             # 保存一些可视化样例
             if train_state.step % config.train.eval_interval == 0:
                 torch.cuda.empty_cache()
-                logging.info("Save a grid of [sat | radar_gt | radar_pred] (first frame only)...")
+                logging.info(
+                    "Save a grid of [sat_IR | sat_lightning | radar_gt | radar_pred] "
+                    "(first frame only) with AE-style colormaps..."
+                )
                 with torch.no_grad():
                     # 预测雷达视频
                     radar_video_pred = ode_fm_solver_sample(nnet_ema, batch)  # [B, T, 1, H, W]
@@ -317,34 +364,60 @@ def train(config):
                         non_blocking=True,
                     )  # [B, T, 1, H, W]
 
-                    # 只可视化每个样本的第 1 帧，并统一为单通道：
-                    # sat: 取第 0 个通道灰度作为 quick-look
-                    sat_first = sat_video[:, 0, 0:1]          # [B, 1, H, W]
-                    radar_gt_first = radar_video_gt[:, 0]    # [B, 1, H, W]
-                    radar_pred_first = radar_video_pred[:, 0]  # [B, 1, H, W]
+                    # 只可视化每个样本的第 1 帧，使用物理范围和 colormap：
+                    # sat: IR ch0 使用 [200,320] + 'cmc.batlow_r'
+                    #       lightning ch10 使用 [0.1,50] + 'Reds'
+                    # radar: [0,60] dBZ + 'HomeyerRainbow'
+                    ir_min, ir_max = 200.0, 320.0
+                    l_min, l_max = 0.1, 50.0
+                    z_min, z_max = 0.0, 60.0
+                    cmap_ir = _cmap_or_fallback("cmc.batlow_r", fallback="viridis")
+                    cmap_lgt = _cmap_or_fallback("Reds", fallback="Reds")
+                    cmap_rad = _cmap_or_fallback("HomeyerRainbow", fallback="viridis")
 
-                    import torchvision.utils as vutils
-
-                    # 对每个样本拼成一行：[sat | radar_gt | radar_pred]
                     max_samples = min(B, 8)
-                    rows = []
+                    rows_np = []
                     for i in range(max_samples):
-                        row = torch.cat(
-                            [sat_first[i], radar_gt_first[i], radar_pred_first[i]],
-                            dim=-1,
-                        )  # [1, H, 3W]
-                        rows.append(row)
+                        # 第 1 帧
+                        sat_ir = sat_video[i, 0, 0] * (ir_max - ir_min) + ir_min  # [H, W]
+                        radar_gt_2d = (
+                            radar_video_gt[i, 0, 0] * (z_max - z_min) + z_min
+                        )  # [H, W]
+                        radar_pred_2d = (
+                            radar_video_pred[i, 0, 0] * (z_max - z_min) + z_min
+                        )  # [H, W]
 
-                    if rows:
-                        # 竖直堆叠多行，得到 [1, H*max_samples, 3W]
-                        stacked = torch.cat(rows, dim=-2)
+                        sat_ir_np = sat_ir.detach().cpu().numpy()
+                        radar_gt_np = radar_gt_2d.detach().cpu().numpy()
+                        radar_pred_np = radar_pred_2d.detach().cpu().numpy()
+
+                        # Lightning channel assumed at index 10 (if present)
+                        if sat_video.shape[2] > 10:
+                            sat_lgt = sat_video[i, 0, 10] * (l_max - l_min) + l_min
+                            sat_lgt_np = sat_lgt.detach().cpu().numpy()
+                        else:
+                            sat_lgt_np = np.zeros_like(sat_ir_np)
+
+                        sat_ir_rgb = _apply_cmap(sat_ir_np, cmap_ir, ir_min, ir_max)
+                        sat_lgt_rgb = _apply_cmap(sat_lgt_np, cmap_lgt, l_min, l_max)
+                        gt_rgb = _apply_cmap(radar_gt_np, cmap_rad, z_min, z_max)
+                        pred_rgb = _apply_cmap(radar_pred_np, cmap_rad, z_min, z_max)
+
+                        row = np.concatenate(
+                            [sat_ir_rgb, sat_lgt_rgb, gt_rgb, pred_rgb], axis=1
+                        )  # [H, 4W, 3]
+                        rows_np.append(row)
+
+                    if rows_np:
+                        # 竖直堆叠多行，得到 [H*max_samples, 4W, 3]
+                        stacked = np.concatenate(rows_np, axis=0)
 
                         if accelerator.is_main_process:
                             save_path = os.path.join(
                                 config.sample_dir,
                                 f"{train_state.step}_sat_radar_gt_pred_first_frames.png",
                             )
-                            vutils.save_image(stacked, save_path)
+                            plt.imsave(save_path, stacked)
                 accelerator.wait_for_everyone()
                 torch.cuda.empty_cache()
 

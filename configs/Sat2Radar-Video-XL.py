@@ -46,12 +46,12 @@ def get_config():
     config.seed = 1234
 
     # Set paths to your pretrained AE checkpoints (sat 11ch -> 77 tokens; radar 1ch -> 77 tokens)
-    config.sat_tokenizer_checkpoint = "/mnt/ssd_1/yghu/Experiments/sat_flowtok_ae_bl77_vae_run1/checkpoint-650000/ema_model/pytorch_model.bin"
-    config.radar_tokenizer_checkpoint = "/mnt/ssd_1/yghu/Experiments/radar_flowtok_ae_bl77_vae_run1/checkpoint-450000/ema_model/pytorch_model.bin"
+    config.sat_tokenizer_checkpoint = "/mnt/ssd_1/yghu/Experiments/sat_flowtitok_ae_bl77_vae_run1/checkpoint-650000/ema_model/pytorch_model.bin"
+    config.radar_tokenizer_checkpoint = "/mnt/ssd_1/yghu/Experiments/radar_flowtitok_ae_bl77_vae_run1/checkpoint-450000/ema_model/pytorch_model.bin"
 
     # ========= 训练设置 =========
     config.train = d(
-        n_steps=50_000,
+        n_steps=400_000,
         batch_size=64,
         log_interval=100,
         eval_interval=10_000,
@@ -90,7 +90,7 @@ def get_config():
     # ========= FlowTok nnet 配置 =========
     global model
     config.nnet = d(
-        name="flowtok-xl",
+        name="flowtok-xl",  # DiT backbone (FlowTok), not FlowTiTok AE
         model_args=model,
     )
 

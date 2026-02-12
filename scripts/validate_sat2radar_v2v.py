@@ -3,9 +3,14 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
+import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
+import cmweather
+import cmcrameri
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -17,7 +22,62 @@ from data.dataset import SatelliteRadarNpyDataset, collate_sat2radar_v2v  # noqa
 from diffusion.flow_matching import ODEEulerFlowMatchingSolver  # noqa: E402
 from libs.flowtitok import FlowTiTok  # noqa: E402
 import flow_utils  # noqa: E402
-from scripts.test_sat2radar_i2i import encode_video_with_autoencoder, load_py_config, _ae_config  # noqa: E402
+from scripts.test_sat2radar_v2v import encode_video_with_autoencoder, load_py_config, _ae_config  # noqa: E402
+
+
+def _cmap_or_fallback(name, fallback="viridis"):
+    """Return a valid colormap name, falling back if needed."""
+    try:
+        plt.get_cmap(name)
+        return name
+    except ValueError:
+        print(f"[WARN] Colormap '{name}' not found, fallback to '{fallback}'")
+        return fallback
+
+
+def _apply_cmap(img2d, cmap_name, vmin, vmax):
+    """Apply matplotlib colormap to a 2D array and return RGB image."""
+    cmap = plt.get_cmap(cmap_name)
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    return cmap(norm(img2d))[..., :3]
+
+
+def _save_two_panel(orig_2d, pred_2d, cmap_name, vmin, vmax, out_path):
+    """
+    Save a 2-panel composite [orig | pred] using the given colormap and value range.
+    """
+    orig_rgb = _apply_cmap(orig_2d, cmap_name, vmin, vmax)
+    pred_rgb = _apply_cmap(pred_2d, cmap_name, vmin, vmax)
+    composite = np.concatenate([orig_rgb, pred_rgb], axis=1)
+    plt.imsave(out_path, composite)
+
+
+def _save_four_panel_sat_light_radar(
+    sat_ir_2d,
+    sat_lgt_2d,
+    gt_2d,
+    pred_2d,
+    cmap_ir,
+    cmap_lgt,
+    cmap_rad,
+    ir_min,
+    ir_max,
+    l_min,
+    l_max,
+    z_min,
+    z_max,
+    out_path,
+):
+    """
+    Save a 4-panel composite [sat_IR | sat_lightning | radar_gt | radar_pred]
+    using AE-style colormaps and physical ranges.
+    """
+    sat_ir_rgb = _apply_cmap(sat_ir_2d, cmap_ir, ir_min, ir_max)
+    sat_lgt_rgb = _apply_cmap(sat_lgt_2d, cmap_lgt, l_min, l_max)
+    gt_rgb = _apply_cmap(gt_2d, cmap_rad, z_min, z_max)
+    pred_rgb = _apply_cmap(pred_2d, cmap_rad, z_min, z_max)
+    composite = np.concatenate([sat_ir_rgb, sat_lgt_rgb, gt_rgb, pred_rgb], axis=1)
+    plt.imsave(out_path, composite)
 
 
 def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
@@ -155,8 +215,16 @@ def main():
         radar_pred = radar_pred.view(B, T_eff, 1, radar_pred.shape[-2], radar_pred.shape[-1])
         radar_gt = torch.clamp(radar_video_gt[:, :T_eff], 0.0, 1.0)
 
-        # For each sample, save first few frames (or all for small T) as [gt | pred]
+        # For each sample, save first few frames (or all for small T) as
+        # sat+radar composites only: [sat_IR | sat_lightning | radar_gt | radar_pred].
         max_frames_to_show = 4 if args.mode == "v2v" else 1
+
+        z_min, z_max = 0.0, 60.0
+        ir_min, ir_max = 200.0, 320.0
+        l_min, l_max = 0.1, 50.0
+        cmap_rad = _cmap_or_fallback("HomeyerRainbow", fallback="viridis")
+        cmap_ir = _cmap_or_fallback("cmc.batlow_r", fallback="viridis")
+        cmap_lgt = _cmap_or_fallback("Reds", fallback="Reds")
 
         for i in range(B):
             frames = []
@@ -165,17 +233,39 @@ def main():
                     continue
                 if len(frames) >= max_frames_to_show:
                     break
-                grid = torch.cat([radar_gt[i, t], radar_pred[i, t]], dim=-1)  # [1, H, 2W]
-                frames.append(grid)
 
-            if not frames:
-                continue
+                # Scale to physical ranges for visualization
+                gt_2d = (radar_gt[i, t, 0] * (z_max - z_min) + z_min).detach().cpu().numpy()
+                pred_2d = (radar_pred[i, t, 0] * (z_max - z_min) + z_min).detach().cpu().numpy()
 
-            # Stack frames vertically: shape [1, H*k, 2W]
-            stacked = torch.cat(frames, dim=-2)
-            idx = batch_idx * B + i
-            out_path = os.path.join(args.out_dir, f"sample_{idx:06d}.png")
-            save_image(stacked, out_path)
+                # Save sat+radar composite [sat_IR | sat_lightning | gt | pred]
+                sat_ir = sat_video[i, t, 0] * (ir_max - ir_min) + ir_min  # [H, W]
+                sat_ir_2d = sat_ir.detach().cpu().numpy()
+                if sat_video.shape[2] > 10:
+                    sat_lgt = sat_video[i, t, 10] * (l_max - l_min) + l_min
+                    sat_lgt_2d = sat_lgt.detach().cpu().numpy()
+                else:
+                    sat_lgt_2d = np.zeros_like(sat_ir_2d)
+                idx = batch_idx * B + i
+                out_path = os.path.join(args.out_dir, f"sample_{idx:06d}_t{t:02d}.png")
+                _save_four_panel_sat_light_radar(
+                    sat_ir_2d,
+                    sat_lgt_2d,
+                    gt_2d,
+                    pred_2d,
+                    cmap_ir,
+                    cmap_lgt,
+                    cmap_rad,
+                    ir_min,
+                    ir_max,
+                    l_min,
+                    l_max,
+                    z_min,
+                    z_max,
+                    out_path,
+                )
+
+            # Note: individual frame images already saved above using colormap.
 
     for b_idx, batch in enumerate(loader):
         if args.max_batches >= 0 and b_idx >= args.max_batches:
