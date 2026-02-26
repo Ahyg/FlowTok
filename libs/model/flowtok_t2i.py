@@ -221,6 +221,32 @@ class FlowTok(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """
+        Make FlowTok compatible with legacy checkpoints that contain
+        `t2t_temperature` and `pos_embed` parameters.
+        """
+        # Handle common wrapper keys first (e.g., {"state_dict": ...}).
+        if isinstance(state_dict, dict):
+            if "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+            elif "model" in state_dict:
+                state_dict = state_dict["model"]
+
+        # Shallow copy so that we don't modify caller's dict.
+        state_dict = dict(state_dict)
+
+        # Legacy `t2t_temperature`: only load it when the current config uses it.
+        if not getattr(self, "use_t2t_temperature", False) and "t2t_temperature" in state_dict:
+            state_dict.pop("t2t_temperature")
+
+        # Legacy `pos_embed`: it is now computed on the fly in `_build_pos_embed`,
+        # so we drop it from old checkpoints to avoid "unexpected key" errors.
+        if self.pos_embed is None and "pos_embed" in state_dict:
+            state_dict.pop("pos_embed")
+
+        return super().load_state_dict(state_dict, strict=strict)
+
     def _build_pos_embed(self, seq_len: int, device: torch.device, dtype: torch.dtype):
         """
         Build positional embedding with explicit temporal (frame) signal for V2V.

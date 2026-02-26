@@ -91,7 +91,7 @@ def train(config):
     total_params = sum(p.numel() for p in nnet.parameters())
     print(f"Total parameters: {total_params / 1e6:.2f}M")
     # nnet = accelerator.prepare(nnet)
-    flowtok_path = None # put your model path here
+    flowtok_path = "/mnt/ssd_1/yghu/Data/flowtok_ckpts/FlowTok-XL.pth" # put your model path here
     nnet.load_state_dict(torch.load(flowtok_path, map_location='cpu'))
     nnet.eval()
     
@@ -145,35 +145,104 @@ def train(config):
 
     eval_bsz = 150
     steps = 20
-    categories = ["animals", "art", "fashion", "food", "indoor", "landscape", "logo", "people", "plants", "vehicles"]
-
-    # Load jsonl files containing prompts
-    json_path = "/opt/tiger/ju/data/MJHQ-30K/meta_data.json"
-    prompts_per_category = categorize_json_data(json_path)
+    
+    # Custom prompts - 10 diverse prompts for testing
+    custom_prompts = [
+        "A majestic lion standing on a rock at sunset, golden hour lighting, photorealistic",
+        "A futuristic cityscape with flying cars and neon lights, cyberpunk style, highly detailed",
+        "A beautiful woman in a vintage red dress walking through a flower garden, soft focus",
+        "A delicious plate of sushi arranged artistically on a black plate, professional food photography",
+        "A cozy modern living room with large windows overlooking mountains, natural lighting",
+        "A serene mountain landscape with a lake reflecting snow-capped peaks, morning mist",
+        "A minimalist logo design featuring a stylized bird in flight, clean vector art",
+        "A group of diverse people laughing together in a cafe, candid photography style",
+        "A close-up of a vibrant sunflower field under blue sky, macro photography",
+        "A sleek red sports car on a winding mountain road, dramatic lighting, automotive photography"
+    ]
+    
+    # Check if using custom prompts or MJHQ dataset
+    use_custom_prompts = os.environ.get('USE_CUSTOM_PROMPTS', 'true').lower() == 'true'
+    
+    if use_custom_prompts:
+        # Use custom prompts
+        logging.info(f"Using {len(custom_prompts)} custom prompts")
+        prompts = custom_prompts
+        output_base = os.path.join(config.workdir, 'custom_eval')
+    else:
+        # Load MJHQ dataset prompts
+        categories = ["animals", "art", "fashion", "food", "indoor", "landscape", "logo", "people", "plants", "vehicles"]
+        json_path = os.environ.get('MJHQ_META_PATH', '/mnt/ssd_1/yghu/Data/MJHQ-30K/meta_data.json')
+        if not os.path.exists(json_path):
+            alt_paths = [
+                os.path.join(config.workdir, 'MJHQ-30K', 'meta_data.json'),
+                os.path.join(os.path.dirname(config.workdir), 'MJHQ-30K', 'meta_data.json'),
+                '/mnt/ssd_1/yghu/Data/MJHQ-30K/meta_data.json',
+            ]
+            for alt_path in alt_paths:
+                if os.path.exists(alt_path):
+                    json_path = alt_path
+                    break
+            else:
+                raise FileNotFoundError(f"MJHQ meta_data.json not found. Please set MJHQ_META_PATH environment variable or place the file in one of: {alt_paths}")
+        
+        prompts_per_category = categorize_json_data(json_path)
+        if prompts_per_category is None:
+            raise FileNotFoundError(f"Failed to load MJHQ data from {json_path}")
+        output_base = os.path.join(config.workdir, 'mjhq_eval')
+    
+    os.makedirs(output_base, exist_ok=True)
+    
     for cfg in [2.0]:
-        root = os.path.join('/opt/tiger/ju/vis/FlowTok-H/MJHQ', f'mjhq_cfg_{cfg}_step_{steps}')
+        root = os.path.join(output_base, f'cfg_{cfg}_step_{steps}')
         os.makedirs(root, exist_ok=True)
-        for category in categories:
-            os.makedirs(os.path.join(root, category), exist_ok=True)
-            ids_prompts = prompts_per_category[category]
-            ids_prompts = sorted(ids_prompts, key=lambda x: x['id'])
-            for i in tqdm(range(0, len(ids_prompts), eval_bsz)):
-                batch = ids_prompts[i:i+eval_bsz]
-                id = map(lambda x: x['id'], batch)
-                captions = list(map(lambda x: x['prompt'], batch))
-                samples = ode_fm_solver_sample(nnet, eval_bsz, steps, captions, cfg)
+        
+        if use_custom_prompts:
+            # Simple generation for custom prompts
+            for idx in tqdm(range(0, len(prompts), eval_bsz)):
+                batch_prompts = prompts[idx:idx+eval_bsz]
+                batch_size = len(batch_prompts)
+                samples = ode_fm_solver_sample(nnet, batch_size, steps, batch_prompts, cfg)
                 if accelerator.is_main_process:
                     generated = samples.mul(255).add_(0.5).clamp_(0, 255)
                     images_for_saving = [DF.to_pil_image(gen.cpu().byte()) for gen in generated]
-
-                    for i, (id, img) in enumerate(zip(id, images_for_saving)):
-                        filename = f"{id}.png"
-                        path = os.path.join(os.path.join(root, category), filename)
+                    
+                    for i, (prompt, img) in enumerate(zip(batch_prompts, images_for_saving)):
+                        # Create a safe filename from prompt (first 50 chars, sanitized)
+                        safe_name = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in prompt[:50])
+                        safe_name = safe_name.replace(' ', '_').strip('_')
+                        filename = f"{idx+i:03d}_{safe_name}.png"
+                        path = os.path.join(root, filename)
                         img.save(path)
+                        logging.info(f"Saved: {filename}")
+        else:
+            # Original MJHQ evaluation logic
+            for category in categories:
+                os.makedirs(os.path.join(root, category), exist_ok=True)
+                ids_prompts = prompts_per_category[category]
+                ids_prompts = sorted(ids_prompts, key=lambda x: x['id'])
+                for i in tqdm(range(0, len(ids_prompts), eval_bsz)):
+                    batch = ids_prompts[i:i+eval_bsz]
+                    id = map(lambda x: x['id'], batch)
+                    captions = list(map(lambda x: x['prompt'], batch))
+                    samples = ode_fm_solver_sample(nnet, eval_bsz, steps, captions, cfg)
+                    if accelerator.is_main_process:
+                        generated = samples.mul(255).add_(0.5).clamp_(0, 255)
+                        images_for_saving = [DF.to_pil_image(gen.cpu().byte()) for gen in generated]
+
+                        for i, (id, img) in enumerate(zip(id, images_for_saving)):
+                            filename = f"{id}.png"
+                            path = os.path.join(os.path.join(root, category), filename)
+                            img.save(path)
         
-        score = fid.compute_fid(root, dataset_name=f"MJHQ-30K_all", mode="clean", dataset_split="custom")
-        with open(os.path.join("/opt/tiger/ju/vis/FlowTok-H/MJHQ/", "fid_scores.txt"), 'a') as file:
-            file.write(f'{cfg}_{steps}: {score}\n')
+        if not use_custom_prompts:
+            # Only compute FID for MJHQ dataset
+            score = fid.compute_fid(root, dataset_name=f"MJHQ-30K_all", mode="clean", dataset_split="custom")
+            fid_scores_file = os.path.join(output_base, "fid_scores.txt")
+            with open(fid_scores_file, 'a') as file:
+                file.write(f'{cfg}_{steps}: {score}\n')
+            logging.info(f'FID score (cfg={cfg}, steps={steps}): {score}')
+        else:
+            logging.info(f'Custom prompts evaluation complete. Images saved to: {root}')
 
     
 

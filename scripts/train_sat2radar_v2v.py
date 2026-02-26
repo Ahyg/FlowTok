@@ -131,6 +131,31 @@ def build_dataloader(config, mode: str, accelerator: accelerate.Accelerator):
         drop_last=True if mode == "train" else False,
         collate_fn=collate_fn,
     )
+    
+    # Log dataset info
+    if accelerator.is_main_process:
+        dataset_mode = "sat2radar_v2v" if use_v2v else "sat2radar_video"
+        num_samples = len(dataset)
+        num_batches = len(dataloader)
+        logging.info(f"Dataset [{mode.upper()}]:")
+        logging.info(f"  Split: {split}")
+        logging.info(f"  Mode: {dataset_mode}")
+        logging.info(f"  Samples: {num_samples}")
+        logging.info(f"  Batches: {num_batches}")
+        logging.info(f"  Batch size (per GPU): {config.train.batch_size // accelerator.num_processes}")
+        if use_v2v:
+            num_frames_cfg = config.dataset.get("num_frames", (1, 8))
+            logging.info(f"  Frame stride: {config.dataset.get('frame_stride', 1)}")
+            if isinstance(num_frames_cfg, tuple):
+                logging.info(f"  Num frames: {num_frames_cfg[0]}-{num_frames_cfg[1]} (variable)")
+            else:
+                logging.info(f"  Num frames: {num_frames_cfg}")
+        else:
+            logging.info(f"  History frames: {config.dataset.get('history_frames', None)}")
+            logging.info(f"  Future frames: {config.dataset.get('future_frames', None)}")
+            logging.info(f"  Frame stride: {config.dataset.get('frame_stride', 1)}")
+        logging.info(f"  Filelist: {config.dataset.filelist_path}")
+    
     return dataloader
 
 
@@ -169,6 +194,8 @@ def train(config):
     train_dataloader = build_dataloader(config, mode="train", accelerator=accelerator)
     # 评估时可以单独 build val dataloader；这里简单起见复用 train split 或者你之后自行扩展
     eval_dataloader = None
+    
+    # Dataset info is already logged in build_dataloader
 
     # ========= FlowTok backbone & optimizer =========
     train_state = flow_utils.initialize_train_state(config, device)

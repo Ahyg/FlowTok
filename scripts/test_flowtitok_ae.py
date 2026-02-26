@@ -5,7 +5,6 @@ import sys
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from omegaconf import OmegaConf
 from skimage.metrics import structural_similarity as ssim
 from torch.utils.data import DataLoader
@@ -14,6 +13,13 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import cmweather
 import cmcrameri
+
+try:
+    from pysteps.verification.spatialscores import fss_init, fss_accum, fss_compute
+    PYSTEPS_AVAILABLE = True
+except ImportError:
+    PYSTEPS_AVAILABLE = False
+    print("[WARN] pysteps not available; FSS will be skipped.")
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -55,31 +61,34 @@ def _parse_csv_numbers(value, cast=float):
     return [cast(v.strip()) for v in value.split(",") if v.strip() != ""]
 
 
-def _fss_score(pred2d, target2d, thr, scale):
-    # pred2d/target2d: torch.Tensor [H, W]
-    pred_bin = (pred2d >= thr).float()
-    target_bin = (target2d >= thr).float()
-    scale = max(int(scale), 1)
-    padding = scale // 2
-    pred_frac = F.avg_pool2d(pred_bin[None, None], kernel_size=scale, stride=1, padding=padding)[0, 0]
-    tgt_frac = F.avg_pool2d(target_bin[None, None], kernel_size=scale, stride=1, padding=padding)[0, 0]
-    num = torch.sum((pred_frac - tgt_frac) ** 2)
-    den = torch.sum(pred_frac ** 2 + tgt_frac ** 2)
-    if den.item() == 0:
-        return 1.0
-    return 1.0 - (num / den).item()
-
-
-def _avg_fss(pred2d, target2d, thrs, scales):
-    if not thrs:
-        thrs = [0.0]
-    if not scales:
-        scales = [1]
-    scores = []
+def _build_pysteps_fss_objects(thrs, scales):
+    """Build one FSS accumulator per (thr, scale) for pysteps accumulated FSS."""
+    if not PYSTEPS_AVAILABLE or not thrs or not scales:
+        return {}
+    objs = {}
     for thr in thrs:
         for scale in scales:
-            scores.append(_fss_score(pred2d, target2d, thr, scale))
-    return float(np.mean(scores))
+            objs[(thr, scale)] = fss_init(thr=thr, scale=float(max(int(scale), 1)))
+    return objs
+
+
+def _pysteps_fss_accum(pysteps_fss_objects, pred_2d_np, tgt_2d_np):
+    """Accumulate one forecast-observation pair into pysteps FSS objects."""
+    if not pysteps_fss_objects or pred_2d_np is None or tgt_2d_np is None:
+        return
+    for fss_obj in pysteps_fss_objects.values():
+        fss_accum(fss_obj, pred_2d_np, tgt_2d_np)
+
+
+def _pysteps_fss_compute_avg(pysteps_fss_objects):
+    """Compute FSS for each (thr, scale) and return the mean (and list of values)."""
+    if not pysteps_fss_objects:
+        return 0.0, []
+    values = []
+    for fss_obj in pysteps_fss_objects.values():
+        v = fss_compute(fss_obj)
+        values.append(float(v) if np.isfinite(v) else np.nan)
+    return float(np.nanmean(values)) if values else 0.0, values
 
 
 @torch.no_grad()
@@ -157,12 +166,25 @@ def main():
     else:
         thrs_sat = thrs
 
+    # pysteps accumulated FSS: one object per (thr, scale)
+    if PYSTEPS_AVAILABLE:
+        if fss_mode == "radar":
+            pysteps_fss_objects = _build_pysteps_fss_objects(thrs, scales)
+            pysteps_fss_ir = {}
+            pysteps_fss_lightning = {}
+        else:
+            pysteps_fss_objects = {}
+            pysteps_fss_ir = _build_pysteps_fss_objects(thrs_sat, scales)
+            pysteps_fss_lightning = _build_pysteps_fss_objects(thrs, scales) if ds_cfg.get("use_lightning", True) else {}
+    else:
+        pysteps_fss_objects = {}
+        pysteps_fss_ir = {}
+        pysteps_fss_lightning = {}
+
     mse_total = 0.0
     mse_count = 0
     ssim_total = 0.0
     ssim_count = 0
-    fss_total = 0.0
-    fss_count = 0
 
     for b_idx, batch in enumerate(eval_loader):
         do_metrics = args.max_batches_metrics < 0 or b_idx < args.max_batches_metrics
@@ -202,21 +224,20 @@ def main():
                     ssim_total += ssim(img[ch], rec[ch], data_range=1.0)
                     ssim_count += 1
 
-                    if ds_cfg.get("mode", "satellite") == "radar":
-                        pred_scaled = torch.from_numpy(rec[ch] * (z_max - z_min) + z_min)
-                        tgt_scaled = torch.from_numpy(img[ch] * (z_max - z_min) + z_min)
-                        fss_total += _avg_fss(pred_scaled, tgt_scaled, thrs, scales)
-                    else:
-                        if ds_cfg.get("use_lightning", True) and ch == 10:
-                            # Lightning channel uses physical range [0.1, 50]
-                            pred_scaled = torch.from_numpy(rec[ch] * (l_max - l_min) + l_min)
-                            tgt_scaled = torch.from_numpy(img[ch] * (l_max - l_min) + l_min)
-                            fss_total += _avg_fss(pred_scaled, tgt_scaled, thrs, scales)
-                        else:
-                            pred_scaled = torch.from_numpy(rec[ch])
-                            tgt_scaled = torch.from_numpy(img[ch])
-                            fss_total += _avg_fss(pred_scaled, tgt_scaled, thrs_sat, scales)
-                    fss_count += 1
+                    # pysteps accumulated FSS (physical units for threshold)
+                    if ds_cfg.get("mode", "satellite") == "radar" and pysteps_fss_objects:
+                        pred_np = (rec[ch] * (z_max - z_min) + z_min).astype(np.float64)
+                        tgt_np = (img[ch] * (z_max - z_min) + z_min).astype(np.float64)
+                        _pysteps_fss_accum(pysteps_fss_objects, pred_np, tgt_np)
+                    elif ds_cfg.get("mode", "satellite") != "radar":
+                        if ds_cfg.get("use_lightning", True) and ch == 10 and pysteps_fss_lightning:
+                            pred_np = (rec[ch] * (l_max - l_min) + l_min).astype(np.float64)
+                            tgt_np = (img[ch] * (l_max - l_min) + l_min).astype(np.float64)
+                            _pysteps_fss_accum(pysteps_fss_lightning, pred_np, tgt_np)
+                        elif ch < 10 and pysteps_fss_ir:
+                            pred_np = rec[ch].astype(np.float64)
+                            tgt_np = img[ch].astype(np.float64)
+                            _pysteps_fss_accum(pysteps_fss_ir, pred_np, tgt_np)
 
         # Save images (can be limited separately)
         if do_images:
@@ -255,7 +276,17 @@ def main():
 
     avg_mse = mse_total / max(mse_count, 1)
     avg_ssim = ssim_total / max(ssim_count, 1)
-    avg_fss = fss_total / max(fss_count, 1)
+    # Combine FSS from radar or (IR + lightning) accumulators
+    all_fss_vals = []
+    if pysteps_fss_objects:
+        _, all_fss_vals = _pysteps_fss_compute_avg(pysteps_fss_objects)
+    if pysteps_fss_ir:
+        _, v = _pysteps_fss_compute_avg(pysteps_fss_ir)
+        all_fss_vals.extend(v)
+    if pysteps_fss_lightning:
+        _, v = _pysteps_fss_compute_avg(pysteps_fss_lightning)
+        all_fss_vals.extend(v)
+    avg_fss = float(np.nanmean(all_fss_vals)) if all_fss_vals else 0.0
 
     metrics = {
         "avg_mse": avg_mse,
@@ -264,6 +295,7 @@ def main():
         "num_samples": int(mse_count),
         "fss_thresholds": thrs,
         "fss_scales": scales,
+        "fss_method": "pysteps_accumulated" if (pysteps_fss_objects or pysteps_fss_ir or pysteps_fss_lightning) else "none",
     }
     print("Metrics:", metrics)
     with open(os.path.join(args.out_dir, "metrics.json"), "w", encoding="utf-8") as f:

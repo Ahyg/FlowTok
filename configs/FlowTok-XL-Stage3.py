@@ -25,7 +25,7 @@ model = Args(
         clip_loss_weight=0.0,
         align_quantized=False,
         use_pretrained=False,
-        tokenizer_checkpoint='/opt/tiger/ju/ckpt/flowtitok_swiglu_bl77_vae/pytorch_model_512.bin',
+        tokenizer_checkpoint='/mnt/ssd_1/yghu/Data/flowtok_ckpts/FlowTiTok_512.bin',
         freeze_encoder=False,
     ),
 )
@@ -39,7 +39,7 @@ def get_config():
     config = ml_collections.ConfigDict()
 
     config.seed = 1234
-    config.tokenizer_checkpoint = '/opt/tiger/ju/ckpt/flowtitok_swiglu_bl77_vae/pytorch_model_512.bin'
+    config.tokenizer_checkpoint = '/mnt/ssd_1/yghu/Data/flowtok_ckpts/FlowTiTok_512.bin'
 
     config.autoencoder = d(
         pretrained_path='assets/stable-diffusion/autoencoder_kl.pth',

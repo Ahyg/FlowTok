@@ -109,6 +109,21 @@ def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
         drop_last=False,
         collate_fn=collate_sat2radar_v2v,
     )
+    
+    # Log dataset info
+    num_samples = len(dataset)
+    num_batches = len(loader)
+    num_frames_cfg = num_frames if mode == "i2i" else config.dataset.get("num_frames", 16)
+    print(f"Dataset [{split.upper()}]:")
+    print(f"  Split: {split}")
+    print(f"  Mode: {mode} (sat2radar_v2v)")
+    print(f"  Samples: {num_samples}")
+    print(f"  Batches: {num_batches}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Num frames: {num_frames_cfg}")
+    print(f"  Frame stride: {config.dataset.get('frame_stride', 1)}")
+    print(f"  Filelist: {config.dataset.filelist_path}")
+    
     return loader
 
 

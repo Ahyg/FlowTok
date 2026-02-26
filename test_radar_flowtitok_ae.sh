@@ -2,12 +2,12 @@
 set -euo pipefail
 
 CONFIG_PATH="/mnt/ssd_1/yghu/Code/FlowTok/configs/radar_flowtitok_ae_bl77_vae.yaml"
-CHECKPOINT_PATH="/mnt/ssd_1/yghu/Experiments/radar_flowtitok_ae_bl77_vae_run1/checkpoint-650000/ema_model/pytorch_model.bin"
+CHECKPOINT_PATH="/mnt/ssd_1/yghu/Experiments/radar_flowtitok_ae_bl77_vae_run1/checkpoint-400000/unwrapped_model/pytorch_model.bin"
 OUTPUT_DIR="/mnt/ssd_1/yghu/Experiments/radar_flowtitok_ae_bl77_vae_run1/test_images"
 MAX_BATCHES_METRICS=-1
 MAX_BATCHES_IMAGES=32
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 
 python /mnt/ssd_1/yghu/Code/FlowTok/scripts/test_flowtitok_ae.py \
   --config "${CONFIG_PATH}" \
