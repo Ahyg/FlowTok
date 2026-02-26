@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -8,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from skimage.metrics import structural_similarity as ssim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms, utils as vutils
+from torchvision import utils as vutils
 
 import open_clip
 
@@ -24,16 +25,17 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from libs.flowtitok import FlowTiTok  # noqa: E402
+from data.dataset import SatelliteRadarNpyDataset  # noqa: E402
 
 
 def load_py_config(config_path: str):
     """
-    Load a Python config file (e.g. configs/FlowTok-XL-Stage1.py) that defines get_config().
+    Load a Python config file (e.g. configs/FlowTok-XL-Stage3.py) that defines get_config().
     """
     import importlib.util
 
     config_path = os.path.abspath(config_path)
-    spec = importlib.util.spec_from_file_location("flowtok_config", config_path)
+    spec = importlib.util.spec_from_file_location("flowtok_config_sat", config_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot import config from {config_path}")
     module = importlib.util.module_from_spec(spec)
@@ -76,41 +78,41 @@ def _pysteps_fss_compute_avg(pysteps_fss_objects):
     return float(np.nanmean(values)) if values else 0.0, values
 
 
-def build_imagenet_like_dataloader(config, data_root: str, split: str, batch_size: int, num_workers: int):
+def build_satellite_dataloader(
+    data_root: str,
+    filelist: str,
+    split: str,
+    batch_size: int,
+    num_workers: int,
+    ir_band_indices=(0, 2, 6),
+):
     """
-    Build a dataloader over natural images arranged like ImageNet:
-        data_root/
-          train/cls_x/xxx.jpg
-          val/cls_y/yyy.jpg
-          ...
+    Build a dataloader over fused satellite .npy frames (shape: [12, H, W]).
 
-    We care about images and class labels (the latter are used to
-    construct simple text prompts when --use_text is enabled).
-
-    Uses:
-      - resize_shorter_edge -> Resize
-      - crop_size -> CenterCrop
-      - ToTensor in [0, 1]
+    - Uses SatelliteRadarNpyDataset with:
+        * mode="satellite"
+        * ir_band_indices = (0, 2, 6)  -> IR 7, 9, 13 channels
+        * use_lightning = False
+        * filelist_path = dataset_filelist_i2i.pkl
+        * filelist_split = split (e.g. "val")
+    - The dataset internally applies `scale_sat_lgt_img`, so IR is scaled to [0, 1].
+    - We then treat the selected 3 IR channels as pseudo-RGB for visualization.
     """
-    if split not in {"train", "val"}:
-        raise ValueError(f"Unsupported split {split}, expected 'train' or 'val'.")
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"Unsupported split {split}, expected 'train', 'val' or 'test'.")
 
-    resize_shorter = int(getattr(config.dataset, "resize_shorter_edge", 256))
-    crop_size = int(getattr(config.dataset, "crop_size", 256))
+    filelist_path = os.path.abspath(filelist)
+    if not os.path.isfile(filelist_path):
+        raise FileNotFoundError(f"Filelist not found: {filelist_path}")
 
-    t_list = [
-        transforms.Resize(resize_shorter, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.CenterCrop(crop_size),
-        transforms.ToTensor(),  # [0,1]
-    ]
-
-    transform = transforms.Compose(t_list)
-
-    split_dir = os.path.join(data_root, split)
-    if not os.path.isdir(split_dir):
-        raise FileNotFoundError(f"Split directory not found: {split_dir}")
-
-    dataset = datasets.ImageFolder(root=split_dir, transform=transform)
+    dataset = SatelliteRadarNpyDataset(
+        base_dir=os.path.abspath(data_root),
+        mode="satellite",
+        ir_band_indices=ir_band_indices,
+        use_lightning=False,
+        filelist_path=filelist_path,
+        filelist_split=split,
+    )
 
     loader = DataLoader(
         dataset,
@@ -125,27 +127,34 @@ def build_imagenet_like_dataloader(config, data_root: str, split: str, batch_siz
 
 @torch.no_grad()
 def main():
-    parser = argparse.ArgumentParser("Test FlowTiTok image tokenizer on natural images (e.g. ImageNet).")
+    parser = argparse.ArgumentParser(
+        "Test FlowTiTok image tokenizer on satellite fused npy data (pseudo-RGB from IR 7/9/13)."
+    )
     parser.add_argument(
         "--config",
         required=True,
-        help="Python config file, e.g. configs/FlowTok-XL-Stage1.py (must define get_config()).",
+        help="Python config file, e.g. configs/FlowTok-XL-Stage3.py (must define get_config()).",
     )
     parser.add_argument(
         "--ckpt",
         required=True,
-        help="Tokenizer checkpoint path, e.g. flowtok_image_tokenizer.bin.",
+        help="Tokenizer checkpoint path, e.g. FlowTiTok_512.bin.",
     )
     parser.add_argument(
         "--data_root",
         required=True,
-        help="Root folder of natural image dataset (ImageFolder-style, containing train/ and/or val/).",
+        help="Root folder of satellite npy data, e.g. /mnt/ssd_1/yghu/Data/71_3m.",
+    )
+    parser.add_argument(
+        "--filelist",
+        required=True,
+        help="Path to dataset_filelist_i2i.pkl under data_root.",
     )
     parser.add_argument(
         "--split",
         default="val",
-        choices=["train", "val"],
-        help="Which split under data_root to evaluate on (default: val).",
+        choices=["train", "val", "test"],
+        help="Which split in dataset_filelist_i2i.pkl to evaluate on (default: val).",
     )
     parser.add_argument(
         "--out_dir",
@@ -155,7 +164,7 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=32,
+        default=16,
         help="Batch size for evaluation.",
     )
     parser.add_argument(
@@ -184,7 +193,7 @@ def main():
     parser.add_argument(
         "--use_text",
         action="store_true",
-        help="If set, build text prompts from class names and encode them with CLIP as text_guidance.",
+        help="If set, build simple CLIP text features from filenames as text_guidance.",
     )
     parser.add_argument(
         "--fss_thresholds",
@@ -207,26 +216,24 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build dataloader over natural images.
-    loader = build_imagenet_like_dataloader(
-        config=config,
+    # Build satellite dataloader.
+    loader = build_satellite_dataloader(
         data_root=args.data_root,
+        filelist=args.filelist,
         split=args.split,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        ir_band_indices=(0, 2, 6),
     )
-    class_names = loader.dataset.classes
 
-    # Log dataset info.
     num_samples = len(loader.dataset)
     num_batches = len(loader)
-    print(f"Tokenizer eval dataset [{args.split.upper()}]:")
-    print(f"  Root: {args.data_root}")
-    print(f"  Samples: {num_samples}")
-    print(f"  Batches: {num_batches}")
+    print(f"Tokenizer eval dataset [{args.split.upper()}] (satellite npy, IR 0/2/6 as pseudo-RGB):")
+    print(f"  Data root: {args.data_root}")
+    print(f"  Filelist : {args.filelist}")
+    print(f"  Samples  : {num_samples}")
+    print(f"  Batches  : {num_batches}")
     print(f"  Batch size: {args.batch_size}")
-    print(f"  Resize shorter edge: {getattr(config.dataset, 'resize_shorter_edge', 256)}")
-    print(f"  Crop size: {getattr(config.dataset, 'crop_size', 256)}")
 
     # Build FlowTiTok tokenizer and load weights.
     tokenizer = FlowTiTok(config)
@@ -238,9 +245,9 @@ def main():
     clip_encoder = None
     clip_tokenizer = None
     if args.use_text:
-        print("[INFO] Using CLIP text features as text_guidance.")
+        print("[INFO] Using CLIP text features as text_guidance (from filenames).")
         clip_encoder, _, _ = open_clip.create_model_and_transforms("ViT-L-14-336", pretrained="openai")
-        # We only need the text branch.
+        # Only keep text branch.
         del clip_encoder.visual
         clip_tokenizer = open_clip.get_tokenizer("ViT-L-14-336")
         clip_encoder.transformer.batch_first = False
@@ -262,7 +269,7 @@ def main():
     # For saving visualization grids.
     saved_images = 0
 
-    def _save_batch_images(batch_idx, images, recons):
+    def _save_batch_images(batch_idx, images, recons, paths):
         nonlocal saved_images
         # images/recons: [B, 3, H, W] in [0,1] (we clamp before calling)
         b = images.size(0)
@@ -274,33 +281,52 @@ def main():
             triplet = torch.cat([x, y, diff], dim=2)  # [3, H, 3W]
             grid_list.append(triplet)
         grid = torch.cat(grid_list, dim=1)  # [3, B*H, 3W]
-        # Save as a single image.
         out_path = os.path.join(args.out_dir, f"recon_batch{batch_idx:04d}.png")
         vutils.save_image(grid, out_path)
         saved_images += 1
 
+        # Optionally, save a small text file listing the underlying npy paths for this batch.
+        txt_path = os.path.join(args.out_dir, f"recon_batch{batch_idx:04d}_paths.txt")
+        with open(txt_path, "w") as f:
+            for p in paths:
+                f.write(str(p) + "\n")
+
+    # Text guidance.
     text_context_length = getattr(config.vq_model, "text_context_length", 77)
     text_embed_dim = getattr(config.vq_model, "text_embed_dim", 768)
 
-    for b_idx, (imgs, labels) in enumerate(loader):
+    for b_idx, batch in enumerate(loader):
         do_metrics = args.max_batches_metrics < 0 or b_idx < args.max_batches_metrics
         do_images = args.max_batches_images < 0 or b_idx < args.max_batches_images
         if not do_metrics and not do_images:
             break
 
-        imgs = imgs.to(
+        imgs = batch["image"].to(
             device,
             memory_format=torch.contiguous_format,
             non_blocking=True,
-        )  # [B, 3, H, W] in [0,1]
+        )  # [B, 3, H, W] in [0,1] after scaling
 
-        # Build text_guidance.
+        # 确保空间尺寸与 tokenizer 预训练时一致（例如 512x512），
+        # 否则 ViT patch 数量和 RoPE 的预设 grid_size^2 会不匹配，导致维度错误。
+        crop_size = int(getattr(config.dataset, "crop_size", 512))
+        if imgs.shape[-2] != crop_size or imgs.shape[-1] != crop_size:
+            imgs = F.interpolate(
+                imgs,
+                size=(crop_size, crop_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        paths = batch["path"]  # list of strings
+
+        # 构造 text_guidance。
         if args.use_text:
-            # Text prompts: "A photo of a {classname}."
+            # 用文件名构造简单文本提示，例如：
+            # "A satellite weather image from <filename>."
             texts = []
-            for lb in labels:
-                cls_name = class_names[lb.item()] if isinstance(lb, torch.Tensor) else class_names[lb]
-                texts.append(f"A photo of a {cls_name}.")
+            for p in paths:
+                fname = os.path.basename(p)
+                texts.append(f"A satellite weather image from {fname}.")
             with torch.no_grad():
                 text_tokens = clip_tokenizer(texts).to(device)
                 cast_dtype = clip_encoder.transformer.get_cast_dtype()
@@ -311,7 +337,7 @@ def main():
                 text_tokens = text_tokens.permute(1, 0, 2)  # LND -> NLD
                 text_tokens = clip_encoder.ln_final(text_tokens)  # [B, n_ctx, d_model]
 
-                # Adapt CLIP context length to FlowTiTok expectation.
+                # 适配到 FlowTiTok 期望的 text_context_length。
                 if text_tokens.shape[1] > text_context_length:
                     text_tokens = text_tokens[:, :text_context_length, :]
                 elif text_tokens.shape[1] < text_context_length:
@@ -325,14 +351,14 @@ def main():
                     )
                     text_tokens = torch.cat([text_tokens, pad], dim=1)
 
-                # Adapt embedding dim if needed.
+                # 适配到 FlowTiTok 期望的 text_embed_dim。
                 if text_tokens.shape[2] != text_embed_dim:
                     proj = torch.nn.Linear(text_tokens.shape[2], text_embed_dim, bias=False).to(device)
                     text_tokens = proj(text_tokens)
 
                 text_guidance = text_tokens.to(imgs.dtype)
         else:
-            # No text: fall back to zeros (same behavior as training without text).
+            # 不使用文本时，使用全 0，引导方式与论文中无文本设定一致。
             text_guidance = torch.zeros(
                 imgs.shape[0],
                 text_context_length,
@@ -342,11 +368,11 @@ def main():
             )
 
         # Forward through tokenizer.
-        print("imgs min max:", imgs.min(), imgs.max())
+        print(f"[batch {b_idx+1}/{num_batches}] imgs min/max:", float(imgs.min()), float(imgs.max()))
         recons, _ = tokenizer(imgs, text_guidance=text_guidance)  # [B, 3, H, W]
-        print("recons min max before clamp:", recons.min(), recons.max())
+        print("  recons min/max before clamp:", float(recons.min()), float(recons.max()))
         recons = torch.clamp(recons, 0.0, 1.0)
-        print("recons min max after clamp:", recons.min(), recons.max())
+        print("  recons min/max after clamp:", float(recons.min()), float(recons.max()))
 
         if do_metrics:
             # Compute MSE, SSIM, and optionally FSS per image (0-1 space).
@@ -373,10 +399,9 @@ def main():
                     )
 
         if do_images:
-            _save_batch_images(b_idx, imgs, recons)
+            _save_batch_images(b_idx, imgs, recons, paths)
 
         if mse_count > 0 and (b_idx + 1) % 10 == 0:
-            # Intermediate metrics.
             batch_mse = mse_total / mse_count
             batch_ssim = ssim_total / ssim_count if ssim_count > 0 else 0.0
             batch_fss = None
@@ -417,9 +442,6 @@ def main():
         print(f"Final FSS (avg over thresholds/scales): {avg_fss:.6f}")
     else:
         metrics["fss_method"] = "none"
-
-    # Save metrics.json
-    import json
 
     metrics_path = os.path.join(args.out_dir, "metrics.json")
     with open(metrics_path, "w") as f:

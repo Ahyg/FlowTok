@@ -71,7 +71,7 @@ def main():
         split_batches=False,
     )
 
-    logger = setup_logger(name="FlowTok-AE", log_level="INFO",
+    logger = setup_logger(name="FlowTiTok-AE", log_level="INFO",
      output_file=f"{output_dir}/log{accelerator.process_index}.txt")
 
     # We need to initialize the trackers we use, and also store our configuration.

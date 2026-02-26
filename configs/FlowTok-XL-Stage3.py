@@ -11,6 +11,9 @@ model = Args(
     learn_sigma = False, # different from DiT, we direct predict noise here
     channels = 16,
     use_t2i = True,
+    # Enable t2t_temperature so that the FlowTok checkpoint parameter is used
+    # instead of being dropped during loading.
+    use_t2t_temperature = True,
     clip_dim=768,
     num_clip_token=77,
     gradient_checking=False, # for larger model
