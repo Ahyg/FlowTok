@@ -240,7 +240,15 @@ def main():
             sat_autoencoder, sat_video, config.vq_model.scale_factor
         )
 
-        x0, _, _ = nnet_ema(sat_tokens, text_encoder=True)
+        # 采样阶段与训练 / 测试保持一致：
+        # - 默认：使用 textVAE，对 sat_tokens 做编码得到 x0 作为 flow 起点；
+        # - 可选（config.use_text_vae_encoder == False）：直接使用 sat_tokens 作为起点。
+        use_text_vae_encoder = getattr(config, "use_text_vae_encoder", True)
+        if use_text_vae_encoder:
+            x0, _, _ = nnet_ema(sat_tokens, text_encoder=True)
+        else:
+            x0 = sat_tokens
+
         if config.nnet.model_args.noising_type != "none":
             x0 = x0 + torch.randn_like(x0) * config.sample.noise_scale
 

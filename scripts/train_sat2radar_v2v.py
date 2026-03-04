@@ -397,7 +397,16 @@ def train(config):
                 sat_autoencoder, sat_video, config.vq_model.scale_factor
             )  # [B, L, C]
 
-            x0, _, _ = nnet_ema_local(sat_tokens, text_encoder=True)
+            # 采样阶段与训练阶段保持一致：
+            # - 默认：使用 textVAE，对 sat_tokens 做编码得到 x0 作为 flow 起点；
+            # - 可选（config.use_text_vae_encoder == False）：直接使用 sat_tokens 作为起点，实现
+            #   “从卫星 tokens → 雷达 tokens” 的显式 flow，而不经过 textVAE。
+            use_text_vae_encoder = getattr(config, "use_text_vae_encoder", True)
+            if use_text_vae_encoder:
+                x0, _, _ = nnet_ema_local(sat_tokens, text_encoder=True)
+            else:
+                x0 = sat_tokens
+
             if config.nnet.model_args.noising_type != "none":
                 x0 = x0 + torch.randn_like(x0) * config.sample.noise_scale
 

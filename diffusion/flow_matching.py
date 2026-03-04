@@ -229,7 +229,17 @@ class FlowMatching(nn.Module):
         contrastive_loss_weight = all_config.losses.contrastive_loss_weight
         kld_loss_weight = all_config.losses.kld_loss_weight
 
-        x0, mu, log_var = nnet(cond, text_encoder = True)
+        # 可选：允许在某些任务中关闭 textVAE，直接使用 cond 作为噪声起点（例如 sat tokens -> radar tokens）。
+        # 为了兼容旧配置，默认启用 textVAE，只有在 config.use_text_vae_encoder == False 时才跳过。
+        use_text_vae_encoder = getattr(all_config, "use_text_vae_encoder", True)
+
+        if use_text_vae_encoder:
+            x0, mu, log_var = nnet(cond, text_encoder=True)
+        else:
+            # 直接使用 cond 作为 latent 起点；mu/log_var 仅为占位，以便后续逻辑安全运行。
+            x0 = cond
+            mu = torch.zeros_like(cond)
+            log_var = torch.zeros_like(cond)
 
         # Initialize losses to zero for the common case where the weights are 0.
         # This avoids UnboundLocalError when contrastive or KLD losses are disabled.
@@ -245,7 +255,7 @@ class FlowMatching(nn.Module):
             x0 = x0 + noising_scale * random_noise
 
         ############ loss for Text VE
-        if contrastive_loss_weight > 0:
+        if use_text_vae_encoder and contrastive_loss_weight > 0:
             B, L, C = cond.shape
             cond_projected, t2t_temperature = nnet(cond, text_projector = True)
 
@@ -263,7 +273,7 @@ class FlowMatching(nn.Module):
             cond_loss = F.cross_entropy(logits_per_cond, targets)
             contrastive_loss = (x0_loss + cond_loss) * contrastive_loss_weight / 2
 
-        if kld_loss_weight > 0:
+        if use_text_vae_encoder and kld_loss_weight > 0:
             kld_loss = -0.5 * torch.sum(1 + log_var - (0.3 * mu) ** 6 - log_var.exp())
             kld_loss = kld_loss * kld_loss_weight
         
