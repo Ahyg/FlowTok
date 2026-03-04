@@ -14,6 +14,13 @@ from matplotlib import colors as mcolors
 from tqdm import tqdm
 import cmweather
 import cmcrameri
+import open_clip
+
+try:
+    import imageio
+    HAS_IMAGEIO = True
+except ImportError:
+    HAS_IMAGEIO = False
 
 # Import pysteps FSS functions
 try:
@@ -103,12 +110,38 @@ def encode_video_with_autoencoder(autoencoder, video, scale_factor: float):
     return: tokens [B, T*L, C_tok]
     """
     B, T, C, H, W = video.shape
+
+    # 将输入 resize 到 AE 预训练时的分辨率（例如 512x512），
+    # 避免 FlowTiTok 的 RoPE 位置编码与 checkpoint 中的形状不一致。
+    ae_ds_cfg = getattr(getattr(autoencoder, "config", None), "dataset", None)
+    if isinstance(ae_ds_cfg, dict):
+        target_size = ae_ds_cfg.get("crop_size", H)
+    else:
+        target_size = getattr(getattr(autoencoder, "config", None), "ae_image_size", H)
+
     video = video.view(B * T, C, H, W)
-    with torch.no_grad():
-        z = autoencoder.encode(video)[0].mul_(scale_factor)  # [B*T, C_tok, 1, L]
+
+    # 通道对齐：FlowTiTok_512 预训练是 3 通道 in / 3 通道 out。
+    # 如果 AE 期望 3 通道而当前是 1 通道（雷达），则将单通道复制为 3 通道。
+    expected_in_ch = getattr(getattr(autoencoder, "config", None), "vq_model", {}).get(
+        "in_channels", C
+    )
+    if C == 1 and expected_in_ch == 3:
+        video = video.repeat(1, 3, 1, 1)  # [B*T, 3, H, W]
+
+    if H != target_size or W != target_size:
+        video = F.interpolate(
+            video,
+            size=(target_size, target_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    z = autoencoder.encode(video)[0].mul_(scale_factor)  # [B*T, C_tok, 1, L]
     z = z.squeeze(2).permute(0, 2, 1)  # [B*T, L, C_tok]
     L = z.shape[1]
-    z = z.view(B, T * L, z.shape[2])   # [B, T*L, C_tok]
+    # interpolate / repeat 等操作可能导致非 contiguous，view 会报错，改用 reshape 更安全
+    z = z.reshape(B, T * L, z.shape[2])   # [B, T*L, C_tok]
     return z
 
 
@@ -140,6 +173,10 @@ def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
     else:
         num_frames = config.dataset.get("num_frames", 16)
 
+    # 与训练脚本保持一致：使用 ir_band_indices / use_lightning 选择卫星通道
+    ir_band_indices = config.dataset.get("ir_band_indices", None)
+    use_lightning = config.dataset.get("use_lightning", True)
+
     dataset = SatelliteRadarNpyDataset(
         base_dir=None,
         years=None,
@@ -149,6 +186,8 @@ def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
         files=None,
         frame_stride=config.dataset.get("frame_stride", 1),
         num_frames=num_frames,
+        ir_band_indices=ir_band_indices,
+        use_lightning=use_lightning,
     )
     loader = DataLoader(
         dataset,
@@ -178,11 +217,29 @@ def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
 
 
 def _ae_config(base_config, in_channels, out_channels):
+    """
+    Build a FlowTiTok autoencoder config compatible with pretrained FlowTiTok_512.bin.
+
+    与训练脚本 train_sat2radar_v2v.py 中的 _ae_config 行为保持一致：
+      - 使用 sat_in_channels / radar_in_channels 指定 in/out 通道；
+      - 如果配置中提供 ae_image_size，则将 AE 内部的 dataset.crop_size 覆盖为该分辨率，
+        并在 config 上记录 ae_image_size，便于 encode 时读取。
+    """
     vq = dict(base_config.vq_model)
     vq["in_channels"] = in_channels
     vq["out_channels"] = out_channels
     cfg = ConfigDict(dict(base_config))
     cfg.vq_model = ConfigDict(vq)
+
+    # 为 AE 单独设置预训练时的图像尺寸（例如 512x512），与 FlowTiTok_512 checkpoint 对齐
+    ae_img_size = getattr(base_config, "ae_image_size", None)
+    if ae_img_size is not None:
+        ds = dict(getattr(base_config, "dataset", {}))
+        ds["crop_size"] = ae_img_size
+        cfg.dataset = ConfigDict(ds)
+        # 也记录到 config 上，encode 时可读取
+        cfg.ae_image_size = ae_img_size
+
     return cfg
 
 
@@ -246,9 +303,21 @@ def main():
     nnet_ema = train_state.nnet_ema.to(device)
     nnet_ema.eval()
 
-    # Pretrained FlowTiTok autoencoders (sat 11ch, radar 1ch)
-    sat_ae_config = _ae_config(config, 11, 11)
-    radar_ae_config = _ae_config(config, 1, 1)
+    # Pretrained FlowTiTok autoencoders
+    # 这里和 train_sat2radar_v2v.py 保持兼容：
+    #   - 新配置会通过 config.sat_in_channels / radar_in_channels 指定通道
+    #   - 旧配置则回退到 11ch sat / 1ch radar
+    sat_in_ch = getattr(config, "sat_in_channels", None)
+    sat_out_ch = getattr(config, "sat_out_channels", None)
+    radar_in_ch = getattr(config, "radar_in_channels", None)
+    radar_out_ch = getattr(config, "radar_out_channels", None)
+    if sat_in_ch is None or sat_out_ch is None:
+        sat_in_ch, sat_out_ch = 11, 11
+    if radar_in_ch is None or radar_out_ch is None:
+        radar_in_ch, radar_out_ch = 1, 1
+
+    sat_ae_config = _ae_config(config, sat_in_ch, sat_out_ch)
+    radar_ae_config = _ae_config(config, radar_in_ch, radar_out_ch)
 
     sat_autoencoder = FlowTiTok(sat_ae_config).to(device)
     sat_autoencoder.load_state_dict(
@@ -263,6 +332,24 @@ def main():
     )
     radar_autoencoder.eval()
     radar_autoencoder.requires_grad_(False)
+
+    # Text guidance encoder for FlowTiTok decoder（基于文件名的弱描述）
+    try:
+        clip_encoder, _, _ = open_clip.create_model_and_transforms(
+            "ViT-L-14-336", pretrained="openai"
+        )
+        del clip_encoder.visual
+        clip_tokenizer = open_clip.get_tokenizer("ViT-L-14-336")
+        clip_encoder.transformer.batch_first = False
+        clip_encoder.eval()
+        clip_encoder.requires_grad_(False)
+        clip_encoder.to(device)
+    except Exception as e:
+        clip_encoder = None
+        clip_tokenizer = None
+        print(
+            f"[WARN] open_clip not available, FlowTiTok decoder will run without text guidance. Error: {e}"
+        )
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -351,12 +438,67 @@ def main():
         z = z.view(B * T_eff, num_latent_tokens, z.shape[3])  # [B*T, Lf, C]
         z = z.permute(0, 2, 1).unsqueeze(2)  # [B*T, C, 1, Lf]
 
+        # 构造基于文件名的弱文本描述，作为 FlowTiTok decoder 的 text_guidance
+        text_guidance = None
+        if clip_encoder is not None and clip_tokenizer is not None:
+            radar_paths = batch.get("radar_paths")
+            texts = []
+            for i in range(B):
+                for t in range(T_eff):
+                    fname = "unknown"
+                    if radar_paths and i < len(radar_paths):
+                        paths_i = radar_paths[i]
+                        if isinstance(paths_i, (list, tuple)) and t < len(paths_i):
+                            fname = os.path.basename(str(paths_i[t]))
+                    desc = f"A radar reflectivity image from {fname}."
+                    texts.append(desc)
+
+            if len(texts) == B * T_eff:
+                try:
+                    text_tokens = clip_tokenizer(texts).to(device)
+                    cast_dtype = clip_encoder.transformer.get_cast_dtype()
+                    text_tokens = clip_encoder.token_embedding(text_tokens).to(
+                        cast_dtype
+                    )  # [B*T, n_ctx, d_model]
+                    text_tokens = (
+                        text_tokens + clip_encoder.positional_embedding.to(cast_dtype)
+                    )
+                    text_tokens = text_tokens.permute(1, 0, 2)  # NLD -> LND
+                    text_tokens = clip_encoder.transformer(
+                        text_tokens, attn_mask=clip_encoder.attn_mask
+                    )
+                    text_tokens = text_tokens.permute(1, 0, 2)  # LND -> NLD
+                    text_tokens = clip_encoder.ln_final(
+                        text_tokens
+                    )  # [B*T, n_ctx, d_model]
+                    text_guidance = text_tokens
+                except Exception as e:
+                    print(f"[WARN] Failed to build CLIP text guidance: {e}")
+                    text_guidance = None
+
         radar_pred = radar_autoencoder.decode_tokens(
-            z / config.vq_model.scale_factor, text_guidance=None
-        )  # [B*T, 1, H, W]
+            z / config.vq_model.scale_factor, text_guidance=text_guidance
+        )  # [B*T_eff, C_out, H_pred, W_pred]
+        # 由于雷达物理上是单通道，只取第一个通道
+        radar_pred = radar_pred[:, 0:1, ...]  # [B*T_eff, 1, H_pred, W_pred]
         radar_pred = torch.clamp(radar_pred, 0.0, 1.0)
         radar_pred = radar_pred.view(B, T_eff, 1, radar_pred.shape[-2], radar_pred.shape[-1])
-        radar_gt = torch.clamp(radar_video_gt[:, :T_eff], 0.0, 1.0)
+        radar_gt = torch.clamp(radar_video_gt[:, :T_eff], 0.0, 1.0)  # [B, T_eff, 1, H_gt, W_gt]
+
+        # 如果预测雷达的分辨率与原始 GT 不一致（例如 AE 在 512x512 上预训练，
+        # 而数据集裁剪为 128x128），则在计算指标 / 可视化前把预测 resize 回 GT 的分辨率，
+        # 以便 MSE / SSIM / FSS 和 PNG/GIF 的空间尺寸与训练/验证保持一致。
+        _, _, _, H_gt, W_gt = radar_gt.shape
+        if radar_pred.shape[-2] != H_gt or radar_pred.shape[-1] != W_gt:
+            Bv, Tv, _, H_pred, W_pred = radar_pred.shape
+            radar_pred_flat = radar_pred.view(Bv * Tv, 1, H_pred, W_pred)
+            radar_pred_flat = F.interpolate(
+                radar_pred_flat,
+                size=(H_gt, W_gt),
+                mode="bilinear",
+                align_corners=False,
+            )
+            radar_pred = radar_pred_flat.view(Bv, Tv, 1, H_gt, W_gt)
 
         # Metrics per (b, t) where valid_mask is True (or all frames if mask is None)
         radar_pred_cpu = radar_pred.detach().cpu()
@@ -407,14 +549,17 @@ def main():
                     pysteps_avg_per_pair = np.mean(pysteps_fss_values_per_pair)
                     fss_pairwise_comparisons.append((fss_orig, pysteps_avg_per_pair))
 
-        # Save images (first valid frame per sample) as sat+radar composites only:
-        # [sat_IR | sat_lightning | radar_gt | radar_pred] with AE-style colormaps.
+        # Save images / videos：
+        #   - PNG：每个样本保存第一个有效帧的 [sat_IR | sat_lightning | radar_gt | radar_pred]
+        #   - GIF（仅 v2v 且安装了 imageio）：多样本堆叠，沿时间维展示演化
         if args.max_batches_images < 0 or batch_idx < args.max_batches_images:
             cmap_rad = _cmap_or_fallback("HomeyerRainbow", fallback="viridis")
             cmap_ir = _cmap_or_fallback("cmc.batlow_r", fallback="viridis")
             cmap_lgt = _cmap_or_fallback("Reds", fallback="Reds")
             ir_min, ir_max = 200.0, 320.0
             l_min, l_max = 0.1, 50.0
+
+            # PNG：每样本一张，取第一个有效帧
             for i in range(B):
                 # choose first t where valid, else t=0
                 t0 = 0
@@ -457,6 +602,57 @@ def main():
                     z_max,
                     out_path,
                 )
+
+            # GIF：仅在 v2v 模式下，为多个样本保存时间序列视频
+            if args.mode == "v2v" and HAS_IMAGEIO:
+                max_samples = min(B, 8)
+                video_frames = []
+                for t in range(T_eff):
+                    rows_t = []
+                    for i in range(max_samples):
+                        if valid_mask is not None and not valid_mask[i, t]:
+                            continue
+                        gt_2d = (
+                            radar_gt[i, t, 0] * (z_max - z_min) + z_min
+                        ).detach().cpu().numpy()
+                        pred_2d = (
+                            radar_pred[i, t, 0] * (z_max - z_min) + z_min
+                        ).detach().cpu().numpy()
+                        sat_ir = (
+                            sat_video[i, t, 0] * (ir_max - ir_min) + ir_min
+                        )  # [H, W]
+                        sat_ir_2d = sat_ir.detach().cpu().numpy()
+                        if sat_video.shape[2] > 10:
+                            sat_lgt = sat_video[i, t, 10] * (l_max - l_min) + l_min
+                            sat_lgt_2d = sat_lgt.detach().cpu().numpy()
+                        else:
+                            sat_lgt_2d = np.zeros_like(sat_ir_2d)
+
+                        sat_ir_rgb = _apply_cmap(sat_ir_2d, cmap_ir, ir_min, ir_max)
+                        sat_lgt_rgb = _apply_cmap(
+                            sat_lgt_2d, cmap_lgt, l_min, l_max
+                        )
+                        gt_rgb = _apply_cmap(gt_2d, cmap_rad, z_min, z_max)
+                        pred_rgb = _apply_cmap(pred_2d, cmap_rad, z_min, z_max)
+
+                        row_t = np.concatenate(
+                            [sat_ir_rgb, sat_lgt_rgb, gt_rgb, pred_rgb], axis=1
+                        )  # [H, 4W, 3]
+                        rows_t.append(row_t)
+
+                    if not rows_t:
+                        continue
+                    frame = np.concatenate(rows_t, axis=0)  # [H*max_samples, 4W, 3]
+                    frame_uint8 = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+                    video_frames.append(frame_uint8)
+
+                if video_frames:
+                    gif_name = f"batch{batch_idx}_v2v.gif"
+                    gif_path = os.path.join(args.out_dir, gif_name)
+                    try:
+                        imageio.mimsave(gif_path, video_frames, fps=4)
+                    except Exception as e:
+                        print(f"[WARN] Failed to save GIF {gif_path}: {e}")
 
     n_batches = len(loader)
     total = (
