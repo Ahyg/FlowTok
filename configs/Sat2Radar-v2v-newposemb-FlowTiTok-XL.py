@@ -9,13 +9,15 @@ class Args:
             setattr(self, key, value)
 
 
-# FlowTok backbone: FlowTok-XL 风格，但用于 sat->radar（非 text->image）
+# 基础模型配置与 Sat2Radar-v2v-pretrained-FlowTiTok-XL 保持一致，
+# 仅通过 config.use_text_vae_encoder 关闭 textVAE encoder 分支，
+# 实现最基础的「sat tokens -> radar tokens」flow matching（方案 A）。
 model = Args(
     learn_sigma=False,
     channels=16,          # token dim（匹配 FlowTiTok_512 的 token_size）
     use_t2i=False,        # sat-to-radar，不是 text-to-image
-    clip_dim=16,          # 这里仍然保留占位，真正的条件来自 sat tokens
-    num_clip_token=77,    # 每帧 77 个 latent token
+    clip_dim=16,
+    num_clip_token=77,
     gradient_checking=False,
     cfg_indicator=0.10,
     noising_type="none",
@@ -25,7 +27,7 @@ model = Args(
         hidden_dim=256,
         num_attention_heads=4,
         dropout_prob=0.1,
-        clip_loss_weight=0.0,   # 不使用 CLIP 对比损失
+        clip_loss_weight=0.0,
         align_quantized=False,
         use_pretrained=False,
         tokenizer_checkpoint="",
@@ -51,11 +53,11 @@ def get_config():
 
     # ========= Train =========
     config.train = d(
-        n_steps=400_000,
-        batch_size=64,
+        n_steps=100_000,
+        batch_size=4,
         log_interval=100,
-        eval_interval=1000_000,
-        save_interval=50_000,
+        eval_interval=500,
+        save_interval=20_000,
         n_samples_eval=4,
     )
 
@@ -73,10 +75,6 @@ def get_config():
     )
 
     # ========= FlowTiTok AE 相关 =========
-    # 注意：FlowTiTok_512 是在自然图像上 3 通道预训练的。
-    # 这里我们约定：
-    #   - 卫星：只用 0/2/6 三个 IR 通道作为“伪 RGB”，因此 AE 的 in/out=3
-    #   - 雷达：单通道（最后一通道，0-60 dBZ），因此 AE 的 in/out=1
     config.vq_model = d(
         deterministic=False,
         token_size=16,
@@ -91,12 +89,7 @@ def get_config():
         scale_factor=1.0,
     )
 
-    # 这些字段会被 scripts/train_sat2radar_v2v.py 中的 _ae_config 读取，
-    # 用来设置 FlowTiTok 的 in/out 通道数。
-    # FlowTiTok_512 预训练是 3 通道 in / 3 通道 out。
-    # 卫星：直接用 0/2/6 三个 IR 通道作为“伪 RGB”，因此 AE 的 in/out 都是 3。
-    # 雷达：本身是单通道，但为了严格复用 3 通道 FlowTiTok_512 的权重，
-    #       在送入 AE 前我们在脚本里把 1 通道复制到 3 通道，解码后再取第 1 个通道作为雷达图。
+    # AE 通道与基础 v2v 配置一致：sat 用 0/2/6 三个 IR 通道伪 RGB；radar 通过 3→1 的复制/截取适配。
     config.sat_in_channels = 3
     config.sat_out_channels = 3
     config.radar_in_channels = 3
@@ -113,21 +106,25 @@ def get_config():
     )
 
     # ========= loss 权重 =========
+    # 方案 A：不使用 textVAE KL / 对比学习，仅优化 flow matching 本身。
     config.losses = d(
         contrastive_loss_weight=0.0,
-        kld_loss_weight=0.01,
+        kld_loss_weight=0.0,
     )
     config.loss_coeffs = []
 
+    # 显式关闭 textVAE encoder，用于 FlowMatching 中的条件判断。
+    # 当该标志为 False 时：
+    #   - 训练：p_losses_textVAE_flowtok 中直接使用 cond (= sat_tokens) 作为噪声起点；
+    #   - 采样：train/test/validate 中从 sat_tokens 出发做 ODE 采样。
+    config.use_text_vae_encoder = False
+
     # ========= Dataset: Sat(0/2/6) -> Radar(last ch) =========
-    # 使用 SatelliteRadarNpyDataset(sat2radar_v2v 模式)：
-    #   - ir_band_indices=[0,2,6] => 只取 3 个 IR 通道
-    #   - use_lightning=False     => 不拼接闪电通道
     config.dataset = d(
-        filelist_path="/mnt/ssd_1/yghu/Data/71_3m/dataset_filelist_i2i.pkl",
+        filelist_path="/mnt/ssd_1/yghu/Data/71_3m/dataset_filelist_v2v.pkl",
         filelist_split="train",
         v2v=True,
-        num_frames=1,   # 1 表示 i2i，>1 表示 v2v，可根据需要修改
+        num_frames=16,
         frame_stride=1,
         num_workers_per_gpu=4,
         crop_size=128,
@@ -136,7 +133,7 @@ def get_config():
     )
 
     # ========= workdir / ckpt / samples =========
-    config.workdir = "/mnt/ssd_1/yghu/Experiments/sat2radar_flowtitok_run"
+    config.workdir = "/mnt/ssd_1/yghu/Experiments/sat2radar_flowtok_run_v2v_newposemb"
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"
 
