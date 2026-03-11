@@ -334,12 +334,24 @@ def main():
     radar_autoencoder.requires_grad_(False)
 
     # Text guidance encoder for FlowTiTok decoder（基于文件名的弱描述）
+    clip_model_name = "ViT-L-14-336"
+    local_clip_ckpt = os.environ.get("OPENCLIP_LOCAL_CKPT", None)
     try:
-        clip_encoder, _, _ = open_clip.create_model_and_transforms(
-            "ViT-L-14-336", pretrained="openai"
-        )
+        if local_clip_ckpt and os.path.isfile(local_clip_ckpt):
+            print(f"[INFO] Loading open_clip '{clip_model_name}' from local checkpoint: {local_clip_ckpt}")
+            clip_encoder, _, _ = open_clip.create_model_and_transforms(
+                clip_model_name, pretrained=None
+            )
+            state_dict = torch.load(local_clip_ckpt, map_location="cpu")
+            missing, unexpected = clip_encoder.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                print(f"[INFO] open_clip loaded with missing_keys={len(missing)}, unexpected_keys={len(unexpected)}")
+        else:
+            clip_encoder, _, _ = open_clip.create_model_and_transforms(
+                clip_model_name, pretrained="openai"
+            )
         del clip_encoder.visual
-        clip_tokenizer = open_clip.get_tokenizer("ViT-L-14-336")
+        clip_tokenizer = open_clip.get_tokenizer(clip_model_name)
         clip_encoder.transformer.batch_first = False
         clip_encoder.eval()
         clip_encoder.requires_grad_(False)

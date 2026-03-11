@@ -301,13 +301,39 @@ def train(config):
     radar_autoencoder.to(device)
 
     # ========= Text guidance encoder for FlowTiTok decoder（基于文件名的弱描述）=========
+    clip_model_name = "ViT-L-14-336"
+    local_clip_ckpt = os.environ.get("OPENCLIP_LOCAL_CKPT", None)
     try:
-        clip_encoder, _, _ = open_clip.create_model_and_transforms(
-            "ViT-L-14-336", pretrained="openai"
-        )
+        if local_clip_ckpt is not None and os.path.isfile(local_clip_ckpt):
+            logging.info(
+                f"Initializing open_clip '{clip_model_name}' from local checkpoint: {local_clip_ckpt}"
+            )
+            # 不通过 HuggingFace hub，直接本地 load_state_dict，避免在计算节点访问外网。
+            clip_encoder, _, _ = open_clip.create_model_and_transforms(
+                clip_model_name, pretrained=None
+            )
+            state_dict = torch.load(local_clip_ckpt, map_location="cpu")
+            missing_keys, unexpected_keys = clip_encoder.load_state_dict(
+                state_dict, strict=False
+            )
+            if missing_keys or unexpected_keys:
+                logging.info(
+                    f"Loaded open_clip from local ckpt with missing_keys={len(missing_keys)}, "
+                    f"unexpected_keys={len(unexpected_keys)}"
+                )
+        else:
+            # 回退到默认行为：通过 tag='openai' 走 hub（本地/在线均可）
+            logging.info(
+                f"OPENCLIP_LOCAL_CKPT not set or file not found, "
+                f"fallback to pretrained tag 'openai' for '{clip_model_name}'."
+            )
+            clip_encoder, _, _ = open_clip.create_model_and_transforms(
+                clip_model_name, pretrained="openai"
+            )
+
         # 只保留文本分支
         del clip_encoder.visual
-        clip_tokenizer = open_clip.get_tokenizer("ViT-L-14-336")
+        clip_tokenizer = open_clip.get_tokenizer(clip_model_name)
         clip_encoder.transformer.batch_first = False
         clip_encoder.eval()
         clip_encoder.requires_grad_(False)
