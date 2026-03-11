@@ -53,11 +53,11 @@ def get_config():
 
     # ========= Train =========
     config.train = d(
-        n_steps=100_000,
+        n_steps=400_000,
         batch_size=4,
         log_interval=100,
-        eval_interval=500,
-        save_interval=20_000,
+        eval_interval=100_0000,
+        save_interval=50_000,
         n_samples_eval=4,
     )
 
