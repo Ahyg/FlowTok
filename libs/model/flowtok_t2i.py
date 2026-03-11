@@ -265,7 +265,7 @@ class FlowTok(nn.Module):
         spatial_embed = get_1d_sincos_pos_embed_from_grid(self.hidden_size // 2, spatial_pos)   # (L, D)
         temporal_embed = get_1d_sincos_pos_embed_from_grid(self.hidden_size // 2, temporal_pos)  # (L, D)
         #pos_embed = torch.from_numpy(spatial_embed + temporal_embed).to(device=device, dtype=dtype).unsqueeze(0)  # [1, L, D]
-        pos_embed = torch.from_numpy(np.concatenate([spatial_embed, temporal_embed], axis=1)).to(device=device, dtype=dtype).unsqueeze(0)  # [1, L, D]
+        pos_embed = torch.from_numpy(np.concatenate([spatial_embed, temporal_embed], axis=-1)).to(device=device, dtype=dtype).unsqueeze(0)  # [1, L, D]
         return pos_embed
 
     def _forward(self, x, t, null_indicator):
