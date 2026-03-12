@@ -45,6 +45,7 @@ from ml_collections import ConfigDict  # noqa: E402
 from data.dataset import SatelliteRadarNpyDataset, collate_sat2radar_v2v  # noqa: E402
 from diffusion.flow_matching import ODEEulerFlowMatchingSolver  # noqa: E402
 from libs.flowtitok import FlowTiTok  # noqa: E402
+from libs.adapters import AdapterIn, AdapterOut  # noqa: E402
 import flow_utils  # noqa: E402
 
 
@@ -104,7 +105,7 @@ def _save_four_panel_sat_light_radar(
 
 
 @torch.no_grad()
-def encode_video_with_autoencoder(autoencoder, video, scale_factor: float):
+def encode_video_with_autoencoder(autoencoder, video, scale_factor: float, adapter_in=None):
     """
     video: [B, T, C, H, W]
     return: tokens [B, T*L, C_tok]
@@ -121,21 +122,24 @@ def encode_video_with_autoencoder(autoencoder, video, scale_factor: float):
 
     video = video.view(B * T, C, H, W)
 
-    # 通道对齐：FlowTiTok_512 预训练是 3 通道 in / 3 通道 out。
-    # 如果 AE 期望 3 通道而当前是 1 通道（雷达），则将单通道复制为 3 通道。
-    expected_in_ch = getattr(getattr(autoencoder, "config", None), "vq_model", {}).get(
-        "in_channels", C
-    )
-    if C == 1 and expected_in_ch == 3:
-        video = video.repeat(1, 3, 1, 1)  # [B*T, 3, H, W]
-
-    if H != target_size or W != target_size:
-        video = F.interpolate(
-            video,
-            size=(target_size, target_size),
-            mode="bilinear",
-            align_corners=False,
+    if adapter_in is not None:
+        video = adapter_in(video, target_size)
+    else:
+        # 通道对齐：FlowTiTok_512 预训练是 3 通道 in / 3 通道 out。
+        # 如果 AE 期望 3 通道而当前是 1 通道（雷达），则将单通道复制为 3 通道。
+        expected_in_ch = getattr(getattr(autoencoder, "config", None), "vq_model", {}).get(
+            "in_channels", C
         )
+        if C == 1 and expected_in_ch == 3:
+            video = video.repeat(1, 3, 1, 1)  # [B*T, 3, H, W]
+
+        if H != target_size or W != target_size:
+            video = F.interpolate(
+                video,
+                size=(target_size, target_size),
+                mode="bilinear",
+                align_corners=False,
+            )
 
     z = autoencoder.encode(video)[0].mul_(scale_factor)  # [B*T, C_tok, 1, L]
     z = z.squeeze(2).permute(0, 2, 1)  # [B*T, L, C_tok]
@@ -303,6 +307,56 @@ def main():
     nnet_ema = train_state.nnet_ema.to(device)
     nnet_ema.eval()
 
+    # Optional adapters: loaded from ckpt directory if present.
+    adapter_in_satellite = None
+    adapter_out = None
+    adapter_in_sat_cfg = getattr(config, "adapter_in_satellite", None)
+    if adapter_in_sat_cfg is None:
+        # Backward compatibility with old config key.
+        adapter_in_sat_cfg = getattr(config, "adapter_in", None)
+    if adapter_in_sat_cfg and adapter_in_sat_cfg.get("enabled", False):
+        adapter_in_satellite = AdapterIn(
+            in_channels=int(adapter_in_sat_cfg.get("in_channels", getattr(config, "sat_in_channels", 3))),
+            out_channels=int(getattr(config, "sat_in_channels", 3)),
+            mid_channels=int(adapter_in_sat_cfg.get("mid_channels", 32)),
+            num_blocks=int(adapter_in_sat_cfg.get("num_blocks", 3)),
+        ).to(device)
+        adapter_in_satellite_path = os.path.join(args.ckpt, "adapter_in_satellite.pth")
+        legacy_adapter_in_path = os.path.join(args.ckpt, "adapter_in.pth")
+        if os.path.isfile(adapter_in_satellite_path):
+            adapter_in_satellite.load_state_dict(
+                torch.load(adapter_in_satellite_path, map_location="cpu")
+            )
+            adapter_in_satellite.eval()
+            print(f"[INFO] Loaded adapter_in_satellite from {adapter_in_satellite_path}")
+        elif os.path.isfile(legacy_adapter_in_path):
+            adapter_in_satellite.load_state_dict(
+                torch.load(legacy_adapter_in_path, map_location="cpu")
+            )
+            adapter_in_satellite.eval()
+            print(f"[INFO] Loaded legacy adapter_in from {legacy_adapter_in_path}")
+        else:
+            print(
+                "[WARN] adapter_in_satellite is enabled in config but checkpoint file not found: "
+                f"{adapter_in_satellite_path} (or legacy {legacy_adapter_in_path})"
+            )
+            adapter_in_satellite = None
+    if getattr(config, "adapter_out", None) and config.adapter_out.get("enabled", False):
+        adapter_out = AdapterOut(
+            in_channels=int(getattr(config, "radar_out_channels", 3)),
+            out_channels=1,
+            mid_channels=int(config.adapter_out.get("mid_channels", 16)),
+            num_blocks=int(config.adapter_out.get("num_blocks", 2)),
+        ).to(device)
+        adapter_out_path = os.path.join(args.ckpt, "adapter_out.pth")
+        if os.path.isfile(adapter_out_path):
+            adapter_out.load_state_dict(torch.load(adapter_out_path, map_location="cpu"))
+            adapter_out.eval()
+            print(f"[INFO] Loaded adapter_out from {adapter_out_path}")
+        else:
+            print(f"[WARN] adapter_out is enabled in config but checkpoint file not found: {adapter_out_path}")
+            adapter_out = None
+
     # Pretrained FlowTiTok autoencoders
     # 这里和 train_sat2radar_v2v.py 保持兼容：
     #   - 新配置会通过 config.sat_in_channels / radar_in_channels 指定通道
@@ -367,6 +421,34 @@ def main():
 
     num_latent_tokens = config.vq_model.num_latent_tokens
 
+    def build_condition_tokens_from_sat_video(sat_video):
+        use_sat_lgt_tokens = getattr(config, "cond_use_sat_lightning_tokens", False)
+        if not use_sat_lgt_tokens:
+            return encode_video_with_autoencoder(
+                sat_autoencoder,
+                sat_video,
+                config.vq_model.scale_factor,
+                adapter_in=adapter_in_satellite,
+            )
+
+        sat_ir_video = sat_video[:, :, :3, :, :]
+        # Dataset output layout: [selected IR bands..., lightning].
+        # Lightning is the last channel after preprocessing (not second-to-last).
+        lgt_slice = sat_video[:, :, -1:, :, :]
+        lgt_video = lgt_slice.repeat(1, 1, 3, 1, 1)
+
+        sat_ir_tokens = encode_video_with_autoencoder(
+            sat_autoencoder, sat_ir_video, config.vq_model.scale_factor, adapter_in=None
+        )
+        lgt_tokens = encode_video_with_autoencoder(
+            sat_autoencoder, lgt_video, config.vq_model.scale_factor, adapter_in=None
+        )
+
+        fusion = getattr(config, "cond_token_fusion", "mean")
+        if fusion == "sum":
+            return sat_ir_tokens + lgt_tokens
+        return 0.5 * (sat_ir_tokens + lgt_tokens)
+
     # FSS / metrics accumulators
     def _parse_csv_numbers(value, cast=float):
         if value is None or value == "":
@@ -416,9 +498,7 @@ def main():
         B, T_max, C_sat, H, W = sat_video.shape
 
         # Encode sat video -> tokens [B, T_eff*L, C_tok]
-        sat_tokens = encode_video_with_autoencoder(
-            sat_autoencoder, sat_video, config.vq_model.scale_factor
-        )  # [B, T_max*L, C]
+        sat_tokens = build_condition_tokens_from_sat_video(sat_video)  # [B, T_max*L, C]
 
         # FlowTok text encoder branch: 默认使用 textVAE 对 sat tokens 编码得到 x0。
         # 若在配置中显式关闭 textVAE（config.use_text_vae_encoder == False），
@@ -497,8 +577,13 @@ def main():
         radar_pred = radar_autoencoder.decode_tokens(
             z / config.vq_model.scale_factor, text_guidance=text_guidance
         )  # [B*T_eff, C_out, H_pred, W_pred]
-        # 由于雷达物理上是单通道，只取第一个通道
-        radar_pred = radar_pred[:, 0:1, ...]  # [B*T_eff, 1, H_pred, W_pred]
+        if adapter_out is not None:
+            # 直接映射到目标雷达分辨率/通道
+            _, _, _, H_gt0, W_gt0 = radar_video_gt[:, :T_eff].shape
+            radar_pred = adapter_out(radar_pred, out_size=(H_gt0, W_gt0))
+        else:
+            # 由于雷达物理上是单通道，只取第一个通道
+            radar_pred = radar_pred[:, 0:1, ...]  # [B*T_eff, 1, H_pred, W_pred]
         radar_pred = torch.clamp(radar_pred, 0.0, 1.0)
         radar_pred = radar_pred.view(B, T_eff, 1, radar_pred.shape[-2], radar_pred.shape[-1])
         radar_gt = torch.clamp(radar_video_gt[:, :T_eff], 0.0, 1.0)  # [B, T_eff, 1, H_gt, W_gt]
@@ -576,6 +661,13 @@ def main():
             cmap_lgt = _cmap_or_fallback("Reds", fallback="Reds")
             ir_min, ir_max = 200.0, 320.0
             l_min, l_max = 0.1, 50.0
+            ir_band_indices = getattr(config.dataset, "ir_band_indices", None)
+            lgt_channel_idx = (
+                len(ir_band_indices)
+                if getattr(config.dataset, "use_lightning", False)
+                and ir_band_indices is not None
+                else None
+            )
 
             # PNG：每样本一张，取第一个有效帧
             for i in range(B):
@@ -590,9 +682,10 @@ def main():
                 pred_2d = (radar_pred[i, t0, 0] * (z_max - z_min) + z_min).cpu().numpy()
                 sat_ir = sat_video[i, t0, 0] * (ir_max - ir_min) + ir_min  # [H, W]
                 sat_ir_2d = sat_ir.detach().cpu().numpy()
-                # Lightning channel assumed at index 10 (as in AE configs)
-                if sat_video.shape[2] > 10:
-                    sat_lgt = sat_video[i, t0, 10] * (l_max - l_min) + l_min
+                # Lightning channel index follows dataset output:
+                # [selected IR bands] + [lightning (optional)].
+                if lgt_channel_idx is not None and sat_video.shape[2] > lgt_channel_idx:
+                    sat_lgt = sat_video[i, t0, lgt_channel_idx] * (l_max - l_min) + l_min
                     sat_lgt_2d = sat_lgt.detach().cpu().numpy()
                 else:
                     # If lightning channel not available, fall back to zeros
@@ -640,8 +733,11 @@ def main():
                             sat_video[i, t, 0] * (ir_max - ir_min) + ir_min
                         )  # [H, W]
                         sat_ir_2d = sat_ir.detach().cpu().numpy()
-                        if sat_video.shape[2] > 10:
-                            sat_lgt = sat_video[i, t, 10] * (l_max - l_min) + l_min
+                        if (
+                            lgt_channel_idx is not None
+                            and sat_video.shape[2] > lgt_channel_idx
+                        ):
+                            sat_lgt = sat_video[i, t, lgt_channel_idx] * (l_max - l_min) + l_min
                             sat_lgt_2d = sat_lgt.detach().cpu().numpy()
                         else:
                             sat_lgt_2d = np.zeros_like(sat_ir_2d)

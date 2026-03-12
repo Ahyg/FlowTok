@@ -150,5 +150,18 @@ def get_config():
         path=config.sample_dir + "/samples_eval",
     )
 
+    # ========= Adapters =========
+    # AdapterIn: sat raw video -> tokenizer输入(3通道, 512x512)
+    config.adapter_in_satellite = d(
+        enabled=False,
+        in_channels=3,  # 若后续加入 lightning，可改为 4
+        mid_channels=32,
+        num_blocks=3,
+    )
+    # AdapterOut: tokenizer解码输出 -> 目标雷达(单通道, 数据集分辨率)
+    config.adapter_out = d(
+        enabled=False,
+    )
+
     return config
 

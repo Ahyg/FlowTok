@@ -29,6 +29,7 @@ if ROOT_DIR not in sys.path:
 import flow_utils
 from diffusion.flow_matching import FlowMatching, ODEEulerFlowMatchingSolver
 from libs.flowtitok import FlowTiTok
+from libs.adapters import AdapterIn, AdapterOut
 from data.dataset import SatelliteRadarNpyDataset, collate_sat2radar_v2v
 from torch.utils.data import DataLoader
 
@@ -42,7 +43,13 @@ config_flags.DEFINE_config_file(
 )
 
 
-def encode_video_with_autoencoder(autoencoder, video, scale_factor: float):
+def encode_video_with_autoencoder(
+    autoencoder,
+    video,
+    scale_factor: float,
+    adapter_in=None,
+    require_grad_through_encoder: bool = False,
+):
     """
     video: [B, T, C, H, W]
     返回: tokens [B, T*L, C_tok]
@@ -59,24 +66,32 @@ def encode_video_with_autoencoder(autoencoder, video, scale_factor: float):
 
     video = video.view(B * T, C, H, W)
 
-    # 通道对齐：FlowTiTok_512 预训练是 3 通道 in / 3 通道 out。
-    # 如果 AE 期望 3 通道而当前是 1 通道（雷达），则将单通道复制为 3 通道。
-    expected_in_ch = getattr(getattr(autoencoder, "config", None), "vq_model", {}).get(
-        "in_channels", C
-    )
-    if C == 1 and expected_in_ch == 3:
-        video = video.repeat(1, 3, 1, 1)  # [B*T, 3, H, W]
-
-    if H != target_size or W != target_size:
-        video = F.interpolate(
-            video,
-            size=(target_size, target_size),
-            mode="bilinear",
-            align_corners=False,
+    if adapter_in is not None:
+        # 由可学习 AdapterIn 完成通道/分辨率适配（例如 4ch@128 -> 3ch@512）
+        video = adapter_in(video, target_size)
+    else:
+        # 通道对齐：FlowTiTok_512 预训练是 3 通道 in / 3 通道 out。
+        # 如果 AE 期望 3 通道而当前是 1 通道（雷达），则将单通道复制为 3 通道。
+        expected_in_ch = getattr(getattr(autoencoder, "config", None), "vq_model", {}).get(
+            "in_channels", C
         )
-    with torch.no_grad():
-        # FlowTiTok.encode 返回 (z, dict)
+        if C == 1 and expected_in_ch == 3:
+            video = video.repeat(1, 3, 1, 1)  # [B*T, 3, H, W]
+
+        if H != target_size or W != target_size:
+            video = F.interpolate(
+                video,
+                size=(target_size, target_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+    if require_grad_through_encoder:
+        # Enable gradient flow to adapter input (AE params are frozen by requires_grad_(False)).
         z = autoencoder.encode(video)[0].mul_(scale_factor)  # [B*T, C_tok, 1, L]
+    else:
+        with torch.no_grad():
+            # FlowTiTok.encode 返回 (z, dict)
+            z = autoencoder.encode(video)[0].mul_(scale_factor)  # [B*T, C_tok, 1, L]
     z = z.squeeze(2).permute(0, 2, 1)  # [B*T, L, C_tok]
     L = z.shape[1]
     # interpolate 等操作可能导致非 contiguous，view 会报错，改用 reshape 更安全
@@ -241,11 +256,116 @@ def train(config):
 
     # ========= FlowTok backbone & optimizer =========
     train_state = flow_utils.initialize_train_state(config, device)
-    nnet, nnet_ema, optimizer = accelerator.prepare(
-        train_state.nnet, train_state.nnet_ema, train_state.optimizer
+
+    # ========= Lightweight adapters =========
+    adapter_in_satellite = None
+    adapter_in_radar = None
+    adapter_out = None
+    adapter_in_sat_cfg = getattr(config, "adapter_in_satellite", None)
+    if adapter_in_sat_cfg is None:
+        # Backward compatibility with old config key.
+        adapter_in_sat_cfg = getattr(config, "adapter_in", None)
+    if adapter_in_sat_cfg and adapter_in_sat_cfg.get("enabled", False):
+        adapter_in_satellite = AdapterIn(
+            in_channels=int(adapter_in_sat_cfg.get("in_channels", getattr(config, "sat_in_channels", 3))),
+            out_channels=int(getattr(config, "sat_in_channels", 3)),
+            mid_channels=int(adapter_in_sat_cfg.get("mid_channels", 32)),
+            num_blocks=int(adapter_in_sat_cfg.get("num_blocks", 3)),
+        )
+    if getattr(config, "adapter_out", None) and config.adapter_out.get("enabled", False):
+        adapter_out = AdapterOut(
+            in_channels=int(getattr(config, "radar_out_channels", 3)),
+            out_channels=1,
+            mid_channels=int(config.adapter_out.get("mid_channels", 16)),
+            num_blocks=int(config.adapter_out.get("num_blocks", 2)),
+        )
+    if getattr(config, "adapter_in_radar", None) and config.adapter_in_radar.get("enabled", False):
+        adapter_in_radar = AdapterIn(
+            in_channels=int(config.adapter_in_radar.get("in_channels", 1)),
+            out_channels=int(getattr(config, "radar_in_channels", 3)),
+            mid_channels=int(config.adapter_in_radar.get("mid_channels", 16)),
+            num_blocks=int(config.adapter_in_radar.get("num_blocks", 2)),
+        )
+
+    # 将 adapter 参数加入优化器，与主干一起训练
+    if adapter_in_satellite is not None:
+        train_state.optimizer.add_param_group({"params": list(adapter_in_satellite.parameters())})
+    if adapter_in_radar is not None:
+        train_state.optimizer.add_param_group({"params": list(adapter_in_radar.parameters())})
+    if adapter_out is not None:
+        train_state.optimizer.add_param_group({"params": list(adapter_out.parameters())})
+    # NOTE:
+    # LambdaLR captures param-group count at creation time (inside base_lrs).
+    # Since adapters are added after initialize_train_state(), we must rebuild
+    # scheduler so its internal lr list length matches optimizer.param_groups.
+    train_state.lr_scheduler = flow_utils.get_lr_scheduler(
+        train_state.optimizer, **config.lr_scheduler
     )
+
+    prepare_items = [
+        train_state.nnet,
+        train_state.nnet_ema,
+        train_state.optimizer,
+        train_dataloader,
+    ]
+    if adapter_in_satellite is not None:
+        prepare_items.append(adapter_in_satellite)
+    if adapter_in_radar is not None:
+        prepare_items.append(adapter_in_radar)
+    if adapter_out is not None:
+        prepare_items.append(adapter_out)
+    prepared = accelerator.prepare(*prepare_items)
+    nnet, nnet_ema, optimizer, train_dataloader = (
+        prepared[0],
+        prepared[1],
+        prepared[2],
+        prepared[3],
+    )
+    idx_prepared = 4
+    if adapter_in_satellite is not None:
+        adapter_in_satellite = prepared[idx_prepared]
+        idx_prepared += 1
+    if adapter_in_radar is not None:
+        adapter_in_radar = prepared[idx_prepared]
+        idx_prepared += 1
+    if adapter_out is not None:
+        adapter_out = prepared[idx_prepared]
+
     lr_scheduler = train_state.lr_scheduler
     train_state.resume(config.ckpt_root)
+
+    # 如使用 adapter，尝试从同一步 ckpt 目录额外恢复其权重（若不存在则忽略）
+    if train_state.step > 0:
+        ckpt_path = os.path.join(config.ckpt_root, f"{train_state.step}.ckpt")
+        if adapter_in_satellite is not None:
+            adapter_in_satellite_path = os.path.join(
+                ckpt_path, "adapter_in_satellite.pth"
+            )
+            legacy_adapter_in_path = os.path.join(ckpt_path, "adapter_in.pth")
+            if os.path.isfile(adapter_in_satellite_path):
+                accelerator.unwrap_model(adapter_in_satellite).load_state_dict(
+                    torch.load(adapter_in_satellite_path, map_location="cpu")
+                )
+                logging.info(f"Loaded adapter_in_satellite from {adapter_in_satellite_path}")
+            elif os.path.isfile(legacy_adapter_in_path):
+                accelerator.unwrap_model(adapter_in_satellite).load_state_dict(
+                    torch.load(legacy_adapter_in_path, map_location="cpu")
+                )
+                logging.info(f"Loaded legacy adapter_in from {legacy_adapter_in_path}")
+        if adapter_in_radar is not None:
+            adapter_in_radar_path = os.path.join(ckpt_path, "adapter_in_radar.pth")
+            if os.path.isfile(adapter_in_radar_path):
+                accelerator.unwrap_model(adapter_in_radar).load_state_dict(
+                    torch.load(adapter_in_radar_path, map_location="cpu")
+                )
+                logging.info(f"Loaded adapter_in_radar from {adapter_in_radar_path}")
+        if adapter_out is not None:
+            adapter_out_path = os.path.join(ckpt_path, "adapter_out.pth")
+            if os.path.isfile(adapter_out_path):
+                accelerator.unwrap_model(adapter_out).load_state_dict(
+                    torch.load(adapter_out_path, map_location="cpu")
+                )
+                logging.info(f"Loaded adapter_out from {adapter_out_path}")
 
     # ========= Pretrained FlowTiTok autoencoders =========
     # I2I/V2V pipeline: sat image -> sat tokenizer (77 tokens/frame); DiT -> radar tokens -> radar decoder (1ch).
@@ -353,6 +473,94 @@ def train(config):
 
     num_latent_tokens = config.vq_model.num_latent_tokens
 
+    # Whether to backprop through frozen AE encoder to train AdapterIn.
+    train_adapter_in_with_encoder_grad = bool(
+        getattr(config, "train_adapter_in_with_encoder_grad", True)
+    )
+    debug_cfg = getattr(config, "debug", None)
+    debug_enabled = bool(debug_cfg.get("enabled", False)) if debug_cfg is not None else False
+    debug_max_steps = int(debug_cfg.get("max_steps", 5)) if debug_cfg is not None else 5
+    debug_log_every = max(
+        int(debug_cfg.get("log_every", 1)) if debug_cfg is not None else 1, 1
+    )
+    debug_grad_eps_on = (
+        float(debug_cfg.get("grad_eps_on", 1e-12)) if debug_cfg is not None else 1e-12
+    )
+    debug_grad_eps_off = (
+        float(debug_cfg.get("grad_eps_off", 1e-14)) if debug_cfg is not None else 1e-14
+    )
+
+    def _first_trainable_param(module):
+        if module is None:
+            return None
+        for p in module.parameters():
+            if p.requires_grad:
+                return p
+        return None
+
+    def _module_grad_norm(module):
+        if module is None:
+            return 0.0
+        grad_sq = 0.0
+        has_grad = False
+        for p in module.parameters():
+            if p.grad is not None:
+                g = p.grad.detach().float()
+                grad_sq += float((g * g).sum().item())
+                has_grad = True
+        return float(grad_sq**0.5) if has_grad else 0.0
+
+    def build_condition_tokens_from_sat_video(sat_video, require_grad=False):
+        """
+        Build condition tokens for FlowMatching.
+
+        Default behavior:
+          cond = sat_tokens (existing pipeline)
+
+        Optional (config.cond_use_sat_lightning_tokens=True):
+          - sat IR(3ch) -> tokenizer
+          - lightning(1ch) repeat to 3ch -> tokenizer
+          - fuse two token streams and feed to FlowMatching.
+        """
+        use_sat_lgt_tokens = getattr(config, "cond_use_sat_lightning_tokens", False)
+        if not use_sat_lgt_tokens:
+            return encode_video_with_autoencoder(
+                sat_autoencoder,
+                sat_video,
+                config.vq_model.scale_factor,
+                adapter_in=adapter_in_satellite,
+                require_grad_through_encoder=require_grad,
+            )
+
+        sat_ir_video = sat_video[:, :, :3, :, :]
+        # Dataset output layout: [selected IR bands..., lightning].
+        # Lightning is the last channel after preprocessing (not second-to-last).
+        lgt_slice = sat_video[:, :, -1:, :, :]
+        lgt_video = lgt_slice.repeat(1, 1, 3, 1, 1)
+
+        # For dual-token mode we intentionally bypass satellite AdapterIn and
+        # use tokenizer-compatible 3ch inputs directly for both branches.
+        sat_ir_tokens = encode_video_with_autoencoder(
+            sat_autoencoder,
+            sat_ir_video,
+            config.vq_model.scale_factor,
+            adapter_in=None,
+            require_grad_through_encoder=require_grad,
+        )
+        lgt_tokens = encode_video_with_autoencoder(
+            sat_autoencoder,
+            lgt_video,
+            config.vq_model.scale_factor,
+            adapter_in=None,
+            require_grad_through_encoder=require_grad,
+        )
+
+        fusion = getattr(config, "cond_token_fusion", "mean")
+        if fusion == "sum":
+            return sat_ir_tokens + lgt_tokens
+        # default: mean
+        return 0.5 * (sat_ir_tokens + lgt_tokens)
+
     def train_step(batch):
         metrics = dict()
         optimizer.zero_grad()
@@ -369,11 +577,17 @@ def train(config):
         )  # [B, T_max, 1, H, W]
 
         # tokens: [B, T_max*L, C_tok]
-        sat_tokens = encode_video_with_autoencoder(
-            sat_autoencoder, sat_video, config.vq_model.scale_factor
+        sat_tokens = build_condition_tokens_from_sat_video(
+            sat_video, require_grad=train_adapter_in_with_encoder_grad
         )
         radar_tokens = encode_video_with_autoencoder(
-            radar_autoencoder, radar_video, config.vq_model.scale_factor
+            radar_autoencoder,
+            radar_video,
+            config.vq_model.scale_factor,
+            adapter_in=adapter_in_radar,
+            require_grad_through_encoder=(
+                train_adapter_in_with_encoder_grad and (adapter_in_radar is not None)
+            ),
         )
 
         # Variable-length v2v: mask padded positions in loss (valid_mask [B, T_max] -> token-level)
@@ -396,19 +610,192 @@ def train(config):
             batch_img_clip=None,
             valid_mask=token_mask,
         )
+        total_loss = loss
 
+        # Auxiliary loss for AdapterOut so it receives direct training signal.
+        losses_cfg = getattr(config, "losses", None)
+        adapter_out_recon_weight = (
+            float(losses_cfg.get("adapter_out_recon_weight", 0.0))
+            if losses_cfg is not None
+            else 0.0
+        )
+        adapter_out_recon_loss = loss.new_zeros([])
+        if adapter_out is not None and adapter_out_recon_weight > 0:
+            Bv, Tv, _, H_gt, W_gt = radar_video.shape
+            C_tok = radar_tokens.shape[-1]
+            assert (
+                radar_tokens.shape[1] == Tv * num_latent_tokens
+            ), "radar token length must equal T*num_latent_tokens"
+            radar_tok = radar_tokens.view(Bv, Tv, num_latent_tokens, C_tok)
+            radar_tok = radar_tok.reshape(Bv * Tv, num_latent_tokens, C_tok)
+            radar_tok = radar_tok.permute(0, 2, 1).unsqueeze(2)  # [B*T, C_tok, 1, L]
+            # Keep AE frozen; only train adapter_out from this branch.
+            with torch.no_grad():
+                radar_decoded = radar_autoencoder.decode_tokens(
+                    radar_tok / config.vq_model.scale_factor,
+                    text_guidance=None,
+                )  # [B*T, 3, H_dec, W_dec]
+            radar_pred_aux = adapter_out(radar_decoded, out_size=(H_gt, W_gt))
+            radar_pred_aux = torch.clamp(radar_pred_aux, 0.0, 1.0)
+            radar_gt_aux = radar_video.reshape(Bv * Tv, 1, H_gt, W_gt)
+            if valid_mask is not None:
+                per_frame_mse = (radar_pred_aux - radar_gt_aux).pow(2).mean(dim=[1, 2, 3])
+                vm_flat = valid_mask.reshape(Bv * Tv).float()
+                adapter_out_recon_loss = (
+                    (per_frame_mse * vm_flat).sum() / vm_flat.sum().clamp_min(1.0)
+                )
+            else:
+                adapter_out_recon_loss = F.mse_loss(radar_pred_aux, radar_gt_aux)
+            total_loss = total_loss + adapter_out_recon_weight * adapter_out_recon_loss
+            metrics["adapter_out_recon_loss"] = accelerator.gather(
+                adapter_out_recon_loss.detach()
+            ).mean()
+
+        if (
+            debug_enabled
+            and accelerator.is_main_process
+            and train_state.step < debug_max_steps
+            and train_state.step % debug_log_every == 0
+        ):
+            flow_loss_scalar = loss.mean()
+            recon_loss_scalar = (adapter_out_recon_weight * adapter_out_recon_loss).mean()
+            total_loss_scalar = total_loss.mean()
+            probe_params = {
+                "nnet": _first_trainable_param(nnet),
+                "adapter_in_satellite": _first_trainable_param(adapter_in_satellite),
+                "adapter_in_radar": _first_trainable_param(adapter_in_radar),
+                "adapter_out": _first_trainable_param(adapter_out),
+            }
+            grad_probe = {}
+            for name, p in probe_params.items():
+                if p is None:
+                    grad_probe[f"{name}_from_flow"] = 0.0
+                    grad_probe[f"{name}_from_recon"] = 0.0
+                    grad_probe[f"{name}_from_total"] = 0.0
+                    continue
+                g_flow = torch.autograd.grad(
+                    flow_loss_scalar, p, retain_graph=True, allow_unused=True
+                )[0]
+                g_recon = torch.autograd.grad(
+                    recon_loss_scalar, p, retain_graph=True, allow_unused=True
+                )[0]
+                g_total = torch.autograd.grad(
+                    total_loss_scalar, p, retain_graph=True, allow_unused=True
+                )[0]
+                grad_probe[f"{name}_from_flow"] = (
+                    float(g_flow.detach().norm().item()) if g_flow is not None else 0.0
+                )
+                grad_probe[f"{name}_from_recon"] = (
+                    float(g_recon.detach().norm().item()) if g_recon is not None else 0.0
+                )
+                grad_probe[f"{name}_from_total"] = (
+                    float(g_total.detach().norm().item()) if g_total is not None else 0.0
+                )
+            recon_branch_enabled = adapter_out is not None and adapter_out_recon_weight > 0
+            debug_failures = []
+
+            def _expect_gt(key, eps, note):
+                if grad_probe.get(key, 0.0) <= eps:
+                    debug_failures.append(f"{key}<={eps:.1e} ({note})")
+
+            def _expect_le(key, eps, note):
+                if grad_probe.get(key, 0.0) > eps:
+                    debug_failures.append(f"{key}>{eps:.1e} ({note})")
+
+            # Expected gradient routing:
+            # flow -> nnet/adapter_in_* ; recon -> adapter_out only ; total -> union.
+            _expect_gt("nnet_from_flow", debug_grad_eps_on, "nnet should get flow grad")
+            if adapter_in_satellite is not None:
+                _expect_gt(
+                    "adapter_in_satellite_from_flow",
+                    debug_grad_eps_on,
+                    "adapter_in_satellite should get flow grad",
+                )
+            if adapter_in_radar is not None:
+                _expect_gt(
+                    "adapter_in_radar_from_flow",
+                    debug_grad_eps_on,
+                    "adapter_in_radar should get flow grad",
+                )
+            if adapter_out is not None:
+                _expect_le(
+                    "adapter_out_from_flow",
+                    debug_grad_eps_off,
+                    "adapter_out should not get flow grad",
+                )
+                if recon_branch_enabled:
+                    _expect_gt(
+                        "adapter_out_from_recon",
+                        debug_grad_eps_on,
+                        "adapter_out should get recon grad",
+                    )
+                else:
+                    _expect_le(
+                        "adapter_out_from_recon",
+                        debug_grad_eps_off,
+                        "adapter_out recon is disabled",
+                    )
+            _expect_le(
+                "nnet_from_recon",
+                debug_grad_eps_off,
+                "nnet should not get recon grad",
+            )
+            if adapter_in_satellite is not None:
+                _expect_le(
+                    "adapter_in_satellite_from_recon",
+                    debug_grad_eps_off,
+                    "adapter_in_satellite should not get recon grad",
+                )
+            if adapter_in_radar is not None:
+                _expect_le(
+                    "adapter_in_radar_from_recon",
+                    debug_grad_eps_off,
+                    "adapter_in_radar should not get recon grad",
+                )
+            debug_status = "PASS" if len(debug_failures) == 0 else "FAIL"
+            logging.info(
+                "DEBUG_LOSS_PATH_%s step=%d flow=%.6e recon_w=%.6e total=%.6e probes=%s failures=%s",
+                debug_status,
+                int(train_state.step),
+                float(flow_loss_scalar.detach().item()),
+                float(recon_loss_scalar.detach().item()),
+                float(total_loss_scalar.detach().item()),
+                grad_probe,
+                debug_failures,
+            )
+
+        metrics["total_loss"] = accelerator.gather(total_loss.detach()).mean()
         metrics["loss"] = accelerator.gather(loss.detach()).mean()
         for key, val in loss_dict.items():
             metrics[key] = accelerator.gather(val.detach()).mean()
 
-        accelerator.backward(loss.mean())
+        accelerator.backward(total_loss.mean())
+        if (
+            debug_enabled
+            and accelerator.is_main_process
+            and train_state.step < debug_max_steps
+            and train_state.step % debug_log_every == 0
+        ):
+            logging.info(
+                "DEBUG_GRAD_NORM step=%d nnet=%.6e adapter_in_satellite=%.6e "
+                "adapter_in_radar=%.6e adapter_out=%.6e",
+                int(train_state.step),
+                _module_grad_norm(nnet),
+                _module_grad_norm(adapter_in_satellite),
+                _module_grad_norm(adapter_in_radar),
+                _module_grad_norm(adapter_out),
+            )
         optimizer.step()
         lr_scheduler.step()
         train_state.ema_update(config.get("ema_rate", 0.9999))
         train_state.step += 1
-        return dict(lr=train_state.optimizer.param_groups[0]["lr"], **metrics)
+        return {
+            "lr": train_state.optimizer.param_groups[0]["lr"],
+            "total_loss": metrics["total_loss"],
+            **{k: v for k, v in metrics.items() if k != "total_loss"},
+        }
 
-    def ode_fm_solver_sample(nnet_ema_local, batch):
+    def ode_fm_solver_sample(nnet_ema_local, batch, use_adapter_out: bool = True):
         """
         简单的采样示例：给一个 batch 的 sat_video，生成对应的 radar_video。
         """
@@ -419,8 +806,8 @@ def train(config):
                 non_blocking=True,
             )
             B = sat_video.shape[0]
-            sat_tokens = encode_video_with_autoencoder(
-                sat_autoencoder, sat_video, config.vq_model.scale_factor
+            sat_tokens = build_condition_tokens_from_sat_video(
+                sat_video, require_grad=False
             )  # [B, L, C]
 
             # 采样阶段与训练阶段保持一致：
@@ -506,8 +893,22 @@ def train(config):
             radar_video_pred = radar_autoencoder.decode_tokens(
                 z / config.vq_model.scale_factor, text_guidance=text_guidance
             )  # [B*T, C_out, H, W]，此处 C_out=3
-            # 由于雷达物理上是单通道，这里只取第一个通道作为雷达图
-            radar_video_pred = radar_video_pred[:, 0:1, ...]  # [B*T, 1, H, W]
+            if adapter_out is not None and use_adapter_out:
+                # 适配到数据集雷达分辨率（若 batch 中可用）
+                radar_ref = batch.get("radar_video")
+                if radar_ref is not None:
+                    H_gt = radar_ref.shape[-2]
+                    W_gt = radar_ref.shape[-1]
+                    radar_video_pred = adapter_out(radar_video_pred, out_size=(H_gt, W_gt))
+                else:
+                    radar_video_pred = adapter_out(
+                        radar_video_pred,
+                        out_size=(radar_video_pred.shape[-2], radar_video_pred.shape[-1]),
+                    )
+                radar_video_pred = torch.clamp(radar_video_pred, 0.0, 1.0)
+            else:
+                # 由于雷达物理上是单通道，这里只取第一个通道作为雷达图
+                radar_video_pred = radar_video_pred[:, 0:1, ...]  # [B*T, 1, H, W]
             radar_video_pred = radar_video_pred.view(
                 B, T, 1, radar_video_pred.shape[-2], radar_video_pred.shape[-1]
             )
@@ -540,6 +941,12 @@ def train(config):
                 with torch.no_grad():
                     # 预测雷达视频
                     radar_video_pred = ode_fm_solver_sample(nnet_ema, batch)  # [B, T, 1, H, W]
+                    radar_video_pred_no_adapterout = None
+                    if adapter_out is not None:
+                        # Optional comparison branch: bypass adapter_out during visualization.
+                        radar_video_pred_no_adapterout = ode_fm_solver_sample(
+                            nnet_ema, batch, use_adapter_out=False
+                        )  # [B, T, 1, H, W]
                     B, T_eff, _, H, W = radar_video_pred.shape
 
                     # 从 batch 中取出对应的 sat / radar GT（只看第 1 帧）
@@ -569,10 +976,30 @@ def train(config):
                         radar_video_pred = radar_video_pred_flat.view(
                             B, T_eff, 1, H_gt, W_gt
                         )
+                    if radar_video_pred_no_adapterout is not None:
+                        T_eff_no_adapter = radar_video_pred_no_adapterout.shape[1]
+                        H_no_adapter = radar_video_pred_no_adapterout.shape[-2]
+                        W_no_adapter = radar_video_pred_no_adapterout.shape[-1]
+                        if (
+                            H_no_adapter != H_gt
+                            or W_no_adapter != W_gt
+                        ):
+                            radar_video_pred_no_adapterout_flat = radar_video_pred_no_adapterout.view(
+                                B * T_eff_no_adapter, 1, H_no_adapter, W_no_adapter
+                            )
+                            radar_video_pred_no_adapterout_flat = F.interpolate(
+                                radar_video_pred_no_adapterout_flat,
+                                size=(H_gt, W_gt),
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+                            radar_video_pred_no_adapterout = radar_video_pred_no_adapterout_flat.view(
+                                B, T_eff_no_adapter, 1, H_gt, W_gt
+                            )
 
                     # 只可视化每个样本的第 1 帧，使用物理范围和 colormap：
                     # sat: IR ch0 使用 [200,320] + 'cmc.batlow_r'
-                    #       lightning ch10 使用 [0.1,50] + 'Reds'
+                    #       lightning 通道使用 [0.1,50] + 'Reds'
                     # radar: [0,60] dBZ + 'HomeyerRainbow'
                     ir_min, ir_max = 200.0, 320.0
                     l_min, l_max = 0.1, 50.0
@@ -580,6 +1007,13 @@ def train(config):
                     cmap_ir = _cmap_or_fallback("cmc.batlow_r", fallback="viridis")
                     cmap_lgt = _cmap_or_fallback("Reds", fallback="Reds")
                     cmap_rad = _cmap_or_fallback("HomeyerRainbow", fallback="viridis")
+                    ir_band_indices = getattr(config.dataset, "ir_band_indices", None)
+                    lgt_channel_idx = (
+                        len(ir_band_indices)
+                        if getattr(config.dataset, "use_lightning", False)
+                        and ir_band_indices is not None
+                        else None
+                    )
 
                     max_samples = min(B, 8)
                     rows_np = []
@@ -597,9 +1031,13 @@ def train(config):
                         radar_gt_np = radar_gt_2d.detach().cpu().numpy()
                         radar_pred_np = radar_pred_2d.detach().cpu().numpy()
 
-                        # Lightning channel assumed at index 10 (if present)
-                        if sat_video.shape[2] > 10:
-                            sat_lgt = sat_video[i, 0, 10] * (l_max - l_min) + l_min
+                        # Lightning channel index follows dataset output:
+                        # [selected IR bands] + [lightning (optional)].
+                        if (
+                            lgt_channel_idx is not None
+                            and sat_video.shape[2] > lgt_channel_idx
+                        ):
+                            sat_lgt = sat_video[i, 0, lgt_channel_idx] * (l_max - l_min) + l_min
                             sat_lgt_np = sat_lgt.detach().cpu().numpy()
                         else:
                             sat_lgt_np = np.zeros_like(sat_ir_np)
@@ -645,8 +1083,11 @@ def train(config):
                                 radar_gt_np_t = radar_gt_t.detach().cpu().numpy()
                                 radar_pred_np_t = radar_pred_t.detach().cpu().numpy()
 
-                                if sat_video.shape[2] > 10:
-                                    sat_lgt_t = sat_video[i, t, 10] * (l_max - l_min) + l_min
+                                if (
+                                    lgt_channel_idx is not None
+                                    and sat_video.shape[2] > lgt_channel_idx
+                                ):
+                                    sat_lgt_t = sat_video[i, t, lgt_channel_idx] * (l_max - l_min) + l_min
                                     sat_lgt_np_t = sat_lgt_t.detach().cpu().numpy()
                                 else:
                                     sat_lgt_np_t = np.zeros_like(sat_ir_np_t)
@@ -690,6 +1131,78 @@ def train(config):
                                 imageio.mimsave(video_path, video_frames, fps=4)
                             except Exception as e:
                                 logging.warning(f"Failed to save v2v GIF: {e}")
+
+                        # Additional comparison GIF: same visualization but bypass adapter_out.
+                        if (
+                            accelerator.is_main_process
+                            and radar_video_pred_no_adapterout is not None
+                        ):
+                            video_frames_no_adapter = []
+                            T_eff_no_adapter = radar_video_pred_no_adapterout.shape[1]
+                            for t in range(T_eff_no_adapter):
+                                rows_t = []
+                                for i in range(max_samples):
+                                    sat_ir_t = sat_video[i, t, 0] * (ir_max - ir_min) + ir_min
+                                    radar_gt_t = (
+                                        radar_video_gt[i, t, 0] * (z_max - z_min) + z_min
+                                    )
+                                    radar_pred_t = (
+                                        radar_video_pred_no_adapterout[i, t, 0] * (z_max - z_min) + z_min
+                                    )
+
+                                    sat_ir_np_t = sat_ir_t.detach().cpu().numpy()
+                                    radar_gt_np_t = radar_gt_t.detach().cpu().numpy()
+                                    radar_pred_np_t = radar_pred_t.detach().cpu().numpy()
+
+                                    if (
+                                        lgt_channel_idx is not None
+                                        and sat_video.shape[2] > lgt_channel_idx
+                                    ):
+                                        sat_lgt_t = sat_video[i, t, lgt_channel_idx] * (l_max - l_min) + l_min
+                                        sat_lgt_np_t = sat_lgt_t.detach().cpu().numpy()
+                                    else:
+                                        sat_lgt_np_t = np.zeros_like(sat_ir_np_t)
+
+                                    sat_ir_rgb_t = _apply_cmap(
+                                        sat_ir_np_t, cmap_ir, ir_min, ir_max
+                                    )
+                                    sat_lgt_rgb_t = _apply_cmap(
+                                        sat_lgt_np_t, cmap_lgt, l_min, l_max
+                                    )
+                                    gt_rgb_t = _apply_cmap(
+                                        radar_gt_np_t, cmap_rad, z_min, z_max
+                                    )
+                                    pred_rgb_t = _apply_cmap(
+                                        radar_pred_np_t, cmap_rad, z_min, z_max
+                                    )
+
+                                    row_t = np.concatenate(
+                                        [sat_ir_rgb_t, sat_lgt_rgb_t, gt_rgb_t, pred_rgb_t],
+                                        axis=1,
+                                    )
+                                    rows_t.append(row_t)
+
+                                if not rows_t:
+                                    continue
+                                frame = np.concatenate(rows_t, axis=0)
+                                frame_uint8 = (np.clip(frame, 0.0, 1.0) * 255).astype(
+                                    np.uint8
+                                )
+                                video_frames_no_adapter.append(frame_uint8)
+
+                            if video_frames_no_adapter:
+                                video_path_no_adapter = os.path.join(
+                                    config.sample_dir,
+                                    f"{train_state.step}_v2v_no_adapterout.gif",
+                                )
+                                try:
+                                    imageio.mimsave(
+                                        video_path_no_adapter, video_frames_no_adapter, fps=4
+                                    )
+                                except Exception as e:
+                                    logging.warning(
+                                        f"Failed to save no-adapterout v2v GIF: {e}"
+                                    )
                 accelerator.wait_for_everyone()
                 torch.cuda.empty_cache()
 
@@ -700,10 +1213,25 @@ def train(config):
             ):
                 torch.cuda.empty_cache()
                 logging.info(f"Save checkpoint {train_state.step}...")
-                if accelerator.local_process_index == 0:
-                    train_state.save(
-                        os.path.join(config.ckpt_root, f"{train_state.step}.ckpt")
-                    )
+                if accelerator.is_main_process:
+                    ckpt_save_path = os.path.join(config.ckpt_root, f"{train_state.step}.ckpt")
+                    train_state.save(ckpt_save_path)
+                    # 额外保存 adapter 权重（若启用）
+                    if adapter_in_satellite is not None:
+                        torch.save(
+                            accelerator.unwrap_model(adapter_in_satellite).state_dict(),
+                            os.path.join(ckpt_save_path, "adapter_in_satellite.pth"),
+                        )
+                    if adapter_in_radar is not None:
+                        torch.save(
+                            accelerator.unwrap_model(adapter_in_radar).state_dict(),
+                            os.path.join(ckpt_save_path, "adapter_in_radar.pth"),
+                        )
+                    if adapter_out is not None:
+                        torch.save(
+                            accelerator.unwrap_model(adapter_out).state_dict(),
+                            os.path.join(ckpt_save_path, "adapter_out.pth"),
+                        )
                 accelerator.wait_for_everyone()
                 torch.cuda.empty_cache()
 

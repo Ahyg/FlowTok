@@ -147,5 +147,16 @@ def get_config():
         path=config.sample_dir + "/samples_eval",
     )
 
+    # ========= Adapters =========
+    config.adapter_in_satellite = d(
+        enabled=False,
+        in_channels=3,
+        mid_channels=32,
+        num_blocks=3,
+    )
+    config.adapter_out = d(
+        enabled=False,
+    )
+
     return config
 
