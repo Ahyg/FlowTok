@@ -9,7 +9,13 @@ class Args:
             setattr(self, key, value)
 
 
-# Gadi 版本配置（路径需根据实际环境修改）
+def d(**kwargs):
+    """Helper of creating a config dict."""
+    return ml_collections.ConfigDict(initial_dictionary=kwargs)
+
+
+# 基础模型配置与 Sat2Radar-v2v-newposemb-FlowTiTok-XL 保持一致，
+# 在该实验中显式开启 AdapterIn/AdapterOut，并启用 lightning 通道。
 model = Args(
     learn_sigma=False,
     channels=16,
@@ -25,7 +31,7 @@ model = Args(
         hidden_dim=256,
         num_attention_heads=4,
         dropout_prob=0.1,
-        clip_loss_weight=1.0,
+        clip_loss_weight=0.0,
         align_quantized=False,
         use_pretrained=False,
         tokenizer_checkpoint="",
@@ -33,36 +39,26 @@ model = Args(
     ),
 )
 
-# 为了在对比损失中使用 t2t_temperature，需要显式打开该开关
-model.use_t2t_temperature = True
-
-
-def d(**kwargs):
-    """Helper of creating a config dict."""
-    return ml_collections.ConfigDict(initial_dictionary=kwargs)
-
 
 def get_config():
     config = ml_collections.ConfigDict()
-
     config.seed = 1234
 
-    # TODO: 按 Gadi 实际路径修改 FlowTiTok 权重路径
-    ftok_path = "/g/data/kl02/yh0308/Data/flowtok_ckpts/FlowTiTok_512.bin"
+    # TODO: 根据实际路径调整 FlowTiTok_512.bin 所在位置
+    ftok_path = "/g/data/kl02/yh0308/Data/FlowTiTok_512.bin"
     config.sat_tokenizer_checkpoint = ftok_path
     config.radar_tokenizer_checkpoint = ftok_path
 
-    # ========= Train =========
+    # 保持与原 adapter 配置一致的训练设置（小 batch，主要用于 debug/adapter 实验）
     config.train = d(
-        n_steps=400_000,
-        batch_size=4,
+        n_steps=200_000,
+        batch_size=8,
         log_interval=100,
-        eval_interval=1000,
-        save_interval=50_000,
+        eval_interval=1_000,
+        save_interval=20_000,
         n_samples_eval=4,
     )
 
-    # ========= Optimizer / LR =========
     config.optimizer = d(
         name="adamw",
         lr=4e-4,
@@ -75,7 +71,6 @@ def get_config():
         warmup_steps=5000,
     )
 
-    # ========= FlowTiTok AE 相关 =========
     config.vq_model = d(
         deterministic=False,
         token_size=16,
@@ -90,32 +85,30 @@ def get_config():
         scale_factor=1.0,
     )
 
+    # tokenizer 仍使用 3 通道预训练权重；通过 AdapterIn 将原始 sat 通道映射到 3 通道
     config.sat_in_channels = 3
     config.sat_out_channels = 3
     config.radar_in_channels = 3
     config.radar_out_channels = 3
-
     config.ae_image_size = 512
 
-    global model
     config.nnet = d(
         name="flowtok-xl",
         model_args=model,
     )
 
-    # ========= loss 权重 =========
     config.losses = d(
-        contrastive_loss_weight=0.1,
-        kld_loss_weight=0.01,
+        contrastive_loss_weight=0.0,
+        kld_loss_weight=0.0,
+        adapter_out_recon_weight=1.0,
     )
     config.loss_coeffs = []
+    config.use_text_vae_encoder = False
+    config.train_adapter_in_with_encoder_grad = True
 
-    config.use_text_vae_encoder = True
-
-    # ========= Dataset: Sat(0/2/6) -> Radar(last ch) =========
-    # TODO: 修改为在 Gadi 上的 dataset_filelist 路径
     config.dataset = d(
-        filelist_path="/g/data/kl02/yh0308/Data/71/dataset_filelist_v2v.pkl",
+        # TODO: 根据实际数据路径调整
+        filelist_path="/g/data/kl02/yh0308/Data/71/dataset_filelist_v2v_3m.pkl",
         filelist_split="train",
         v2v=True,
         num_frames=16,
@@ -123,7 +116,7 @@ def get_config():
         num_workers_per_gpu=4,
         crop_size=128,
         ir_band_indices=[0, 2, 6],
-        use_lightning=False,
+        use_lightning=True,
         augment=d(
             enabled=True,
             hflip=True,
@@ -131,8 +124,8 @@ def get_config():
         ),
     )
 
-    # TODO: 修改为在 Gadi 上实际的实验输出目录
-    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_run_v2v_contrastive"
+    # Gadi 上的实验输出目录
+    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_run_v2v_adapter"
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"
 
@@ -143,6 +136,25 @@ def get_config():
         scale=2.0,
         noise_scale=0.1,
         path=config.sample_dir + "/samples_eval",
+    )
+
+    # adapter 设置：与原始 adapter 配置保持一致
+    config.adapter_in_satellite = d(
+        enabled=True,
+        in_channels=4,
+        mid_channels=32,
+        num_blocks=3,
+    )
+    config.adapter_in_radar = d(
+        enabled=True,
+        in_channels=1,
+        mid_channels=16,
+        num_blocks=2,
+    )
+    config.adapter_out = d(
+        enabled=True,
+        mid_channels=16,
+        num_blocks=2,
     )
 
     return config

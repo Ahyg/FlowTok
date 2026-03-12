@@ -149,6 +149,10 @@ def build_dataloader(config, mode: str, accelerator: accelerate.Accelerator):
     ir_band_indices = config.dataset.get("ir_band_indices", None)
     use_lightning = config.dataset.get("use_lightning", True)
 
+    is_train = (mode == "train")
+    aug_cfg = config.dataset.get("augment", None)
+    do_augment = is_train and aug_cfg is not None and aug_cfg.get("enabled", False)
+
     if use_v2v:
         dataset = SatelliteRadarNpyDataset(
             base_dir=None,
@@ -161,6 +165,9 @@ def build_dataloader(config, mode: str, accelerator: accelerate.Accelerator):
             num_frames=config.dataset.get("num_frames", (1, 8)),  # (min_t, max_t) => i2i + v2v
             ir_band_indices=ir_band_indices,
             use_lightning=use_lightning,
+            augment=do_augment,
+            augment_hflip=aug_cfg.get("hflip", True) if aug_cfg else True,
+            augment_vflip=aug_cfg.get("vflip", True) if aug_cfg else True,
         )
         collate_fn = collate_sat2radar_v2v
     else:
@@ -176,6 +183,9 @@ def build_dataloader(config, mode: str, accelerator: accelerate.Accelerator):
             frame_stride=config.dataset.get("frame_stride", 1),
             ir_band_indices=ir_band_indices,
             use_lightning=use_lightning,
+            augment=do_augment,
+            augment_hflip=aug_cfg.get("hflip", True) if aug_cfg else True,
+            augment_vflip=aug_cfg.get("vflip", True) if aug_cfg else True,
         )
         collate_fn = None
 
@@ -212,6 +222,10 @@ def build_dataloader(config, mode: str, accelerator: accelerate.Accelerator):
             logging.info(f"  Future frames: {config.dataset.get('future_frames', None)}")
             logging.info(f"  Frame stride: {config.dataset.get('frame_stride', 1)}")
         logging.info(f"  Filelist: {config.dataset.filelist_path}")
+        if do_augment:
+            logging.info(f"  Augmentation: ON (hflip={dataset.augment_hflip}, vflip={dataset.augment_vflip})")
+        else:
+            logging.info(f"  Augmentation: OFF")
     
     return dataloader
 

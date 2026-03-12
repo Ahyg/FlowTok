@@ -74,6 +74,11 @@ class SatelliteRadarNpyDataset(Dataset):
         # For real-time v2v: aligned (sat, radar) pairs, variable T (T=1 => i2i).
         # num_frames: int = fixed T; (min_t, max_t) = sample T in [min_t, max_t]; None = use all.
         num_frames: int | tuple[int, int] | None = None,
+        # Spatial augmentation (applied synchronously to sat & radar).
+        # Only effective when augment=True (typically set for train split only).
+        augment: bool = False,
+        augment_hflip: bool = True,
+        augment_vflip: bool = True,
     ):
         super().__init__()
         self.base_dir = base_dir
@@ -87,6 +92,9 @@ class SatelliteRadarNpyDataset(Dataset):
         self.future_frames = future_frames
         self.frame_stride = max(int(frame_stride), 1)
         self.num_frames = num_frames
+        self.augment = augment
+        self.augment_hflip = augment_hflip
+        self.augment_vflip = augment_vflip
         self.files = self._collect_files(files)
 
     def _collect_files(self, files_override):
@@ -132,6 +140,25 @@ class SatelliteRadarNpyDataset(Dataset):
         z_min, z_max = 0.0, 60.0
         np.clip(mask, z_min, z_max, out=mask)
         return (mask - z_min) / (z_max - z_min)
+
+    def _apply_augmentation(self, sat_video: np.ndarray, radar_video: np.ndarray):
+        """Apply random spatial flips consistently to all frames of both modalities.
+
+        Args:
+            sat_video:   (T, C_sat, H, W)
+            radar_video: (T, C_rad, H, W)
+        Returns:
+            Augmented copies (same shapes).
+        """
+        if not self.augment:
+            return sat_video, radar_video
+        if self.augment_hflip and np.random.random() < 0.5:
+            sat_video = np.ascontiguousarray(sat_video[..., ::-1])
+            radar_video = np.ascontiguousarray(radar_video[..., ::-1])
+        if self.augment_vflip and np.random.random() < 0.5:
+            sat_video = np.ascontiguousarray(sat_video[..., ::-1, :])
+            radar_video = np.ascontiguousarray(radar_video[..., ::-1, :])
+        return sat_video, radar_video
 
     def __len__(self):
         return len(self.files)
@@ -225,6 +252,7 @@ class SatelliteRadarNpyDataset(Dataset):
 
                 sat_video = np.stack(sat_frames, axis=0)   # (T_sat, C_sat, H, W)
                 radar_video = np.stack(radar_frames, axis=0)  # (T_rad, 1, H, W)
+                sat_video, radar_video = self._apply_augmentation(sat_video, radar_video)
 
                 return {
                     "sat_video": torch.from_numpy(sat_video).float(),
@@ -270,6 +298,7 @@ class SatelliteRadarNpyDataset(Dataset):
                 radar_frames = [self._load_radar_image(p) for p in radar_paths_seq]
                 sat_video = np.stack(sat_frames, axis=0)
                 radar_video = np.stack(radar_frames, axis=0)
+                sat_video, radar_video = self._apply_augmentation(sat_video, radar_video)
                 return {
                     "sat_video": torch.from_numpy(sat_video).float(),
                     "radar_video": torch.from_numpy(radar_video).float(),

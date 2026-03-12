@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import logging
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,28 @@ class NpyDatasetBuilder:
         is_sparse = (paf < self.coverage_threshold) and (caf < 0.005) and (saf < 0.05)
         return is_sparse
 
+    def is_v2v_clip_sparse(self, path_list, min_valid_ratio=0.5):
+        """
+        Video-level sparse filtering for V2V clips.
+
+        A clip is considered valid iff at least `min_valid_ratio` of its frames
+        are NOT sparse according to `is_radar_sparse_npy`.
+        Default behavior enforces: at least half of frames are valid.
+        """
+        if self.coverage_threshold == 0.0:
+            return False
+        if path_list is None or len(path_list) == 0:
+            return True
+
+        n_total = len(path_list)
+        n_valid = 0
+        for p in path_list:
+            if not self.is_radar_sparse_npy(p):
+                n_valid += 1
+
+        required_valid = int(np.ceil(n_total * min_valid_ratio))
+        return n_valid < required_valid
+
     # ---------- Build (hist_seq, target) pairs from time series ----------
 
     def _check_strict_consecutive(self, path_list):
@@ -201,26 +224,35 @@ class NpyDatasetBuilder:
         - Scan left to right: if segment [i, i+clip_length) exists in time_to_path and is strictly
           consecutive, emit one clip and set i += clip_length (no overlap); else i += 1 and retry.
         - strict_consecutive: when True, require adjacent frames in the segment to be exactly refresh_rate apart.
-        - filter_radar: when True and coverage_threshold > 0, keep clip only if last frame passes is_radar_sparse_npy.
+        - filter_radar: when True and coverage_threshold > 0, apply video-level filtering:
+          keep clip only if at least half of frames pass radar sparsity filtering.
         Returns: [(path_list, path_list), ...], each path_list of length clip_length; no overlap between samples.
         """
         paired = []
         i = 0
-        while i + clip_length <= len(sorted_times):
+        total = len(sorted_times)
+        pbar = tqdm(total=total, desc="Building clips", unit="frame")
+        while i + clip_length <= total:
             segment = sorted_times[i:i + clip_length]
             if not all(tt in time_to_path for tt in segment):
+                pbar.update(1)
                 i += 1
                 continue
             if strict_consecutive and not self._are_times_consecutive(segment):
+                pbar.update(1)
                 i += 1
                 continue
             path_list = [time_to_path[tt] for tt in segment]
             if filter_radar and self.coverage_threshold > 0:
-                if self.is_radar_sparse_npy(path_list[-1]):
+                if self.is_v2v_clip_sparse(path_list, min_valid_ratio=0.5):
+                    pbar.update(1)
                     i += 1
                     continue
             paired.append((path_list, path_list))
+            pbar.update(clip_length)
             i += clip_length  # no overlap: next segment starts after this clip
+        pbar.update(total - pbar.n)
+        pbar.close()
         return paired
 
     def _get_aligned_v2v_from_times(self, times, time_to_path,
@@ -244,7 +276,7 @@ class NpyDatasetBuilder:
                 if strict_consecutive and not self._check_strict_consecutive(path_list):
                     continue
                 if filter_radar and self.coverage_threshold > 0:
-                    if self.is_radar_sparse_npy(path_list[-1]):
+                    if self.is_v2v_clip_sparse(path_list, min_valid_ratio=0.5):
                         continue
                 paired.append((path_list, path_list))
             except ValueError:
