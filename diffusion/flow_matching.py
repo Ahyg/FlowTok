@@ -280,6 +280,10 @@ class FlowMatching(nn.Module):
         ############ loss for FM
         noise = x0.reshape(x_start.shape)
 
+        # Clone x_start before any in-place modification so the caller's tensor
+        # (e.g. radar_tokens used by adapter_out recon loss) is not corrupted.
+        x_start = x_start.clone()
+
         null_indicator = torch.from_numpy(np.array([random.random() < all_config.nnet.model_args.cfg_indicator for _ in range(x_start.shape[0])])).to(x_start.device)
         if null_indicator.sum() <= 1:
             null_indicator[null_indicator==True] = False

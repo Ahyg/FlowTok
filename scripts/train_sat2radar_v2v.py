@@ -87,11 +87,11 @@ def encode_video_with_autoencoder(
             )
     if require_grad_through_encoder:
         # Enable gradient flow to adapter input (AE params are frozen by requires_grad_(False)).
-        z = autoencoder.encode(video)[0].mul_(scale_factor)  # [B*T, C_tok, 1, L]
+        z = autoencoder.encode(video)[0] * scale_factor  # [B*T, C_tok, 1, L]
     else:
         with torch.no_grad():
             # FlowTiTok.encode 返回 (z, dict)
-            z = autoencoder.encode(video)[0].mul_(scale_factor)  # [B*T, C_tok, 1, L]
+            z = autoencoder.encode(video)[0] * scale_factor  # [B*T, C_tok, 1, L]
     z = z.squeeze(2).permute(0, 2, 1)  # [B*T, L, C_tok]
     L = z.shape[1]
     # interpolate 等操作可能导致非 contiguous，view 会报错，改用 reshape 更安全
@@ -1065,7 +1065,7 @@ def train(config):
 
                     # v2v 训练时，额外保存一段随时间演化的 GIF 视频，
                     # 每一帧与上面的 PNG 类似，都是多样本堆叠 + 四联图：[sat_IR | sat_lightning | radar_gt | radar_pred]。
-                    if getattr(getattr(config, "dataset", {}), "v2v", False) and HAS_IMAGEIO:
+                    if accelerator.is_main_process and getattr(getattr(config, "dataset", {}), "v2v", False) and HAS_IMAGEIO:
                         video_frames = []
                         for t in range(T_eff):
                             rows_t = []
