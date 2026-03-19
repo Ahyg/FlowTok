@@ -286,6 +286,7 @@ def main():
     parser.add_argument("--max_batches_images", type=int, default=2, help="Max batches to save images (-1 for all)")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--gpu", default=None, help="CUDA_VISIBLE_DEVICES override, e.g. '0'")
+    parser.add_argument("--filelist_path", default=None, help="Optional override for config.dataset.filelist_path")
     parser.add_argument("--fss_thresholds", default="0,5,10,15,20,25,30,35,40,45,50,55,60")
     parser.add_argument("--fss_scales", default="1,2,3,4,5,6,7,8,9,10")
     args = parser.parse_args()
@@ -294,6 +295,9 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     config = load_py_config(args.config)
+    if args.filelist_path:
+        config.dataset.filelist_path = args.filelist_path
+        print(f"[INFO] Override filelist_path: {args.filelist_path}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

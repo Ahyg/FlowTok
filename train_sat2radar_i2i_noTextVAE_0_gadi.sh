@@ -33,6 +33,7 @@ conda activate flowtok
 # FlowTok 根目录与 i2i noTextVAE 的 Gadi 配置路径
 FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
 CONFIG_PATH="${FLOWTOK_ROOT}/configs/Sat2Radar-i2i-noTextVAE-FlowTiTok-XL_gadi.py"
+FILELIST_PATH="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202312_ct005.pkl"
 
 cd "${FLOWTOK_ROOT}"
 
@@ -42,5 +43,6 @@ accelerate launch \
   --num_processes 1 \
   scripts/train_sat2radar_v2v.py \
   --config="${CONFIG_PATH}" \
+  --filelist_path="${FILELIST_PATH}" \
   > /scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_sat2radar_i2i_noTextVAE_train.log 2>&1
 

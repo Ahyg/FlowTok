@@ -152,12 +152,16 @@ def main():
     parser.add_argument("--max_batches", type=int, default=10, help="Max number of batches to visualize (-1 for all)")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--gpu", default=None, help="CUDA_VISIBLE_DEVICES override, e.g. '0'")
+    parser.add_argument("--filelist_path", default=None, help="Optional override for config.dataset.filelist_path")
     args = parser.parse_args()
 
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     config = load_py_config(args.config)
+    if args.filelist_path:
+        config.dataset.filelist_path = args.filelist_path
+        print(f"[INFO] Override filelist_path: {args.filelist_path}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     loader = build_eval_dataloader(config, split=args.split, batch_size=args.batch_size, mode=args.mode)

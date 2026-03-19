@@ -41,7 +41,7 @@ def get_config():
     config = ml_collections.ConfigDict()
     config.seed = 1234
 
-    ftok_path = "/g/data/kl02/yh0308/Data/FlowTiTok_512.bin"
+    ftok_path = "/g/data/kl02/yh0308/Data/flowtok_ckpts/FlowTiTok_512.bin"
     config.sat_tokenizer_checkpoint = ftok_path
     config.radar_tokenizer_checkpoint = ftok_path
 
@@ -105,7 +105,7 @@ def get_config():
 
     # 使用新的大数据集 filelist（按时间块切分好的 train/val/test）
     config.dataset = d(
-        filelist_path="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_timeblock_201906_202507.pkl",
+        filelist_path="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_train_201906_202312_halfvalid50_ct005.pkl",
         filelist_split="train",
         v2v=True,
         num_frames=16,

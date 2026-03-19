@@ -169,7 +169,9 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, condition_embeds, condition_masks, pos):
         if self.gradient_checking:
-            return torch.utils.checkpoint.checkpoint(self._forward, x, condition_embeds, condition_masks, pos)
+            return torch.utils.checkpoint.checkpoint(
+                self._forward, x, condition_embeds, condition_masks, pos, use_reentrant=False
+            )
         else:
             return self._forward(x, condition_embeds, condition_masks, pos)
     
@@ -192,7 +194,7 @@ class ConvNeXtBlock(nn.Module):
 
     def forward(self, x, condition_embeds, condition_masks, pos):
         if self.gradient_checking:
-            return torch.utils.checkpoint.checkpoint(self._forward, x)
+            return torch.utils.checkpoint.checkpoint(self._forward, x, use_reentrant=False)
         else:
             return self._forward(x)
     

@@ -10,7 +10,7 @@
 #PBS -l wd
 #PBS -M auhuyg@gmail.com
 #PBS -m abe
-#PBS -N Sat2Radar_v2v_satlight_train
+#PBS -N Sat2Radar_v2v_adapter_train
 
 export HF_HOME="/scratch/kl02/$USER/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME"
@@ -25,19 +25,22 @@ echo "OPENCLIP_LOCAL_CKPT=$OPENCLIP_LOCAL_CKPT" >&2
 
 source /scratch/kl02/$USER/miniconda3/etc/profile.d/conda.sh
 conda activate flowtok
+export PYTHONUNBUFFERED=1
 
 FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
-CONFIG_PATH="${FLOWTOK_ROOT}/configs/Sat2Radar-v2v-satlight-tokenfusion-FlowTiTok-XL_gadi.py"
+CONFIG_PATH="${FLOWTOK_ROOT}/configs/Sat2Radar-v2v-adapter-FlowTiTok-XL_gadi.py"
 FILELIST_PATH="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_train_201906_202312_halfvalid50_ct005.pkl"
 
 cd "${FLOWTOK_ROOT}"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 NUM_PROCESSES=${NUM_PROCESSES:-1}
 
+mkdir -p "/scratch/kl02/$USER/Projv2v/job_logs"
+
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   scripts/train_sat2radar_v2v.py \
   --config="${CONFIG_PATH}" \
   --filelist_path="${FILELIST_PATH}" \
-  > /scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_sat2radar_v2v_satlight_train.log 2>&1
+  > /scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_sat2radar_v2v_adapter_train.log 2>&1
 

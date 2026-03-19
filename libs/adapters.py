@@ -44,7 +44,6 @@ class AdapterIn(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-        #return torch.clamp(x, 0.0, 1.0)
         return x
 
 
@@ -89,6 +88,5 @@ class AdapterOut(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-        #return torch.clamp(x, 0.0, 1.0)
         return x
 

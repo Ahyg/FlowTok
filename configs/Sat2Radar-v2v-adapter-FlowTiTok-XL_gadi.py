@@ -45,14 +45,14 @@ def get_config():
     config.seed = 1234
 
     # TODO: 根据实际路径调整 FlowTiTok_512.bin 所在位置
-    ftok_path = "/g/data/kl02/yh0308/Data/FlowTiTok_512.bin"
+    ftok_path = "/g/data/kl02/yh0308/Data/flowtok_ckpts/FlowTiTok_512.bin"
     config.sat_tokenizer_checkpoint = ftok_path
     config.radar_tokenizer_checkpoint = ftok_path
 
     # 保持与原 adapter 配置一致的训练设置（小 batch，主要用于 debug/adapter 实验）
     config.train = d(
         n_steps=200_000,
-        batch_size=8,
+        batch_size=4,
         log_interval=100,
         eval_interval=1_000,
         save_interval=20_000,
@@ -138,7 +138,6 @@ def get_config():
         path=config.sample_dir + "/samples_eval",
     )
 
-    # adapter 设置：与原始 adapter 配置保持一致
     config.adapter_in_satellite = d(
         enabled=True,
         in_channels=4,

@@ -34,6 +34,7 @@ FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
 CONFIG_PATH="${FLOWTOK_ROOT}/configs/Sat2Radar-v2v-contrastive-FlowTiTok-XL_gadi.py"
 CKPT_PATH="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_v2v_contrastive/ckpts/200000.ckpt"
 OUTPUT_DIR="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_v2v_contrastive/test_v2v_200000"
+FILELIST_PATH="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_test_202407_202507.pkl"
 
 SPLIT="test"              # train/val/test，可按需要改
 MODE="v2v"                # 固定为 v2v
@@ -47,6 +48,7 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
 python scripts/test_sat2radar_v2v.py \
   --config "${CONFIG_PATH}" \
+  --filelist_path "${FILELIST_PATH}" \
   --ckpt "${CKPT_PATH}" \
   --out_dir "${OUTPUT_DIR}" \
   --split "${SPLIT}" \

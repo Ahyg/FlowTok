@@ -9,8 +9,6 @@ class Args:
             setattr(self, key, value)
 
 
-# 基础模型配置与 Sat2Radar-v2v-pretrained-FlowTiTok-XL 保持一致，
-# 仅通过 config.use_text_vae_encoder 关闭 textVAE encoder 分支。
 model = Args(
     learn_sigma=False,
     channels=16,
@@ -36,13 +34,11 @@ model = Args(
 
 
 def d(**kwargs):
-    """Helper of creating a config dict."""
     return ml_collections.ConfigDict(initial_dictionary=kwargs)
 
 
 def get_config():
     config = ml_collections.ConfigDict()
-
     config.seed = 1234
 
     ftok_path = "/g/data/kl02/yh0308/Data/flowtok_ckpts/FlowTiTok_512.bin"
@@ -51,7 +47,7 @@ def get_config():
 
     config.train = d(
         n_steps=200_000,
-        batch_size=8,
+        batch_size=64,
         log_interval=100,
         eval_interval=1_000,
         save_interval=20_000,
@@ -103,17 +99,20 @@ def get_config():
     config.loss_coeffs = []
     config.use_text_vae_encoder = False
 
-    # 使用新的大数据集 filelist（按时间块切分好的 train/val/test）
+    # sat IR + lightning token fusion for i2i
+    config.cond_use_sat_lightning_tokens = True
+    config.cond_token_fusion = "mean"
+
     config.dataset = d(
-        filelist_path="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_train_201906_202312_halfvalid50_ct005.pkl",
+        filelist_path="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202312_ct005.pkl",
         filelist_split="train",
         v2v=True,
-        num_frames=16,
+        num_frames=1,
         frame_stride=1,
         num_workers_per_gpu=4,
         crop_size=128,
         ir_band_indices=[0, 2, 6],
-        use_lightning=False,
+        use_lightning=True,
         augment=d(
             enabled=True,
             hflip=True,
@@ -121,7 +120,7 @@ def get_config():
         ),
     )
 
-    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_run_v2v_newposemb"
+    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_run_i2i_satlight_tokenfusion"
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"
 
@@ -136,13 +135,20 @@ def get_config():
 
     config.adapter_in_satellite = d(
         enabled=False,
-        in_channels=3,
+        in_channels=4,
         mid_channels=32,
         num_blocks=3,
     )
+    config.adapter_in_radar = d(
+        enabled=False,
+        in_channels=1,
+        mid_channels=16,
+        num_blocks=2,
+    )
     config.adapter_out = d(
         enabled=False,
+        mid_channels=16,
+        num_blocks=2,
     )
 
     return config
-

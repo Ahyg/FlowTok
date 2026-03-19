@@ -41,6 +41,11 @@ config_flags.DEFINE_config_file(
     "Config file path for Sat2Radar-Video training.",
     lock_config=False,
 )
+flags.DEFINE_string(
+    "filelist_path",
+    None,
+    "Optional override for config.dataset.filelist_path.",
+)
 
 
 def encode_video_with_autoencoder(
@@ -277,7 +282,6 @@ def train(config):
     adapter_out = None
     adapter_in_sat_cfg = getattr(config, "adapter_in_satellite", None)
     if adapter_in_sat_cfg is None:
-        # Backward compatibility with old config key.
         adapter_in_sat_cfg = getattr(config, "adapter_in", None)
     if adapter_in_sat_cfg and adapter_in_sat_cfg.get("enabled", False):
         adapter_in_satellite = AdapterIn(
@@ -303,7 +307,9 @@ def train(config):
 
     # 将 adapter 参数加入优化器，与主干一起训练
     if adapter_in_satellite is not None:
-        train_state.optimizer.add_param_group({"params": list(adapter_in_satellite.parameters())})
+        train_state.optimizer.add_param_group(
+            {"params": list(adapter_in_satellite.parameters())}
+        )
     if adapter_in_radar is not None:
         train_state.optimizer.add_param_group({"params": list(adapter_in_radar.parameters())})
     if adapter_out is not None:
@@ -799,9 +805,12 @@ def train(config):
                 _module_grad_norm(adapter_in_radar),
                 _module_grad_norm(adapter_out),
             )
+
         optimizer.step()
         lr_scheduler.step()
+
         train_state.ema_update(config.get("ema_rate", 0.9999))
+
         train_state.step += 1
         return {
             "lr": train_state.optimizer.param_groups[0]["lr"],
@@ -957,9 +966,8 @@ def train(config):
                     radar_video_pred = ode_fm_solver_sample(nnet_ema, batch)  # [B, T, 1, H, W]
                     radar_video_pred_no_adapterout = None
                     if adapter_out is not None:
-                        # Optional comparison branch: bypass adapter_out during visualization.
                         radar_video_pred_no_adapterout = ode_fm_solver_sample(
-                            nnet_ema, batch, use_adapter_out=False
+                            nnet_ema, batch, use_adapter_out=False,
                         )  # [B, T, 1, H, W]
                     B, T_eff, _, H, W = radar_video_pred.shape
 
@@ -1230,7 +1238,6 @@ def train(config):
                 if accelerator.is_main_process:
                     ckpt_save_path = os.path.join(config.ckpt_root, f"{train_state.step}.ckpt")
                     train_state.save(ckpt_save_path)
-                    # 额外保存 adapter 权重（若启用）
                     if adapter_in_satellite is not None:
                         torch.save(
                             accelerator.unwrap_model(adapter_in_satellite).state_dict(),
@@ -1259,6 +1266,9 @@ def train(config):
 
 def main(_):
     config = FLAGS.config
+    if FLAGS.filelist_path:
+        config.dataset.filelist_path = FLAGS.filelist_path
+        logging.info("Override filelist_path: %s", FLAGS.filelist_path)
     train(config)
 
 

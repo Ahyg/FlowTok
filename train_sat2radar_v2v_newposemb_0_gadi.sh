@@ -28,6 +28,7 @@ conda activate flowtok
 
 FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
 CONFIG_PATH="${FLOWTOK_ROOT}/configs/Sat2Radar-v2v-newposemb-FlowTiTok-XL_gadi.py"
+FILELIST_PATH="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_train_201906_202312_halfvalid50_ct005.pkl"
 
 cd "${FLOWTOK_ROOT}"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
@@ -37,5 +38,6 @@ accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   scripts/train_sat2radar_v2v.py \
   --config="${CONFIG_PATH}" \
+  --filelist_path="${FILELIST_PATH}" \
   > /scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_sat2radar_v2v_newposemb_train.log 2>&1
 

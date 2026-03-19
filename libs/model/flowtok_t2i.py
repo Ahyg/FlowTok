@@ -99,7 +99,7 @@ class DiTBlock(nn.Module):
         )
 
     def forward(self, x, c):
-        return torch.utils.checkpoint.checkpoint(self._forward, x, c)
+        return torch.utils.checkpoint.checkpoint(self._forward, x, c, use_reentrant=False)
         # return self._forward(x, c)
     
     def _forward(self, x, c):

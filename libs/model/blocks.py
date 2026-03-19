@@ -292,7 +292,7 @@ class UViTBlock(nn.Module):
 
     def forward(self, x, skip=None):
         if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(self._forward, x, skip)
+            return torch.utils.checkpoint.checkpoint(self._forward, x, skip, use_reentrant=False)
         else:
             return self._forward(x, skip)
 
