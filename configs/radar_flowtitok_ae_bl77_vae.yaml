@@ -3,9 +3,9 @@ experiment:
   name: radar_flowtitok_ae_bl77_vae_run1
   output_dir: /mnt/ssd_1/yghu/Experiments/radar_flowtitok_ae_bl77_vae_run1
   max_train_examples: 10464
-  save_every: 50000
-  eval_every: 50000
-  generate_every: 5000
+  save_every: 10000
+  eval_every: 200
+  generate_every: 100
   log_every: 50
   log_grad_norm_every: 1000
   resume: true
@@ -68,6 +68,19 @@ lr_scheduler:
     warmup_steps: 10000
     end_lr: 1.0e-05
 
+finetune:
+  enabled: true
+  pretrained_weight: /mnt/ssd_1/yghu/Data/flowtok_ckpts/FlowTiTok_512.bin
+  freeze_encoder: true
+  encoder_trainable_prefixes:
+    - encoder.patch_embed
+  decoder_pretrained_lr_scale: 0.1
+  decoder_new_layer_prefixes:
+    - decoder.ffn
+    - decoder.conv_out
+  text_guidance_from_filename: true
+  decoder_warmup_steps: 200000
+
 training:
   gradient_accumulation_steps: 1
   per_gpu_batch_size: 8
@@ -79,6 +92,6 @@ training:
   max_train_steps: 650000
   num_generated_images: 2
   max_grad_norm: 1.0
-  nan_check: true
+  nan_check: false
   nan_skip: true
 

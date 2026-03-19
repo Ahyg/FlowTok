@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
 import os
 import torch
 import torch.nn as nn
@@ -22,6 +23,8 @@ from einops import rearrange
 from torch.cuda.amp import autocast
 
 from libs.model.blocks import FlowTiTokEncoder, FlowTiTokDecoder
+
+logger = logging.getLogger(__name__)
 
 
 class DiagonalGaussianDistribution(object):
@@ -154,3 +157,128 @@ class FlowTiTok(nn.Module):
     def load_pretrained_weight(self, checkpoint_path):
         state_dict = torch.load(checkpoint_path, map_location="cpu")
         self.load_state_dict(state_dict, strict=True)
+
+    def load_pretrained_with_channel_adapt(self, checkpoint_path):
+        """Load pretrained weights with smart channel adaptation.
+
+        Handles shape mismatches in channel-dependent layers when the model's
+        in_channels / out_channels differ from the pretrained checkpoint (typically 3).
+        All other parameters are loaded normally via strict=False.
+        """
+        pretrained_sd = torch.load(checkpoint_path, map_location="cpu")
+        model_sd = self.state_dict()
+
+        channel_keys = self._find_channel_mismatch_keys(pretrained_sd, model_sd)
+        if channel_keys:
+            logger.info(
+                f"Channel-adaptive loading: {len(channel_keys)} keys with shape mismatch "
+                f"will be handled specially: {list(channel_keys.keys())}"
+            )
+
+        compatible_sd = {
+            k: v for k, v in pretrained_sd.items()
+            if k in model_sd and k not in channel_keys and model_sd[k].shape == v.shape
+        }
+        msg = self.load_state_dict(compatible_sd, strict=False)
+        logger.info(
+            f"Loaded {len(compatible_sd)} compatible keys. "
+            f"Missing: {len(msg.missing_keys)}, Unexpected: {len(msg.unexpected_keys)}"
+        )
+
+        for key, (pre_shape, model_shape) in channel_keys.items():
+            pre_w = pretrained_sd[key]
+            new_w = model_sd[key].clone()
+            self._adapt_channel_weight(key, pre_w, new_w, pre_shape, model_shape)
+            with torch.no_grad():
+                param = self
+                for attr in key.split("."):
+                    param = getattr(param, attr) if not attr.isdigit() else param[int(attr)]
+                param.copy_(new_w)
+
+        logger.info("Channel-adaptive pretrained weight loading complete.")
+
+    @staticmethod
+    def _find_channel_mismatch_keys(pretrained_sd, model_sd):
+        mismatched = {}
+        for k in pretrained_sd:
+            if k in model_sd and pretrained_sd[k].shape != model_sd[k].shape:
+                mismatched[k] = (pretrained_sd[k].shape, model_sd[k].shape)
+        return mismatched
+
+    @staticmethod
+    def _adapt_channel_weight(key, pre_w, new_w, pre_shape, model_shape):
+        """Copy pretrained weights into the new tensor with channel adaptation.
+
+        Strategy: when the channel dimension mismatches, compute the mean
+        across the pretrained channel axis and broadcast (repeat) it to fill
+        every new channel.  This gives a uniform, pretrained-informed starting
+        point for all channels instead of leaving some randomly initialized.
+        """
+
+        if "patch_embed.weight" in key:
+            # Encoder input projection: (width, C_in_pre, P, P) -> (width, C_in_new, P, P)
+            c_new = model_shape[1]
+            mean_w = pre_w.mean(dim=1, keepdim=True)          # (width, 1, P, P)
+            new_w.copy_(mean_w.expand_as(new_w))
+            logger.info(f"  {key}: mean-broadcast input channels {pre_shape[1]} -> {c_new}")
+
+        elif "ffn.0.weight" in key:
+            # Decoder pixel projection: (P^2*C_pre, width, 1, 1) -> (P^2*C_new, width, 1, 1)
+            width = pre_shape[1]
+            c_new_total = model_shape[0]
+            for c_old_guess in [3, 1]:
+                if pre_shape[0] % c_old_guess == 0:
+                    p_sq = pre_shape[0] // c_old_guess
+                    c_new = c_new_total // p_sq
+                    if c_new * p_sq == c_new_total:
+                        # (P^2, C_old, width, 1, 1) -> mean over C_old -> (P^2, 1, width, 1, 1)
+                        pre_reshaped = pre_w.reshape(p_sq, c_old_guess, width, 1, 1)
+                        mean_ch = pre_reshaped.mean(dim=1, keepdim=True)  # (P^2, 1, w, 1, 1)
+                        expanded = mean_ch.expand(p_sq, c_new, width, 1, 1)
+                        new_w.copy_(expanded.reshape(model_shape))
+                        logger.info(
+                            f"  {key}: mean-broadcast output channels {c_old_guess} -> {c_new} "
+                            f"(P^2={p_sq})"
+                        )
+                        return
+            logger.warning(f"  {key}: could not determine channel layout, using random init")
+            nn.init.trunc_normal_(new_w, mean=0.0, std=0.02)
+
+        elif "ffn.0.bias" in key:
+            c_pre_total = pre_shape[0]
+            c_new_total = model_shape[0]
+            for c_old_guess in [3, 1]:
+                if c_pre_total % c_old_guess == 0:
+                    p_sq = c_pre_total // c_old_guess
+                    c_new = c_new_total // p_sq
+                    if c_new * p_sq == c_new_total:
+                        pre_reshaped = pre_w.reshape(p_sq, c_old_guess)
+                        mean_ch = pre_reshaped.mean(dim=1, keepdim=True)  # (P^2, 1)
+                        expanded = mean_ch.expand(p_sq, c_new)
+                        new_w.copy_(expanded.reshape(model_shape))
+                        logger.info(f"  {key}: mean-broadcast bias channels {c_old_guess} -> {c_new}")
+                        return
+            logger.warning(f"  {key}: could not determine channel layout for bias, using random init")
+            new_w.zero_()
+
+        elif "conv_out.weight" in key:
+            # Decoder final refine conv: (C_pre, C_pre, k, k) -> (C_new, C_new, k, k)
+            c_pre = pre_shape[0]
+            c_new = model_shape[0]
+            # mean over both input and output channel dims
+            mean_w = pre_w.mean(dim=0, keepdim=True).mean(dim=1, keepdim=True)  # (1, 1, k, k)
+            new_w.copy_(mean_w.expand_as(new_w))
+            logger.info(f"  {key}: mean-broadcast conv_out channels {c_pre} -> {c_new}")
+
+        elif "conv_out.bias" in key or "patch_embed.bias" in key:
+            c_pre = pre_shape[0]
+            c_new = model_shape[0]
+            mean_b = pre_w.mean()
+            new_w.fill_(mean_b.item())
+            logger.info(f"  {key}: mean-fill bias {c_pre} -> {c_new}")
+
+        else:
+            logger.warning(
+                f"  {key}: unrecognized mismatch {pre_shape} -> {model_shape}, using random init"
+            )
+            nn.init.trunc_normal_(new_w, mean=0.0, std=0.02)

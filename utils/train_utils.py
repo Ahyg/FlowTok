@@ -220,15 +220,22 @@ def create_model_and_loss_module(config, logger, accelerator,
         model_config = config
     model = model_cls(model_config)
 
-    if config.experiment.get("init_weight", ""):
-        # If loading a pretrained weight
+    finetune_cfg = config.get("finetune", {})
+    finetune_enabled = finetune_cfg.get("enabled", False)
+    finetune_pretrained = finetune_cfg.get("pretrained_weight", "")
+
+    if finetune_enabled and finetune_pretrained and model_type == "flowtitok":
+        logger.info(
+            f"Finetune mode: loading pretrained weight with channel adaptation "
+            f"from {finetune_pretrained}"
+        )
+        model.load_pretrained_with_channel_adapt(finetune_pretrained)
+    elif config.experiment.get("init_weight", ""):
         model_weight = torch.load(config.experiment.init_weight, map_location="cpu")
         if config.model.vq_model.finetune_decoder:
-            # Add the MaskGIT-VQGAN's quantizer/decoder weight as well
             pretrained_tokenizer_weight = torch.load(
                 config.model.vq_model.pretrained_tokenizer_weight, map_location="cpu"
             )
-            # Only keep the quantize and decoder part
             pretrained_tokenizer_weight = {"pixel_" + k:v for k,v in pretrained_tokenizer_weight.items() if not "encoder." in k}
             model_weight.update(pretrained_tokenizer_weight)
         
@@ -333,6 +340,141 @@ def create_model_and_loss_module(config, logger, accelerator,
     return model, ema_model, loss_module
 
 
+def _is_no_weight_decay(name, param):
+    return (param.ndim < 2 or "ln" in name or "bias" in name or 'latent_tokens' in name
+            or 'mask_token' in name or 'embedding' in name or 'norm' in name
+            or 'gamma' in name or 'embed' in name)
+
+
+def _create_finetune_optimizer(config, logger, model, optimizer_cls,
+                               optimizer_config, base_lr):
+    """Build optimizer with differential LR for finetune mode.
+
+    Three logical groups (each split into weight-decay / no-weight-decay):
+      1. high_lr: encoder trainable layers (patch_embed) + decoder new layers (ffn, conv_out)
+      2. low_lr:  all other trainable decoder parameters (pretrained transformer, etc.)
+    """
+    finetune_cfg = config.finetune
+    lr_scale = finetune_cfg.get("decoder_pretrained_lr_scale", 0.1)
+    low_lr = base_lr * lr_scale
+
+    enc_trainable_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
+    dec_new_prefixes = list(finetune_cfg.get("decoder_new_layer_prefixes", []))
+    high_lr_prefixes = enc_trainable_prefixes + dec_new_prefixes
+
+    high_lr_wd, high_lr_no_wd = [], []
+    low_lr_wd, low_lr_no_wd = [], []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_high_lr = any(name.startswith(p) for p in high_lr_prefixes)
+        is_no_wd = _is_no_weight_decay(name, param)
+
+        if is_high_lr:
+            (high_lr_no_wd if is_no_wd else high_lr_wd).append(param)
+        else:
+            (low_lr_no_wd if is_no_wd else low_lr_wd).append(param)
+
+    param_groups = []
+    if high_lr_wd:
+        param_groups.append({"params": high_lr_wd, "lr": base_lr,
+                             "weight_decay": optimizer_config.weight_decay})
+    if high_lr_no_wd:
+        param_groups.append({"params": high_lr_no_wd, "lr": base_lr,
+                             "weight_decay": 0.0})
+    if low_lr_wd:
+        param_groups.append({"params": low_lr_wd, "lr": low_lr,
+                             "weight_decay": optimizer_config.weight_decay})
+    if low_lr_no_wd:
+        param_groups.append({"params": low_lr_no_wd, "lr": low_lr,
+                             "weight_decay": 0.0})
+
+    total_trainable = sum(len(g["params"]) for g in param_groups)
+    logger.info(
+        f"Finetune optimizer: {total_trainable} trainable param tensors, "
+        f"high_lr={base_lr} ({len(high_lr_wd)}+{len(high_lr_no_wd)} tensors), "
+        f"low_lr={low_lr} ({len(low_lr_wd)}+{len(low_lr_no_wd)} tensors)"
+    )
+
+    return optimizer_cls(
+        param_groups,
+        lr=base_lr,
+        betas=(optimizer_config.beta1, optimizer_config.beta2),
+    )
+
+
+def _apply_finetune_freeze(config, logger, model):
+    """Freeze encoder parameters except those matching trainable prefixes.
+
+    Frozen params still participate in the forward graph so gradients flow
+    through them; they simply do not accumulate .grad themselves.
+    """
+    finetune_cfg = config.get("finetune", {})
+    if not finetune_cfg.get("freeze_encoder", False):
+        return
+
+    trainable_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
+    frozen_count = 0
+    trainable_count = 0
+    for name, param in model.named_parameters():
+        if not name.startswith("encoder."):
+            continue
+        keep_trainable = any(name.startswith(p) for p in trainable_prefixes)
+        if keep_trainable:
+            trainable_count += 1
+        else:
+            param.requires_grad = False
+            frozen_count += 1
+
+    logger.info(
+        f"Encoder freeze: {frozen_count} params frozen, "
+        f"{trainable_count} params kept trainable "
+        f"(prefixes: {trainable_prefixes})"
+    )
+
+
+def _apply_decoder_warmup_freeze(config, logger, model):
+    """Freeze decoder pretrained params during the warmup phase.
+
+    New channel-adaptation layers (matching decoder_new_layer_prefixes) stay
+    trainable so they can converge with a simple L2 objective first.
+    Frozen params still sit in the forward graph so gradients flow through.
+    """
+    finetune_cfg = config.get("finetune", {})
+    new_prefixes = list(finetune_cfg.get("decoder_new_layer_prefixes", []))
+    frozen_count = 0
+    kept_count = 0
+    for name, param in model.named_parameters():
+        if not name.startswith("decoder."):
+            continue
+        is_new = any(name.startswith(p) for p in new_prefixes)
+        if is_new:
+            kept_count += 1
+        else:
+            param.requires_grad = False
+            frozen_count += 1
+    logger.info(
+        f"Decoder warmup freeze: {frozen_count} decoder params frozen, "
+        f"{kept_count} new-layer params kept trainable"
+    )
+
+
+def _release_decoder_warmup_freeze(config, logger, model):
+    """Unfreeze decoder pretrained params after the warmup phase ends."""
+    finetune_cfg = config.get("finetune", {})
+    new_prefixes = list(finetune_cfg.get("decoder_new_layer_prefixes", []))
+    released = 0
+    for name, param in model.named_parameters():
+        if not name.startswith("decoder."):
+            continue
+        is_new = any(name.startswith(p) for p in new_prefixes)
+        if not is_new and not param.requires_grad:
+            param.requires_grad = True
+            released += 1
+    logger.info(f"Decoder warmup ended: {released} decoder params unfrozen.")
+
+
 def create_optimizer(config, logger, model, loss_module,
                      model_type="titok", need_discrminator=True):
     """Creates optimizer for TiTok and discrminator."""
@@ -346,21 +488,31 @@ def create_optimizer(config, logger, model, loss_module,
     else:
         raise ValueError(f"Optimizer {optimizer_type} not supported")
 
-    # Exclude terms we may not want to apply weight decay.
-    exclude = (lambda n, p: p.ndim < 2 or "ln" in n or "bias" in n or 'latent_tokens' in n 
-               or 'mask_token' in n or 'embedding' in n or 'norm' in n or 'gamma' in n or 'embed' in n)
+    finetune_cfg = config.get("finetune", {})
+    finetune_enabled = finetune_cfg.get("enabled", False) and model_type == "flowtitok"
+
+    if finetune_enabled:
+        _apply_finetune_freeze(config, logger, model)
+
+    exclude = _is_no_weight_decay
     include = lambda n, p: not exclude(n, p)
-    named_parameters = list(model.named_parameters())
-    gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
-    rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
-    optimizer = optimizer_cls(
-        [
-            {"params": gain_or_bias_params, "weight_decay": 0.},
-            {"params": rest_params, "weight_decay": optimizer_config.weight_decay},
-        ],
-        lr=learning_rate,
-        betas=(optimizer_config.beta1, optimizer_config.beta2)
-    )
+
+    if finetune_enabled:
+        optimizer = _create_finetune_optimizer(
+            config, logger, model, optimizer_cls, optimizer_config, learning_rate
+        )
+    else:
+        named_parameters = list(model.named_parameters())
+        gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
+        rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
+        optimizer = optimizer_cls(
+            [
+                {"params": gain_or_bias_params, "weight_decay": 0.},
+                {"params": rest_params, "weight_decay": optimizer_config.weight_decay},
+            ],
+            lr=learning_rate,
+            betas=(optimizer_config.beta1, optimizer_config.beta2)
+        )
 
     if (config.model.vq_model.finetune_decoder or model_type in ["tatitok", "flowtitok"]) and need_discrminator:
         discriminator_learning_rate = optimizer_config.discriminator_learning_rate
@@ -572,6 +724,40 @@ def auto_resume(config, logger, accelerator, ema_model,
     return global_step, first_epoch
 
 
+def _encode_text_with_clip(texts, clip_tokenizer, clip_encoder, device):
+    """Encode a list of text strings into CLIP hidden states."""
+    tokens = clip_tokenizer(texts).to(device)
+    cast_dtype = clip_encoder.transformer.get_cast_dtype()
+    x = clip_encoder.token_embedding(tokens).to(cast_dtype)
+    x = x + clip_encoder.positional_embedding.to(cast_dtype)
+    x = x.permute(1, 0, 2)  # NLD -> LND
+    x = clip_encoder.transformer(x, attn_mask=clip_encoder.attn_mask)
+    x = x.permute(1, 0, 2)  # LND -> NLD
+    x = clip_encoder.ln_final(x)
+    return x
+
+
+def _maybe_build_text_from_filename(config, batch):
+    """Build text descriptions from filenames when finetune.text_guidance_from_filename is set."""
+    finetune_cfg = config.get("finetune", {})
+    if not finetune_cfg.get("text_guidance_from_filename", False):
+        return None
+
+    paths = batch.get("path")
+    if paths is None:
+        return None
+
+    mode = config.dataset.params.get("mode", "satellite")
+    texts = []
+    for p in paths:
+        fname = os.path.basename(str(p))
+        if mode == "radar":
+            texts.append(f"A radar reflectivity image from {fname}.")
+        else:
+            texts.append(f"A multispectral satellite infrared and lightning image from {fname}.")
+    return texts
+
+
 def train_one_epoch(config, logger, accelerator,
                     model, ema_model, loss_module,
                     optimizer, discriminator_optimizer,
@@ -590,6 +776,13 @@ def train_one_epoch(config, logger, accelerator,
 
     model.train()
 
+    finetune_cfg = config.get("finetune", {})
+    _finetune_enabled = finetune_cfg.get("enabled", False) and model_type == "flowtitok"
+    _decoder_warmup_steps = finetune_cfg.get("decoder_warmup_steps", 0) if _finetune_enabled else 0
+    _in_decoder_warmup = _decoder_warmup_steps > 0 and global_step < _decoder_warmup_steps
+    if _in_decoder_warmup:
+        _apply_decoder_warmup_freeze(config, logger, accelerator.unwrap_model(model))
+
     autoencoder_logs = defaultdict(float)
     discriminator_logs = defaultdict(float)
     for i, batch in enumerate(train_dataloader):
@@ -601,22 +794,24 @@ def train_one_epoch(config, logger, accelerator,
         if "text" in batch and model_type in ["tatitok", "flowtitok"]:
             text = batch["text"]
             with torch.no_grad():
-                text_guidance = clip_tokenizer(text).to(accelerator.device)
-                cast_dtype = clip_encoder.transformer.get_cast_dtype()
-                text_guidance = clip_encoder.token_embedding(text_guidance).to(cast_dtype)  # [batch_size, n_ctx, d_model]
-                text_guidance = text_guidance + clip_encoder.positional_embedding.to(cast_dtype)
-                text_guidance = text_guidance.permute(1, 0, 2)  # NLD -> LND
-                text_guidance = clip_encoder.transformer(text_guidance, attn_mask=clip_encoder.attn_mask)
-                text_guidance = text_guidance.permute(1, 0, 2)  # LND -> NLD
-                text_guidance = clip_encoder.ln_final(text_guidance)  # [batch_size, n_ctx, transformer.width]
+                text_guidance = _encode_text_with_clip(
+                    text, clip_tokenizer, clip_encoder, accelerator.device
+                )
         elif model_type in ["tatitok", "flowtitok"]:
-            text_guidance = torch.zeros(
-                images.shape[0],
-                config.model.vq_model.get("text_context_length", 77),
-                config.model.vq_model.get("text_embed_dim", 768),
-                device=accelerator.device,
-                dtype=images.dtype,
-            )
+            text_from_fname = _maybe_build_text_from_filename(config, batch)
+            if text_from_fname is not None and clip_encoder is not None and clip_tokenizer is not None:
+                with torch.no_grad():
+                    text_guidance = _encode_text_with_clip(
+                        text_from_fname, clip_tokenizer, clip_encoder, accelerator.device
+                    )
+            else:
+                text_guidance = torch.zeros(
+                    images.shape[0],
+                    config.model.vq_model.get("text_context_length", 77),
+                    config.model.vq_model.get("text_embed_dim", 768),
+                    device=accelerator.device,
+                    dtype=images.dtype,
+                )
 
         fnames = batch.get("__key__", batch.get("path", [str(i) for i in range(images.shape[0])]))
         data_time_meter.update(time.time() - end)
@@ -677,13 +872,22 @@ def train_one_epoch(config, logger, accelerator,
                     if non_finite:
                         accelerator.wait_for_everyone()
                         raise RuntimeError("Non-finite values detected (pre-loss).")
-                autoencoder_loss, loss_dict = loss_module(
-                    images,
-                    reconstructed_images,
-                    extra_results_dict,
-                    global_step,
-                    mode="generator",
-                )
+                if _in_decoder_warmup:
+                    autoencoder_loss = torch.nn.functional.mse_loss(
+                        reconstructed_images, images
+                    )
+                    loss_dict = {
+                        "total_loss": autoencoder_loss.detach(),
+                        "reconstruction_loss": autoencoder_loss.detach(),
+                    }
+                else:
+                    autoencoder_loss, loss_dict = loss_module(
+                        images,
+                        reconstructed_images,
+                        extra_results_dict,
+                        global_step,
+                        mode="generator",
+                    )
             else:
                 raise NotImplementedError
 
@@ -733,9 +937,9 @@ def train_one_epoch(config, logger, accelerator,
 
             optimizer.zero_grad(set_to_none=True)
 
-            # Train discriminator.
+            # Train discriminator (skip during decoder warmup).
             discriminator_logs = defaultdict(float)
-            if (config.model.vq_model.finetune_decoder or model_type in ["tatitok", "flowtitok"]) and accelerator.unwrap_model(loss_module).should_discriminator_be_trained(global_step):
+            if not _in_decoder_warmup and (config.model.vq_model.finetune_decoder or model_type in ["tatitok", "flowtitok"]) and accelerator.unwrap_model(loss_module).should_discriminator_be_trained(global_step):
                 discriminator_logs = defaultdict(float)
                 discriminator_loss, loss_dict_discriminator = loss_module(
                     images,
@@ -800,7 +1004,9 @@ def train_one_epoch(config, logger, accelerator,
                 )
 
                 lr = lr_scheduler.get_last_lr()[0]
+                warmup_tag = "[dec-warmup] " if _in_decoder_warmup else ""
                 logger.info(
+                    f"{warmup_tag}"
                     f"Data (t): {data_time_meter.val:0.4f}, {samples_per_second_per_gpu:0.2f}/s/gpu "
                     f"Batch (t): {batch_time_meter.val:0.4f} "
                     f"LR: {lr:0.6f} "
@@ -911,6 +1117,16 @@ def train_one_epoch(config, logger, accelerator,
                 accelerator.wait_for_everyone()
 
             global_step += 1
+
+            if _in_decoder_warmup and global_step >= _decoder_warmup_steps:
+                _release_decoder_warmup_freeze(
+                    config, logger, accelerator.unwrap_model(model)
+                )
+                _in_decoder_warmup = False
+                logger.info(
+                    f"Step {global_step}: decoder warmup ended, "
+                    f"switching to full loss and joint fine-tuning."
+                )
 
             if global_step >= config.training.max_train_steps:
                 accelerator.print(
@@ -1292,13 +1508,19 @@ def eval_reconstruction(
             reconstructed_images, model_dict = local_model(images)
         elif model_type in ["tatitok", "flowtitok"]:
             if model_type == "flowtitok":
-                text_guidance = torch.zeros(
-                    images.shape[0],
-                    config.model.vq_model.get("text_context_length", 77),
-                    config.model.vq_model.get("text_embed_dim", 768),
-                    device=accelerator.device,
-                    dtype=images.dtype,
-                )
+                text_from_fname = _maybe_build_text_from_filename(config, batch)
+                if text_from_fname is not None and clip_encoder is not None and clip_tokenizer is not None:
+                    text_guidance = _encode_text_with_clip(
+                        text_from_fname, clip_tokenizer, clip_encoder, accelerator.device
+                    )
+                else:
+                    text_guidance = torch.zeros(
+                        images.shape[0],
+                        config.model.vq_model.get("text_context_length", 77),
+                        config.model.vq_model.get("text_embed_dim", 768),
+                        device=accelerator.device,
+                        dtype=images.dtype,
+                    )
             reconstructed_images, model_dict = local_model(images, text_guidance)
         else:
             raise NotImplementedError
