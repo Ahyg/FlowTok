@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -P kl02
 #PBS -q gpuhopper
-#PBS -l walltime=24:00:00
+#PBS -l walltime=2:00:00
 #PBS -l storage=gdata/kl02+scratch/kl02
 #PBS -l ncpus=12
 #PBS -l ngpus=1
@@ -28,8 +28,8 @@ conda activate flowtok
 
 FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
 CONFIG_PATH="${FLOWTOK_ROOT}/configs/Sat2Radar-v2v-satlight-tokenfusion-FlowTiTok-XL_gadi.py"
-CKPT_PATH="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_v2v_satlight_tokenfusion/ckpts/100000.ckpt"
-OUTPUT_DIR="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_v2v_satlight_tokenfusion/validate_v2v_100000"
+CKPT_PATH="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_v2v_satlight_tokenfusion/ckpts/80000.ckpt"
+OUTPUT_DIR="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_v2v_satlight_tokenfusion/validate_v2v_80000"
 FILELIST_PATH="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_val_202401_202406.pkl"
 
 SPLIT="val"

@@ -351,12 +351,11 @@ class NpyDatasetBuilder:
             fixed_test_days = set(str(d) for d in fixed_test_days)
             test_days = [d for d in all_days if d in fixed_test_days]
             remaining_days = [d for d in all_days if d not in fixed_test_days]
-
-            random.shuffle(remaining_days)
             total_remaining = len(remaining_days)
             train_days = round(split_ratio[0] / (split_ratio[0] + split_ratio[1]) * total_remaining)
             val_days   = total_remaining - train_days
 
+            random.shuffle(remaining_days)
             train_days = remaining_days[:train_days]
             val_days   = remaining_days[train_days:train_days+val_days]
         else:
@@ -383,6 +382,21 @@ class NpyDatasetBuilder:
             [t for d in test_days for t in day_to_times[d]],
             time_to_path
         )
+
+        # Internal ordering inside each split:
+        # keep split assignment random, but make pkl indices time-consistent by sorting
+        # (target timestamp extracted from the radar file name).
+        def _i2i_target_time_key(item):
+            # item = (hist_paths, [target_path])
+            try:
+                target_path = item[1][0]
+                return self.extract_time(os.path.basename(target_path)) or ""
+            except Exception:
+                return ""
+
+        train_files = sorted(train_files, key=_i2i_target_time_key)
+        val_files = sorted(val_files, key=_i2i_target_time_key)
+        test_files = sorted(test_files, key=_i2i_target_time_key)
 
         # ---- Save ----
         os.makedirs(save_dir, exist_ok=True)
@@ -468,6 +482,18 @@ class NpyDatasetBuilder:
         val_files = [c for d in val_days for c in clips_by_day.get(d, [])]
         test_files = [c for d in test_days for c in clips_by_day.get(d, [])]
 
+        # Internal ordering inside each split: sort clips by first-frame timestamp.
+        def _v2v_first_frame_time_key(clip_item):
+            # clip_item = (path_list, path_list), where path_list[0] is first frame
+            try:
+                return self.extract_time(os.path.basename(clip_item[0][0])) or ""
+            except Exception:
+                return ""
+
+        train_files = sorted(train_files, key=_v2v_first_frame_time_key)
+        val_files = sorted(val_files, key=_v2v_first_frame_time_key)
+        test_files = sorted(test_files, key=_v2v_first_frame_time_key)
+
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, file_name)
         with open(save_path, 'wb') as f:
@@ -544,6 +570,17 @@ class NpyDatasetBuilder:
         val_files = flatten(val_idx)
         test_files = flatten(test_idx)
 
+        # Internal ordering inside each split: sort clips by first-frame timestamp.
+        def _v2v_first_frame_time_key(clip_item):
+            try:
+                return self.extract_time(os.path.basename(clip_item[0][0])) or ""
+            except Exception:
+                return ""
+
+        train_files = sorted(train_files, key=_v2v_first_frame_time_key)
+        val_files = sorted(val_files, key=_v2v_first_frame_time_key)
+        test_files = sorted(test_files, key=_v2v_first_frame_time_key)
+
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, file_name)
         with open(save_path, 'wb') as f:
@@ -614,6 +651,19 @@ class NpyDatasetBuilder:
         train_files = flatten_blocks(train_idx)
         val_files   = flatten_blocks(val_idx)
         test_files  = flatten_blocks(test_idx)
+
+        # Internal ordering inside each split: sort by target timestamp.
+        def _i2i_target_time_key(item):
+            # item = (hist_paths, [target_path])
+            try:
+                target_path = item[1][0]
+                return self.extract_time(os.path.basename(target_path)) or ""
+            except Exception:
+                return ""
+
+        train_files = sorted(train_files, key=_i2i_target_time_key)
+        val_files = sorted(val_files, key=_i2i_target_time_key)
+        test_files = sorted(test_files, key=_i2i_target_time_key)
 
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, file_name)

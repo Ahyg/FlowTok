@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -P kl02
 #PBS -q gpuhopper
-#PBS -l walltime=24:00:00
+#PBS -l walltime=8:00:00
 #PBS -l storage=gdata/kl02+scratch/kl02
 #PBS -l ncpus=12
 #PBS -l ngpus=1
@@ -25,8 +25,8 @@ export PYTHONUNBUFFERED=1
 
 FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
 CONFIG_PATH="${FLOWTOK_ROOT}/configs/Sat2Radar-i2i-satlight-tokenfusion-FlowTiTok-XL_gadi.py"
-CKPT_PATH="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_i2i_satlight_tokenfusion/ckpts/100000.ckpt"
-OUTPUT_DIR="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_i2i_satlight_tokenfusion/test_i2i_100000"
+CKPT_PATH="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_i2i_satlight_tokenfusion/ckpts/160000.ckpt"
+OUTPUT_DIR="/scratch/kl02/$USER/Projv2v/Experiments/sat2radar_flowtok_run_i2i_satlight_tokenfusion/test_i2i_160000"
 FILELIST_PATH="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_test_202407_202507_nofilter.pkl"
 
 SPLIT="test"

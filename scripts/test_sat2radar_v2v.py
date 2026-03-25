@@ -25,16 +25,14 @@ except ImportError:
 # Import pysteps FSS functions
 try:
     from pysteps.verification.spatialscores import (
-        fss as pysteps_fss,
         fss_init,
         fss_accum,
         fss_compute,
-        fss_merge,
     )
     PYSTEPS_AVAILABLE = True
 except ImportError:
     PYSTEPS_AVAILABLE = False
-    print("[WARN] pysteps not available. FSS comparison will be skipped.")
+    print("[WARN] pysteps not available. FSS computation will be skipped.")
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -247,33 +245,6 @@ def _ae_config(base_config, in_channels, out_channels):
     return cfg
 
 
-def _fss_score(pred2d, target2d, thr, scale):
-    # pred2d/target2d: torch.Tensor [H, W] in physical units (e.g. dBZ)
-    pred_bin = (pred2d >= thr).float()
-    target_bin = (target2d >= thr).float()
-    scale = max(int(scale), 1)
-    padding = scale // 2
-    pred_frac = F.avg_pool2d(pred_bin[None, None], kernel_size=scale, stride=1, padding=padding)[0, 0]
-    tgt_frac = F.avg_pool2d(target_bin[None, None], kernel_size=scale, stride=1, padding=padding)[0, 0]
-    num = torch.sum((pred_frac - tgt_frac) ** 2)
-    den = torch.sum(pred_frac ** 2 + tgt_frac ** 2)
-    if den.item() == 0:
-        return 1.0
-    return 1.0 - (num / den).item()
-
-
-def _avg_fss(pred2d, target2d, thrs, scales):
-    if not thrs:
-        thrs = [0.0]
-    if not scales:
-        scales = [1]
-    scores = []
-    for thr in thrs:
-        for scale in scales:
-            scores.append(_fss_score(pred2d, target2d, thr, scale))
-    return float(np.mean(scores))
-
-
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser("Test sat2radar I2I/V2V model with metrics.")
@@ -467,13 +438,9 @@ def main():
     mse_count = 0
     ssim_total = 0.0
     ssim_count = 0
-    fss_total = 0.0
-    fss_count = 0
     
     # pysteps FSS accumulators (one per threshold-scale combination)
     pysteps_fss_objects = {}
-    # Per-pair FSS comparison (for detailed analysis)
-    fss_pairwise_comparisons = []  # List of (original_fss, pysteps_fss) tuples
     
     if PYSTEPS_AVAILABLE:
         for thr in thrs:
@@ -482,8 +449,7 @@ def main():
                 pysteps_fss_objects[key] = fss_init(thr=thr, scale=float(scale))
 
     def infer_batch(batch, batch_idx: int):
-        nonlocal mse_total, mse_count, ssim_total, ssim_count, fss_total, fss_count
-        nonlocal pysteps_fss_objects, fss_pairwise_comparisons
+        nonlocal mse_total, mse_count, ssim_total, ssim_count, pysteps_fss_objects
 
         sat_video = batch["sat_video"].to(
             device,
@@ -626,35 +592,15 @@ def main():
                 ssim_total += ssim(gt, pred, data_range=1.0)
                 ssim_count += 1
 
-                # FSS on physical dBZ range
-                pred_scaled = torch.from_numpy(pred * (z_max - z_min) + z_min)
-                tgt_scaled = torch.from_numpy(gt * (z_max - z_min) + z_min)
-                
-                # Original FSS calculation (average over all threshold-scale combinations)
-                fss_orig = _avg_fss(pred_scaled, tgt_scaled, thrs, scales)
-                fss_total += fss_orig
-                fss_count += 1
-                
-                # pysteps FSS calculation
+                # FSS on physical dBZ range (accumulated method only)
                 if PYSTEPS_AVAILABLE:
-                    pred_np = pred_scaled.numpy()
-                    tgt_np = tgt_scaled.numpy()
-                    
-                    # Compute per-pair FSS using pysteps (average over all threshold-scale combinations)
-                    pysteps_fss_values_per_pair = []
+                    pred_np = pred * (z_max - z_min) + z_min
+                    tgt_np = gt * (z_max - z_min) + z_min
+
                     for thr in thrs:
                         for scale in scales:
-                            # Single pair FSS calculation
-                            fss_val = pysteps_fss(pred_np, tgt_np, thr=thr, scale=float(scale))
-                            pysteps_fss_values_per_pair.append(fss_val)
-                            
-                            # Also accumulate for overall average
                             key = (thr, scale)
                             fss_accum(pysteps_fss_objects[key], pred_np, tgt_np)
-                    
-                    # Average FSS for this pair (comparable to original method)
-                    pysteps_avg_per_pair = np.mean(pysteps_fss_values_per_pair)
-                    fss_pairwise_comparisons.append((fss_orig, pysteps_avg_per_pair))
 
         # Save images / videos：
         #   - PNG：每个样本保存第一个有效帧的 [sat_IR | sat_lightning | radar_gt | radar_pred]
@@ -793,45 +739,21 @@ def main():
         print(f"MSE: {mse_total / mse_count:.6f}")
     if ssim_count > 0:
         print(f"SSIM: {ssim_total / ssim_count:.6f}")
-    if fss_count > 0:
-        print(f"FSS (original method): {fss_total / fss_count:.6f}")
-    
-    # Compute and compare pysteps FSS
+    # Compute accumulated pysteps FSS
     if PYSTEPS_AVAILABLE and pysteps_fss_objects:
-        print("\n" + "="*60)
-        print("FSS Comparison: Original vs pysteps")
-        print("="*60)
-        
-        # Method 1: Overall average (accumulated)
+        print("\n" + "=" * 60)
+        print("FSS (pysteps accumulated)")
+        print("=" * 60)
+
         pysteps_fss_values = []
         for (thr, scale), fss_obj in pysteps_fss_objects.items():
             fss_val = fss_compute(fss_obj)
             pysteps_fss_values.append(fss_val)
-        
+
         pysteps_avg_fss_accumulated = np.mean(pysteps_fss_values) if pysteps_fss_values else 0.0
-        
-        # Method 2: Average of per-pair averages
-        if fss_pairwise_comparisons:
-            orig_per_pair = [x[0] for x in fss_pairwise_comparisons]
-            pysteps_per_pair = [x[1] for x in fss_pairwise_comparisons]
-            pysteps_avg_fss_pairwise = np.mean(pysteps_per_pair)
-            
-            print(f"\nOverall Averages:")
-            print(f"  Original method:        {fss_total / fss_count:.6f}")
-            print(f"  pysteps (accumulated):  {pysteps_avg_fss_accumulated:.6f}")
-            print(f"  pysteps (pairwise avg): {pysteps_avg_fss_pairwise:.6f}")
-            print(f"  Difference (accum):     {abs(fss_total / fss_count - pysteps_avg_fss_accumulated):.6f}")
-            print(f"  Difference (pairwise): {abs(fss_total / fss_count - pysteps_avg_fss_pairwise):.6f}")
-            
-            # Per-pair statistics
-            differences = [abs(o - p) for o, p in fss_pairwise_comparisons]
-            print(f"\nPer-pair Statistics ({len(fss_pairwise_comparisons)} pairs):")
-            print(f"  Mean absolute difference: {np.mean(differences):.6f}")
-            print(f"  Max absolute difference:  {np.max(differences):.6f}")
-            print(f"  Min absolute difference:  {np.min(differences):.6f}")
-            print(f"  Std of differences:      {np.std(differences):.6f}")
-        
-        # Per threshold-scale breakdown (using accumulated method)
+        print(f"FSS (accumulated average): {pysteps_avg_fss_accumulated:.6f}")
+
+        # Per threshold-scale breakdown
         print("\nPer threshold-scale FSS breakdown (accumulated method):")
         print(f"{'Threshold':<12} {'Scale':<8} {'pysteps FSS':<15}")
         print("-" * 40)
@@ -839,9 +761,9 @@ def main():
             fss_val = fss_compute(fss_obj)
             print(f"{thr:<12.1f} {scale:<8} {fss_val:<15.6f}")
         
-        print("="*60)
+        print("=" * 60)
     elif not PYSTEPS_AVAILABLE:
-        print("\n[INFO] pysteps not available. Skipping FSS comparison.")
+        print("\n[INFO] pysteps not available. Skipping FSS computation.")
 
     print(f"\nSaved sat2radar {args.mode} predictions to {args.out_dir}")
 
