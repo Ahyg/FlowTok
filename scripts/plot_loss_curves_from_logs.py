@@ -16,16 +16,34 @@ class Series:
 
 LOSS_KEYS_DEFAULT = ["total_loss"]
 
+# Keys emitted by training (train_step) and validate (run_validation_logging -> val_*).
+_KEYS_TO_PARSE = [
+    "total_loss",
+    "loss",
+    "diff_loss",
+    "contrastive_loss",
+    "kld_loss",
+    "val_total_loss",
+    "val_loss",
+    "val_diff_loss",
+    "val_contrastive_loss",
+    "val_kld_loss",
+    "val_adapter_out_recon_loss",
+]
+
+_LINE_MARKERS = tuple(f"'{k}'" for k in _KEYS_TO_PARSE)
+
 
 def _extract_step_and_losses(line: str) -> Optional[Tuple[int, Dict[str, float]]]:
     """
     Parse a log line containing a dict-like payload:
         {'step': '100', 'lr': '8e-06', 'total_loss': '1.30051', 'diff_loss': '...', ...}
+        {'step': '2000', 'val_total_loss': '0.42', 'val_diff_loss': '...', ...}
     Returns (step, dict_of_available_losses) or None if not parseable.
     """
     if "{" not in line or "'step'" not in line:
         return None
-    if "total_loss" not in line and "diff_loss" not in line and "contrastive_loss" not in line and "kld_loss" not in line:
+    if not any(m in line for m in _LINE_MARKERS):
         return None
 
     m_step = re.search(r"'step'\s*:\s*'(\d+)'", line)
@@ -33,9 +51,8 @@ def _extract_step_and_losses(line: str) -> Optional[Tuple[int, Dict[str, float]]
         return None
     step = int(m_step.group(1))
 
-    keys = ["total_loss", "loss", "diff_loss", "contrastive_loss", "kld_loss"]
     out: Dict[str, float] = {}
-    for k in keys:
+    for k in _KEYS_TO_PARSE:
         mk = re.search(rf"'{re.escape(k)}'\s*:\s*'([0-9eE.+-]+)'", line)
         if mk:
             out[k] = float(mk.group(1))
@@ -106,7 +123,11 @@ def main():
         "--keys",
         default="total_loss",
         type=str,
-        help="Comma-separated loss keys to plot. Supported: total_loss, loss, diff_loss, contrastive_loss, kld_loss",
+        help=(
+            "Comma-separated loss keys to plot. Supported: total_loss, loss, diff_loss, "
+            "contrastive_loss, kld_loss, val_total_loss, val_loss, val_diff_loss, "
+            "val_contrastive_loss, val_kld_loss, val_adapter_out_recon_loss"
+        ),
     )
     parser.add_argument(
         "--smooth-window",

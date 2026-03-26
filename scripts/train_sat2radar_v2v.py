@@ -268,9 +268,8 @@ def train(config):
 
     # ========= Data =========
     train_dataloader = build_dataloader(config, mode="train", accelerator=accelerator)
-    # 评估时可以单独 build val dataloader；这里简单起见复用 train split 或者你之后自行扩展
-    eval_dataloader = None
-    
+    val_dataloader = build_dataloader(config, mode="val", accelerator=accelerator)
+
     # Dataset info is already logged in build_dataloader
 
     # ========= FlowTok backbone & optimizer =========
@@ -327,6 +326,7 @@ def train(config):
         train_state.nnet_ema,
         train_state.optimizer,
         train_dataloader,
+        val_dataloader,
     ]
     if adapter_in_satellite is not None:
         prepare_items.append(adapter_in_satellite)
@@ -335,13 +335,14 @@ def train(config):
     if adapter_out is not None:
         prepare_items.append(adapter_out)
     prepared = accelerator.prepare(*prepare_items)
-    nnet, nnet_ema, optimizer, train_dataloader = (
+    nnet, nnet_ema, optimizer, train_dataloader, val_dataloader = (
         prepared[0],
         prepared[1],
         prepared[2],
         prepared[3],
+        prepared[4],
     )
-    idx_prepared = 4
+    idx_prepared = 5
     if adapter_in_satellite is not None:
         adapter_in_satellite = prepared[idx_prepared]
         idx_prepared += 1
@@ -580,6 +581,135 @@ def train(config):
             return sat_ir_tokens + lgt_tokens
         # default: mean
         return 0.5 * (sat_ir_tokens + lgt_tokens)
+
+    @torch.no_grad()
+    def _val_forward_batch(batch):
+        """Same loss as training forward (flow + optional adapter_out recon), no backward."""
+        metrics = {}
+        sat_video = batch["sat_video"].to(
+            accelerator.device,
+            memory_format=torch.contiguous_format,
+            non_blocking=True,
+        )
+        radar_video = batch["radar_video"].to(
+            accelerator.device,
+            memory_format=torch.contiguous_format,
+            non_blocking=True,
+        )
+        sat_tokens = build_condition_tokens_from_sat_video(
+            sat_video, require_grad=False
+        )
+        radar_tokens = encode_video_with_autoencoder(
+            radar_autoencoder,
+            radar_video,
+            config.vq_model.scale_factor,
+            adapter_in=adapter_in_radar,
+            require_grad_through_encoder=False,
+        )
+        valid_mask = batch.get("valid_mask")
+        if valid_mask is not None:
+            valid_mask = valid_mask.to(
+                accelerator.device,
+                non_blocking=True,
+            )
+            token_mask = valid_mask.repeat_interleave(num_latent_tokens, dim=1)
+        else:
+            token_mask = None
+
+        loss, loss_dict = flow_matching_model(
+            x=radar_tokens,
+            nnet=nnet,
+            cond=sat_tokens,
+            all_config=config,
+            batch_img_clip=None,
+            valid_mask=token_mask,
+        )
+        total_loss = loss
+
+        losses_cfg = getattr(config, "losses", None)
+        adapter_out_recon_weight = (
+            float(losses_cfg.get("adapter_out_recon_weight", 0.0))
+            if losses_cfg is not None
+            else 0.0
+        )
+        adapter_out_recon_loss = loss.new_zeros([])
+        if adapter_out is not None and adapter_out_recon_weight > 0:
+            Bv, Tv, _, H_gt, W_gt = radar_video.shape
+            C_tok = radar_tokens.shape[-1]
+            assert radar_tokens.shape[1] == Tv * num_latent_tokens
+            radar_tok = radar_tokens.view(Bv, Tv, num_latent_tokens, C_tok)
+            radar_tok = radar_tok.reshape(Bv * Tv, num_latent_tokens, C_tok)
+            radar_tok = radar_tok.permute(0, 2, 1).unsqueeze(2)
+            radar_decoded = radar_autoencoder.decode_tokens(
+                radar_tok / config.vq_model.scale_factor,
+                text_guidance=None,
+            )
+            radar_pred_aux = adapter_out(radar_decoded, out_size=(H_gt, W_gt))
+            radar_pred_aux = torch.clamp(radar_pred_aux, 0.0, 1.0)
+            radar_gt_aux = radar_video.reshape(Bv * Tv, 1, H_gt, W_gt)
+            if valid_mask is not None:
+                per_frame_mse = (radar_pred_aux - radar_gt_aux).pow(2).mean(
+                    dim=[1, 2, 3]
+                )
+                vm_flat = valid_mask.reshape(Bv * Tv).float()
+                adapter_out_recon_loss = (
+                    (per_frame_mse * vm_flat).sum() / vm_flat.sum().clamp_min(1.0)
+                )
+            else:
+                adapter_out_recon_loss = F.mse_loss(radar_pred_aux, radar_gt_aux)
+            total_loss = total_loss + adapter_out_recon_weight * adapter_out_recon_loss
+            metrics["adapter_out_recon_loss"] = accelerator.gather(
+                adapter_out_recon_loss.detach()
+            ).mean()
+
+        metrics["total_loss"] = accelerator.gather(total_loss.detach()).mean()
+        metrics["loss"] = accelerator.gather(loss.detach()).mean()
+        for key, val in loss_dict.items():
+            metrics[key] = accelerator.gather(val.detach()).mean()
+        return metrics
+
+    def run_validation_logging():
+        """Average val losses over part or all of val loader; log to the same output.log as train."""
+        val_max_batches = getattr(config.train, "val_max_batches", 64)
+        if val_max_batches is None:
+            val_max_batches = 64
+        val_max_batches = int(val_max_batches)
+        # Negative or zero: use full val set (all batches).
+        if val_max_batches <= 0:
+            val_max_batches = 10**12
+        nnet.eval()
+        if adapter_in_satellite is not None:
+            adapter_in_satellite.eval()
+        if adapter_in_radar is not None:
+            adapter_in_radar.eval()
+        if adapter_out is not None:
+            adapter_out.eval()
+
+        sums: dict = {}
+        nb = 0
+        for bi, vbatch in enumerate(val_dataloader):
+            if bi >= val_max_batches:
+                break
+            m = _val_forward_batch(vbatch)
+            for k, v in m.items():
+                sums[k] = sums.get(k, 0.0) + float(v.detach().item())
+            nb += 1
+
+        nnet.train()
+        if adapter_in_satellite is not None:
+            adapter_in_satellite.train()
+        if adapter_in_radar is not None:
+            adapter_in_radar.train()
+        if adapter_out is not None:
+            adapter_out.train()
+
+        if nb == 0 or not accelerator.is_main_process:
+            return
+        avgs = {k: sums[k] / nb for k in sums}
+        log_d = {"step": train_state.step}
+        for k, v in avgs.items():
+            log_d["val_" + k] = v
+        logging.info(flow_utils.dct2str(log_d))
 
     def train_step(batch):
         metrics = dict()
@@ -957,6 +1087,7 @@ def train(config):
             # 保存一些可视化样例
             if train_state.step % config.train.eval_interval == 0:
                 torch.cuda.empty_cache()
+                run_validation_logging()
                 logging.info(
                     "Save a grid of [sat_IR | sat_lightning | radar_gt | radar_pred] "
                     "(first frame only) with AE-style colormaps..."

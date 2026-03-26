@@ -52,6 +52,7 @@ def get_config():
         eval_interval=1_000,
         save_interval=20_000,
         n_samples_eval=4,
+        val_max_batches=64,
     )
 
     config.optimizer = d(
