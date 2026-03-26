@@ -27,7 +27,7 @@ echo "HF_HUB_OFFLINE=$HF_HUB_OFFLINE" >&2
 echo "OPENCLIP_LOCAL_CKPT=$OPENCLIP_LOCAL_CKPT" >&2
 
 source /scratch/kl02/$USER/miniconda3/etc/profile.d/conda.sh
-conda activate flowtok
+conda activate 1d-tokenizer
 
 FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
 CONFIG_PATH="${FLOWTOK_ROOT}/configs/sat_flowtitok_ae_bl77_vae_gadi.yaml"

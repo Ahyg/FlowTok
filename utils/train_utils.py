@@ -407,6 +407,10 @@ def _create_finetune_optimizer(config, logger, model, optimizer_cls,
 def _apply_finetune_freeze(config, logger, model):
     """Freeze encoder parameters except those matching trainable prefixes.
 
+    Also freezes top-level parameters (e.g. ``latent_tokens``) that are not
+    part of the encoder or decoder — these are pretrained and should not be
+    updated during the input/output layer warmup phase.
+
     Frozen params still participate in the forward graph so gradients flow
     through them; they simply do not accumulate .grad themselves.
     """
@@ -417,7 +421,16 @@ def _apply_finetune_freeze(config, logger, model):
     trainable_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
     frozen_count = 0
     trainable_count = 0
+    toplevel_frozen = 0
     for name, param in model.named_parameters():
+        # Freeze top-level params (e.g. latent_tokens) that are neither
+        # encoder nor decoder — they are pretrained and should stay fixed
+        # during the warmup phase.
+        if not name.startswith("encoder.") and not name.startswith("decoder."):
+            param.requires_grad = False
+            toplevel_frozen += 1
+            continue
+
         if not name.startswith("encoder."):
             continue
         keep_trainable = any(name.startswith(p) for p in trainable_prefixes)
@@ -428,9 +441,10 @@ def _apply_finetune_freeze(config, logger, model):
             frozen_count += 1
 
     logger.info(
-        f"Encoder freeze: {frozen_count} params frozen, "
-        f"{trainable_count} params kept trainable "
-        f"(prefixes: {trainable_prefixes})"
+        f"Encoder freeze: {frozen_count} encoder params frozen, "
+        f"{trainable_count} encoder params kept trainable "
+        f"(prefixes: {trainable_prefixes}), "
+        f"{toplevel_frozen} top-level params frozen (e.g. latent_tokens)"
     )
 
 
@@ -461,18 +475,49 @@ def _apply_decoder_warmup_freeze(config, logger, model):
 
 
 def _release_decoder_warmup_freeze(config, logger, model):
-    """Unfreeze decoder pretrained params after the warmup phase ends."""
+    """Unfreeze decoder pretrained params after the warmup phase ends.
+
+    Optionally freeze encoder trainable layers (e.g. patch_embed) so that
+    stage-2 only fine-tunes the decoder.  Controlled by
+    ``finetune.freeze_encoder_after_warmup`` (default: True).
+    """
     finetune_cfg = config.get("finetune", {})
     new_prefixes = list(finetune_cfg.get("decoder_new_layer_prefixes", []))
     released = 0
+    toplevel_released = 0
     for name, param in model.named_parameters():
+        # Unfreeze top-level params (e.g. latent_tokens) frozen in stage-1
+        if not name.startswith("encoder.") and not name.startswith("decoder."):
+            if not param.requires_grad:
+                param.requires_grad = True
+                toplevel_released += 1
+            continue
+
         if not name.startswith("decoder."):
             continue
         is_new = any(name.startswith(p) for p in new_prefixes)
         if not is_new and not param.requires_grad:
             param.requires_grad = True
             released += 1
-    logger.info(f"Decoder warmup ended: {released} decoder params unfrozen.")
+    logger.info(
+        f"Decoder warmup ended: {released} decoder params unfrozen, "
+        f"{toplevel_released} top-level params unfrozen (e.g. latent_tokens)"
+    )
+
+    # Stage-2: freeze encoder trainable layers (e.g. patch_embed) so only decoder is fine-tuned.
+    freeze_enc_after = finetune_cfg.get("freeze_encoder_after_warmup", True)
+    if freeze_enc_after:
+        enc_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
+        frozen_enc = 0
+        for name, param in model.named_parameters():
+            if not name.startswith("encoder."):
+                continue
+            if any(name.startswith(p) for p in enc_prefixes) and param.requires_grad:
+                param.requires_grad = False
+                frozen_enc += 1
+        logger.info(
+            f"Stage-2: froze {frozen_enc} encoder params (prefixes: {enc_prefixes})"
+        )
 
 
 def create_optimizer(config, logger, model, loss_module,

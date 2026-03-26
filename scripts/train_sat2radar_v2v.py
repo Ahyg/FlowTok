@@ -30,6 +30,7 @@ import flow_utils
 from diffusion.flow_matching import FlowMatching, ODEEulerFlowMatchingSolver
 from libs.flowtitok import FlowTiTok
 from libs.adapters import AdapterIn, AdapterOut
+from libs.cond_projector import CondTokenProjector
 from data.dataset import SatelliteRadarNpyDataset, collate_sat2radar_v2v
 from torch.utils.data import DataLoader
 
@@ -304,7 +305,16 @@ def train(config):
             num_blocks=int(config.adapter_in_radar.get("num_blocks", 2)),
         )
 
-    # 将 adapter 参数加入优化器，与主干一起训练
+    # ========= Condition token projector (for concat fusion) =========
+    cond_projector = None
+    if getattr(config, "cond_token_fusion", "mean") == "concat":
+        cond_projector = CondTokenProjector(
+            token_dim=config.nnet.model_args.channels,
+            num_latent_tokens=config.vq_model.num_latent_tokens,
+        )
+        logging.info("CondTokenProjector created for concat fusion mode")
+
+    # 将 adapter / cond_projector 参数加入优化器，与主干一起训练
     if adapter_in_satellite is not None:
         train_state.optimizer.add_param_group(
             {"params": list(adapter_in_satellite.parameters())}
@@ -313,6 +323,8 @@ def train(config):
         train_state.optimizer.add_param_group({"params": list(adapter_in_radar.parameters())})
     if adapter_out is not None:
         train_state.optimizer.add_param_group({"params": list(adapter_out.parameters())})
+    if cond_projector is not None:
+        train_state.optimizer.add_param_group({"params": list(cond_projector.parameters())})
     # NOTE:
     # LambdaLR captures param-group count at creation time (inside base_lrs).
     # Since adapters are added after initialize_train_state(), we must rebuild
@@ -334,6 +346,8 @@ def train(config):
         prepare_items.append(adapter_in_radar)
     if adapter_out is not None:
         prepare_items.append(adapter_out)
+    if cond_projector is not None:
+        prepare_items.append(cond_projector)
     prepared = accelerator.prepare(*prepare_items)
     nnet, nnet_ema, optimizer, train_dataloader, val_dataloader = (
         prepared[0],
@@ -351,6 +365,9 @@ def train(config):
         idx_prepared += 1
     if adapter_out is not None:
         adapter_out = prepared[idx_prepared]
+        idx_prepared += 1
+    if cond_projector is not None:
+        cond_projector = prepared[idx_prepared]
 
     lr_scheduler = train_state.lr_scheduler
     train_state.resume(config.ckpt_root)
@@ -387,6 +404,13 @@ def train(config):
                     torch.load(adapter_out_path, map_location="cpu")
                 )
                 logging.info(f"Loaded adapter_out from {adapter_out_path}")
+        if cond_projector is not None:
+            cond_proj_path = os.path.join(ckpt_path, "cond_projector.pth")
+            if os.path.isfile(cond_proj_path):
+                accelerator.unwrap_model(cond_projector).load_state_dict(
+                    torch.load(cond_proj_path, map_location="cpu")
+                )
+                logging.info(f"Loaded cond_projector from {cond_proj_path}")
 
     # ========= Pretrained FlowTiTok autoencoders =========
     # I2I/V2V pipeline: sat image -> sat tokenizer (77 tokens/frame); DiT -> radar tokens -> radar decoder (1ch).
@@ -579,6 +603,10 @@ def train(config):
         fusion = getattr(config, "cond_token_fusion", "mean")
         if fusion == "sum":
             return sat_ir_tokens + lgt_tokens
+        elif fusion == "concat":
+            # concat 模式：通过 cond_projector 将 sat + lgt tokens 投影融合，
+            # 输出与 radar_tokens 同形状 [B, T*L, C]
+            return cond_projector(sat_ir_tokens, lgt_tokens)
         # default: mean
         return 0.5 * (sat_ir_tokens + lgt_tokens)
 
@@ -684,6 +712,8 @@ def train(config):
             adapter_in_radar.eval()
         if adapter_out is not None:
             adapter_out.eval()
+        if cond_projector is not None:
+            cond_projector.eval()
 
         sums: dict = {}
         nb = 0
@@ -702,6 +732,8 @@ def train(config):
             adapter_in_radar.train()
         if adapter_out is not None:
             adapter_out.train()
+        if cond_projector is not None:
+            cond_projector.train()
 
         if nb == 0 or not accelerator.is_main_process:
             return
@@ -1383,6 +1415,11 @@ def train(config):
                         torch.save(
                             accelerator.unwrap_model(adapter_out).state_dict(),
                             os.path.join(ckpt_save_path, "adapter_out.pth"),
+                        )
+                    if cond_projector is not None:
+                        torch.save(
+                            accelerator.unwrap_model(cond_projector).state_dict(),
+                            os.path.join(ckpt_save_path, "cond_projector.pth"),
                         )
                 accelerator.wait_for_everyone()
                 torch.cuda.empty_cache()

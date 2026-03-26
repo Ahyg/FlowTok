@@ -80,6 +80,7 @@ finetune:
     - decoder.conv_out
   text_guidance_from_filename: true
   decoder_warmup_steps: 200000
+  freeze_encoder_after_warmup: true
 
 training:
   gradient_accumulation_steps: 1
