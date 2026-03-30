@@ -1119,7 +1119,8 @@ def train(config):
             # 保存一些可视化样例
             if train_state.step % config.train.eval_interval == 0:
                 torch.cuda.empty_cache()
-                run_validation_logging()
+                # Temporarily disable val logging to avoid empty-val-loader accelerate error.
+                # run_validation_logging()
                 logging.info(
                     "Save a grid of [sat_IR | sat_lightning | radar_gt | radar_pred] "
                     "(first frame only) with AE-style colormaps..."

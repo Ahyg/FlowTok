@@ -85,7 +85,7 @@ finetune:
 training:
   gradient_accumulation_steps: 1
   per_gpu_batch_size: 64
-  mixed_precision: no
+  mixed_precision: "no"
   enable_tf32: true
   enable_wandb: false
   use_ema: true

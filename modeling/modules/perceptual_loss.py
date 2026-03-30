@@ -15,6 +15,8 @@ See the License for the specific language governing permissions and
 limitations under the License. 
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -24,7 +26,40 @@ from .lpips import LPIPS
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD = [0.229, 0.224, 0.225]
 
- 
+
+def _load_convnext_small_imagenet():
+    """ConvNeXt-Small ImageNet1K weights. Offline: set CONVNEXT_SMALL_IMAGENET_PTH or stage under TORCH_HOME/hub/checkpoints/."""
+    local = os.environ.get("CONVNEXT_SMALL_IMAGENET_PTH", "").strip()
+    if not local:
+        th = os.environ.get("TORCH_HOME", "").strip()
+        if th:
+            ckpt_dir = os.path.join(th, "hub", "checkpoints")
+            for name in (
+                "convnext_small-0c510722.pth",
+                "convnext_small-47c16186.pth",
+            ):
+                cand = os.path.join(ckpt_dir, name)
+                if os.path.isfile(cand):
+                    local = cand
+                    break
+    m = models.convnext_small(weights=None)
+    if local:
+        if not os.path.isfile(local):
+            raise FileNotFoundError(
+                f"CONVNEXT_SMALL_IMAGENET_PTH is set but file not found: {local}"
+            )
+        print(f"[INFO] Loading ConvNeXt-Small from local weights: {local}")
+        sd = torch.load(local, map_location="cpu")
+        if isinstance(sd, dict):
+            if "state_dict" in sd:
+                sd = sd["state_dict"]
+            elif "model" in sd:
+                sd = sd["model"]
+        m.load_state_dict(sd, strict=True)
+        return m
+    return models.convnext_small(weights=models.ConvNeXt_Small_Weights.IMAGENET1K_V1)
+
+
 class PerceptualLoss(torch.nn.Module):
     def __init__(self, model_name: str = "convnext_s"):
         """Initializes the PerceptualLoss class.
@@ -54,7 +89,7 @@ class PerceptualLoss(torch.nn.Module):
             self.lpips = LPIPS().eval()
 
         if "convnext_s" in model_name:
-            self.convnext = models.convnext_small(weights=models.ConvNeXt_Small_Weights.IMAGENET1K_V1).eval()
+            self.convnext = _load_convnext_small_imagenet().eval()
 
         if "lpips" in model_name and "convnext_s" in model_name:
             loss_config = model_name.split('-')[-2:]

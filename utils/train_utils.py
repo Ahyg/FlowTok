@@ -32,6 +32,7 @@ import open_clip
 
 from data.dataset import SatelliteRadarNpyDataset
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 from torch.optim import AdamW
@@ -618,6 +619,57 @@ def create_dataloader(config, logger, accelerator):
     dataset_config = config.dataset.params
 
     if dataset_config.get("filelist_path"):
+        class _AEImageTransformDataset(torch.utils.data.Dataset):
+            """
+            Apply per-sample tensor transforms (resize/crop/flip) at dataloader level.
+            We do this here (instead of modifying data/dataset.py) so AE training gets
+            fixed `crop_size x crop_size` inputs and randomized augmentation.
+            """
+
+            def __init__(
+                self,
+                base_dataset,
+                *,
+                resize_shorter_edge: int,
+                crop_size: int,
+                random_flip: bool,
+                random_vflip: bool,
+                training: bool,
+            ):
+                super().__init__()
+                self.base_dataset = base_dataset
+                self.random_flip = bool(random_flip)
+                self.random_vflip = bool(random_vflip)
+                self.training = bool(training)
+
+            def _maybe_hflip(self, img: torch.Tensor) -> torch.Tensor:
+                if self.training and self.random_flip and np.random.random() < 0.5:
+                    return img.flip(-1)
+                return img
+
+            def _maybe_vflip(self, img: torch.Tensor) -> torch.Tensor:
+                if self.training and self.random_vflip and np.random.random() < 0.5:
+                    return img.flip(-2)
+                return img
+
+            def __len__(self):
+                return len(self.base_dataset)
+
+            def __getitem__(self, idx):
+                sample = self.base_dataset[idx]
+                if "image" not in sample:
+                    return sample
+                img = sample["image"]
+                # Ensure float tensor.
+                if not isinstance(img, torch.Tensor):
+                    img = torch.from_numpy(np.asarray(img))
+                img = img.float()
+                img = self._maybe_hflip(img)
+                img = self._maybe_vflip(img)
+                sample = dict(sample)
+                sample["image"] = img.contiguous()
+                return sample
+
         train_dataset = SatelliteRadarNpyDataset(
             base_dir=dataset_config.get("data_dir"),
             years=dataset_config.get("years", "").split(",") if dataset_config.get("years") else None,
@@ -627,6 +679,14 @@ def create_dataloader(config, logger, accelerator):
             filelist_path=dataset_config.get("filelist_path"),
             filelist_split=dataset_config.get("filelist_split", "train"),
         )
+        train_dataset = _AEImageTransformDataset(
+            train_dataset,
+            resize_shorter_edge=int(preproc_config.resize_shorter_edge),
+            crop_size=int(preproc_config.crop_size),
+            random_flip=bool(getattr(preproc_config, "random_flip", False)),
+            random_vflip=True if getattr(preproc_config, "random_flip", False) else False,
+            training=True,
+        )
         eval_dataset = SatelliteRadarNpyDataset(
             base_dir=dataset_config.get("data_dir"),
             years=dataset_config.get("years", "").split(",") if dataset_config.get("years") else None,
@@ -635,6 +695,14 @@ def create_dataloader(config, logger, accelerator):
             use_lightning=dataset_config.get("use_lightning", True),
             filelist_path=dataset_config.get("filelist_path"),
             filelist_split="val",
+        )
+        eval_dataset = _AEImageTransformDataset(
+            eval_dataset,
+            resize_shorter_edge=int(preproc_config.resize_shorter_edge),
+            crop_size=int(preproc_config.crop_size),
+            random_flip=False,
+            random_vflip=False,
+            training=False,
         )
         num_workers = dataset_config.get("num_workers_per_gpu", dataset_config.get("num_workers", 4))
         train_dataloader = DataLoader(

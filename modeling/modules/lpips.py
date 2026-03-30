@@ -57,10 +57,17 @@ def md5_hash(path):
 
 def get_ckpt_path(name, root, check=False):
     assert name in URL_MAP
+    os.makedirs(root, exist_ok=True)
     path = os.path.join(root, CKPT_MAP[name])
-    if not os.path.exists(path) or (check and not md5_hash(path) == MD5_MAP[name]):
+    if not os.path.exists(path) or (check and md5_hash(path) != MD5_MAP[name]):
         print("Downloading {} model from {} to {}".format(name, URL_MAP[name], path))
-        download(URL_MAP[name], path)
+        try:
+            download(URL_MAP[name], path)
+        except (requests.RequestException, OSError) as e:
+            raise RuntimeError(
+                f"Failed to download LPIPS checkpoint ({e}). "
+                "Set LPIPS_VGG_PTH to a local vgg.pth on offline machines."
+            ) from e
         md5 = md5_hash(path)
         assert md5 == MD5_MAP[name], md5
     return path
@@ -83,8 +90,19 @@ class LPIPS(nn.Module):
             param.requires_grad = False
 
     def load_pretrained(self):
-        workspace = os.environ.get('WORKSPACE', '')
-        VGG_PATH = get_ckpt_path("vgg_lpips", os.path.join(workspace, "models/vgg_lpips.pth"), check=True)
+        # Offline / Gadi: set LPIPS_VGG_PTH to a pre-staged LPIPS vgg.pth (same as CLIP's OPENCLIP_LOCAL_CKPT).
+        local_lpips = os.environ.get("LPIPS_VGG_PTH", "").strip()
+        if local_lpips:
+            if not os.path.isfile(local_lpips):
+                raise FileNotFoundError(
+                    f"LPIPS_VGG_PTH is set but file not found: {local_lpips}"
+                )
+            print("[INFO] Loading LPIPS vgg.pth from LPIPS_VGG_PTH:", local_lpips)
+            VGG_PATH = local_lpips
+        else:
+            workspace = os.environ.get("WORKSPACE", "") or "."
+            cache_dir = os.path.join(workspace, "models", "lpips")
+            VGG_PATH = get_ckpt_path("vgg_lpips", cache_dir, check=True)
         self.load_state_dict(torch.load(VGG_PATH, map_location=torch.device("cpu")), strict=False)
 
     def forward(self, input, target):
@@ -138,7 +156,33 @@ class NetLinLayer(nn.Module):
 class vgg16(torch.nn.Module):
     def __init__(self, requires_grad=False, pretrained=True):
         super(vgg16, self).__init__()
-        vgg_pretrained_features = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
+        # Heidelberg vgg.pth only contains LPIPS lin0–lin4 weights; the VGG backbone still needs ImageNet.
+        # Offline (e.g. Gadi): set VGG16_IMAGENET_PTH to vgg16-397923af.pth (torchvision).
+        local_imagenet = os.environ.get("VGG16_IMAGENET_PTH", "").strip()
+        if not local_imagenet:
+            torch_home = os.environ.get("TORCH_HOME", "").strip()
+            if torch_home:
+                cand = os.path.join(torch_home, "hub", "checkpoints", "vgg16-397923af.pth")
+                if os.path.isfile(cand):
+                    local_imagenet = cand
+        if local_imagenet:
+            if not os.path.isfile(local_imagenet):
+                raise FileNotFoundError(
+                    f"VGG16_IMAGENET_PTH is set but file not found: {local_imagenet}"
+                )
+            print("[INFO] Loading VGG16 backbone from:", local_imagenet)
+            vgg_full = models.vgg16(weights=None)
+            sd = torch.load(local_imagenet, map_location=torch.device("cpu"))
+            if isinstance(sd, dict) and "state_dict" in sd:
+                sd = sd["state_dict"]
+            vgg_full.load_state_dict(sd, strict=True)
+            vgg_pretrained_features = vgg_full.features
+        elif pretrained:
+            vgg_pretrained_features = models.vgg16(
+                weights=models.VGG16_Weights.IMAGENET1K_V1
+            ).features
+        else:
+            vgg_pretrained_features = models.vgg16(weights=None).features
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()
