@@ -899,6 +899,9 @@ def train_one_epoch(config, logger, accelerator,
     finetune_cfg = config.get("finetune", {})
     _finetune_enabled = finetune_cfg.get("enabled", False) and model_type == "flowtitok"
     _decoder_warmup_steps = finetune_cfg.get("decoder_warmup_steps", 0) if _finetune_enabled else 0
+    # Also support standalone reconstruction-only warmup (for from-scratch training).
+    _recon_only_steps = config.losses.get("reconstruction_only_steps", 0)
+    _decoder_warmup_steps = max(_decoder_warmup_steps, _recon_only_steps)
     _in_decoder_warmup = _decoder_warmup_steps > 0 and global_step < _decoder_warmup_steps
     if _in_decoder_warmup:
         _apply_decoder_warmup_freeze(config, logger, accelerator.unwrap_model(model))
