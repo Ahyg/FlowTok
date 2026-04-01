@@ -133,20 +133,29 @@ class FlowTiTok(nn.Module):
         result_dict = posteriors
         return z_quantized, result_dict
 
-    def decode(self, z_quantized, text_guidance):
-        decoded = self.decoder(z_quantized, text_guidance)
+    def decode(self, z_quantized, text_guidance, output_size=None):
+        """Decode latent tokens to pixel space.
+
+        Args:
+            output_size: optional (H, W) tuple. When given, the decoder
+                         produces an output of that spatial size instead of
+                         the training resolution.
+        """
+        decoded = self.decoder(z_quantized, text_guidance, output_size=output_size)
         if self.nan_debug and not torch.isfinite(decoded).all():
             raise RuntimeError("Non-finite detected after decoder output.")
         return decoded
-    
-    def decode_tokens(self, tokens, text_guidance):
+
+    def decode_tokens(self, tokens, text_guidance, output_size=None):
         z_quantized = tokens
-        decoded = self.decode(z_quantized, text_guidance)
+        decoded = self.decode(z_quantized, text_guidance, output_size=output_size)
         return decoded
-    
+
     def forward(self, x, text_guidance):
         z_quantized, result_dict = self.encode(x)
-        decoded = self.decode(z_quantized, text_guidance)
+        # Decode at the same resolution as input.
+        output_size = (x.shape[2], x.shape[3])
+        decoded = self.decode(z_quantized, text_guidance, output_size=output_size)
         return decoded, result_dict
 
     def save_pretrained_weight(self, output_dir, **kwargs):
@@ -206,21 +215,36 @@ class FlowTiTok(nn.Module):
         return mismatched
 
     @staticmethod
-    def _adapt_channel_weight(key, pre_w, new_w, pre_shape, model_shape):
+    def _cyclic_repeat_1d(src, c_pre, c_new):
+        """Cyclically repeat *src* along dim-0 from *c_pre* to *c_new*."""
+        import math
+        reps = math.ceil(c_new / c_pre)
+        return src.repeat(reps, *([1] * (src.dim() - 1)))[:c_new]
+
+    @staticmethod
+    def _adapt_channel_weight(key, pre_w, new_w, pre_shape, model_shape,
+                              noise_ratio=0.01):
         """Copy pretrained weights into the new tensor with channel adaptation.
 
-        Strategy: when the channel dimension mismatches, compute the mean
-        across the pretrained channel axis and broadcast (repeat) it to fill
-        every new channel.  This gives a uniform, pretrained-informed starting
-        point for all channels instead of leaving some randomly initialized.
+        Strategy: cyclic-repeat pretrained channel weights, scale to preserve
+        activation magnitude, then add small Gaussian noise to break symmetry
+        among duplicated channels.  This avoids the symmetry problem of
+        mean-broadcast and gives the optimizer distinct gradients from step 1.
         """
 
         if "patch_embed.weight" in key:
             # Encoder input projection: (width, C_in_pre, P, P) -> (width, C_in_new, P, P)
+            c_pre = pre_shape[1]
             c_new = model_shape[1]
-            mean_w = pre_w.mean(dim=1, keepdim=True)          # (width, 1, P, P)
-            new_w.copy_(mean_w.expand_as(new_w))
-            logger.info(f"  {key}: mean-broadcast input channels {pre_shape[1]} -> {c_new}")
+            import math
+            reps = math.ceil(c_new / c_pre)
+            repeated = pre_w.repeat(1, reps, 1, 1)[:, :c_new, :, :]  # (width, c_new, P, P)
+            scaled = repeated * (c_pre / c_new)
+            noise = torch.randn_like(scaled) * (pre_w.std().item() * noise_ratio)
+            new_w.copy_(scaled + noise)
+            logger.info(
+                f"  {key}: cyclic-repeat+scale+noise input channels {c_pre} -> {c_new}"
+            )
 
         elif "ffn.0.weight" in key:
             # Decoder pixel projection: (P^2*C_pre, width, 1, 1) -> (P^2*C_new, width, 1, 1)
@@ -231,14 +255,17 @@ class FlowTiTok(nn.Module):
                     p_sq = pre_shape[0] // c_old_guess
                     c_new = c_new_total // p_sq
                     if c_new * p_sq == c_new_total:
-                        # (P^2, C_old, width, 1, 1) -> mean over C_old -> (P^2, 1, width, 1, 1)
+                        import math
+                        # (P^2, C_old, width, 1, 1)
                         pre_reshaped = pre_w.reshape(p_sq, c_old_guess, width, 1, 1)
-                        mean_ch = pre_reshaped.mean(dim=1, keepdim=True)  # (P^2, 1, w, 1, 1)
-                        expanded = mean_ch.expand(p_sq, c_new, width, 1, 1)
-                        new_w.copy_(expanded.reshape(model_shape))
+                        reps = math.ceil(c_new / c_old_guess)
+                        repeated = pre_reshaped.repeat(1, reps, 1, 1, 1)[:, :c_new, :, :, :]
+                        scaled = repeated * (c_old_guess / c_new)
+                        noise = torch.randn_like(scaled) * (pre_w.std().item() * noise_ratio)
+                        new_w.copy_((scaled + noise).reshape(model_shape))
                         logger.info(
-                            f"  {key}: mean-broadcast output channels {c_old_guess} -> {c_new} "
-                            f"(P^2={p_sq})"
+                            f"  {key}: cyclic-repeat+scale+noise output channels "
+                            f"{c_old_guess} -> {c_new} (P^2={p_sq})"
                         )
                         return
             logger.warning(f"  {key}: could not determine channel layout, using random init")
@@ -253,29 +280,44 @@ class FlowTiTok(nn.Module):
                     c_new = c_new_total // p_sq
                     if c_new * p_sq == c_new_total:
                         pre_reshaped = pre_w.reshape(p_sq, c_old_guess)
-                        mean_ch = pre_reshaped.mean(dim=1, keepdim=True)  # (P^2, 1)
-                        expanded = mean_ch.expand(p_sq, c_new)
-                        new_w.copy_(expanded.reshape(model_shape))
-                        logger.info(f"  {key}: mean-broadcast bias channels {c_old_guess} -> {c_new}")
+                        repeated = FlowTiTok._cyclic_repeat_1d(
+                            pre_reshaped.t(), c_old_guess, c_new
+                        ).t()  # (p_sq, c_new)
+                        noise = torch.randn_like(repeated) * (pre_w.std().item() * noise_ratio)
+                        new_w.copy_((repeated + noise).reshape(model_shape))
+                        logger.info(
+                            f"  {key}: cyclic-repeat+noise bias channels "
+                            f"{c_old_guess} -> {c_new}"
+                        )
                         return
             logger.warning(f"  {key}: could not determine channel layout for bias, using random init")
             new_w.zero_()
 
         elif "conv_out.weight" in key:
             # Decoder final refine conv: (C_pre, C_pre, k, k) -> (C_new, C_new, k, k)
+            import math
             c_pre = pre_shape[0]
             c_new = model_shape[0]
-            # mean over both input and output channel dims
-            mean_w = pre_w.mean(dim=0, keepdim=True).mean(dim=1, keepdim=True)  # (1, 1, k, k)
-            new_w.copy_(mean_w.expand_as(new_w))
-            logger.info(f"  {key}: mean-broadcast conv_out channels {c_pre} -> {c_new}")
+            # Repeat along output dim (dim-0), then input dim (dim-1)
+            reps0 = math.ceil(c_new / c_pre)
+            reps1 = math.ceil(c_new / c_pre)
+            repeated = pre_w.repeat(reps0, reps1, 1, 1)[:c_new, :c_new, :, :]
+            scaled = repeated * (c_pre / c_new)
+            noise = torch.randn_like(scaled) * (pre_w.std().item() * noise_ratio)
+            new_w.copy_(scaled + noise)
+            logger.info(
+                f"  {key}: cyclic-repeat+scale+noise conv_out channels {c_pre} -> {c_new}"
+            )
 
         elif "conv_out.bias" in key or "patch_embed.bias" in key:
             c_pre = pre_shape[0]
             c_new = model_shape[0]
-            mean_b = pre_w.mean()
-            new_w.fill_(mean_b.item())
-            logger.info(f"  {key}: mean-fill bias {c_pre} -> {c_new}")
+            repeated = FlowTiTok._cyclic_repeat_1d(pre_w.unsqueeze(1), c_pre, c_new).squeeze(1)
+            noise = torch.randn_like(repeated) * (pre_w.std().item() * noise_ratio)
+            new_w.copy_(repeated + noise)
+            logger.info(
+                f"  {key}: cyclic-repeat+noise bias {c_pre} -> {c_new}"
+            )
 
         else:
             logger.warning(

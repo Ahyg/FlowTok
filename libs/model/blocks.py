@@ -19,6 +19,7 @@ Reference:
     https://github.com/baofff/U-ViT/blob/main/libs/timm.py
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -62,16 +63,26 @@ class RoPEAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x, rope):
+    def forward(self, x, rope, num_patches=None):
+        """
+        Args:
+            x: (B, N, C) where N = num_patches + num_latent_tokens [+ num_text_tokens]
+            rope: VisionRotaryEmbeddingFast instance
+            num_patches: number of image patch tokens (grid_h * grid_w).
+                         If None, falls back to self.grid_size**2.
+        """
+        if num_patches is None:
+            num_patches = self.grid_size ** 2
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        q_image, q_latent = q[:, :, :self.grid_size**2], q[:, :, self.grid_size**2:]
-        k_image, k_latent = k[:, :, :self.grid_size**2], k[:, :, self.grid_size**2:]
-        
-        q_image = rope(q_image)
-        k_image = rope(k_image)
+        q_image, q_latent = q[:, :, :num_patches], q[:, :, num_patches:]
+        k_image, k_latent = k[:, :, :num_patches], k[:, :, num_patches:]
+
+        grid_size = int(math.sqrt(num_patches))
+        q_image = rope(q_image, grid_size=grid_size)
+        k_image = rope(k_image, grid_size=grid_size)
 
         q = torch.cat([q_image, q_latent], dim=2)
         k = torch.cat([k_image, k_latent], dim=2)
@@ -157,11 +168,11 @@ class ResidualRoPEAttentionBlock(nn.Module):
                     ("c_proj", nn.Linear(mlp_width, d_model))
                 ]))
 
-    def attention(self, x, rope):
-        return self.attn(x, rope)
+    def attention(self, x, rope, num_patches=None):
+        return self.attn(x, rope, num_patches=num_patches)
 
-    def forward(self, x, rope):
-        attn_output = self.attention(self.ln_1(x), rope)
+    def forward(self, x, rope, num_patches=None):
+        attn_output = self.attention(self.ln_1(x), rope, num_patches=num_patches)
         if self.nan_debug and not torch.isfinite(attn_output).all():
             raise RuntimeError("Non-finite detected in ResidualRoPEAttentionBlock attention output.")
         x = x + attn_output
@@ -364,8 +375,10 @@ class FlowTiTokEncoder(nn.Module):
         x = self.patch_embed(x)
         if self.nan_debug and not torch.isfinite(x).all():
             raise RuntimeError("Non-finite detected after encoder patch_embed.")
+        # x: (B, width, H_grid, W_grid) — H_grid/W_grid depend on input resolution
+        num_patches = x.shape[2] * x.shape[3]
         x = x.reshape(x.shape[0], x.shape[1], -1)
-        x = x.permute(0, 2, 1) # shape = [*, grid ** 2, width]
+        x = x.permute(0, 2, 1) # shape = [*, num_patches, width]
 
         latent_tokens = _expand_token(latent_tokens, x.shape[0]).to(x.dtype)
         latent_tokens = latent_tokens + self.latent_token_positional_embedding.to(x.dtype)
@@ -375,11 +388,11 @@ class FlowTiTokEncoder(nn.Module):
         if self.nan_debug and not torch.isfinite(x).all():
             raise RuntimeError("Non-finite detected after encoder ln_pre.")
         for i in range(self.num_layers):
-            x = self.transformer[i](x, self.positional_embedding)
+            x = self.transformer[i](x, self.positional_embedding, num_patches=num_patches)
             if self.nan_debug and not torch.isfinite(x).all():
                 raise RuntimeError(f"Non-finite detected after encoder block {i}.")
-        
-        latent_tokens = x[:, self.grid_size**2:]
+
+        latent_tokens = x[:, num_patches:]
         latent_tokens = self.ln_post(latent_tokens)
         if self.nan_debug and not torch.isfinite(latent_tokens).all():
             raise RuntimeError("Non-finite detected after encoder ln_post.")
@@ -453,7 +466,14 @@ class FlowTiTokDecoder(nn.Module):
         self.text_guidance_proj = nn.Linear(self.text_embed_dim, self.width)
         self.text_guidance_positional_embedding = nn.Parameter(scale * torch.randn(self.text_context_length, self.width))
 
-    def forward(self, z_quantized, text_guidance):
+    def forward(self, z_quantized, text_guidance, output_size=None):
+        """
+        Args:
+            z_quantized: (N, C, 1, num_latent_tokens) latent codes.
+            text_guidance: (N, T, text_embed_dim) or None.
+            output_size: (H_out, W_out) desired output pixel size.
+                         If None, uses the training grid_size (self.grid_size).
+        """
         N, C, H, W = z_quantized.shape
         assert H == 1 and W == self.num_latent_tokens, f"{H}, {W}, {self.num_latent_tokens}"
         x = z_quantized.reshape(N, C*H, W).permute(0, 2, 1) # NLD
@@ -463,7 +483,15 @@ class FlowTiTokDecoder(nn.Module):
 
         batchsize, seq_len, _ = x.shape
 
-        mask_tokens = self.mask_token.repeat(batchsize, self.grid_size**2, 1).to(x.dtype)
+        # Determine output grid size (in patch units).
+        if output_size is not None:
+            grid_h = output_size[0] // self.patch_size
+            grid_w = output_size[1] // self.patch_size
+        else:
+            grid_h = grid_w = self.grid_size
+        num_patches = grid_h * grid_w
+
+        mask_tokens = self.mask_token.repeat(batchsize, num_patches, 1).to(x.dtype)
         x = x + self.latent_token_positional_embedding[:seq_len]
         x = torch.cat([mask_tokens, x], dim=1)
         if self.nan_debug and not torch.isfinite(x).all():
@@ -479,21 +507,21 @@ class FlowTiTokDecoder(nn.Module):
         x = torch.cat([x, text_guidance], dim=1)
         if self.nan_debug and not torch.isfinite(x).all():
             raise RuntimeError("Non-finite detected after adding text guidance.")
-        
+
         x = self.ln_pre(x)
         if self.nan_debug and not torch.isfinite(x).all():
             raise RuntimeError("Non-finite detected after decoder ln_pre.")
         for i in range(self.num_layers):
-            x = self.transformer[i](x, self.positional_embedding)
+            x = self.transformer[i](x, self.positional_embedding, num_patches=num_patches)
             if self.nan_debug and not torch.isfinite(x).all():
                 raise RuntimeError(f"Non-finite detected after decoder block {i}.")
 
-        x = x[:, :self.grid_size**2] # remove cls embed
+        x = x[:, :num_patches]
         x = self.ln_post(x)
         if self.nan_debug and not torch.isfinite(x).all():
             raise RuntimeError("Non-finite detected after decoder ln_post.")
         # N L D -> N D H W
-        x = x.permute(0, 2, 1).reshape(batchsize, self.width, self.grid_size, self.grid_size)
+        x = x.permute(0, 2, 1).reshape(batchsize, self.width, grid_h, grid_w)
         x = self.ffn(x.contiguous())
         if self.nan_debug and not torch.isfinite(x).all():
             raise RuntimeError("Non-finite detected after decoder ffn.")

@@ -53,6 +53,10 @@ class VisionRotaryEmbeddingFast(nn.Module):
         else:
             raise ValueError(f'unknown modality {freqs_for}')
 
+        # Store base frequencies and pt_seq_len for dynamic recomputation.
+        self.register_buffer("base_freqs", freqs)
+        self.pt_seq_len = pt_seq_len
+
         if ft_seq_len is None: ft_seq_len = pt_seq_len
         t = torch.arange(ft_seq_len) / ft_seq_len * pt_seq_len
 
@@ -66,6 +70,25 @@ class VisionRotaryEmbeddingFast(nn.Module):
         self.register_buffer("freqs_cos", freqs_cos)
         self.register_buffer("freqs_sin", freqs_sin)
 
-        # print('======== shape of rope freq', self.freqs_cos.shape, '========')
+        # Cache: maps grid_size -> (freqs_cos, freqs_sin) on same device.
+        self._cache = {}
 
-    def forward(self, t): return  t * self.freqs_cos + rotate_half(t) * self.freqs_sin
+    def _build_for_grid(self, grid_size):
+        """Compute freqs_cos/freqs_sin for an arbitrary *grid_size*."""
+        t = torch.arange(grid_size, device=self.base_freqs.device,
+                         dtype=self.base_freqs.dtype) / grid_size * self.pt_seq_len
+        freqs = torch.einsum('..., f -> ... f', t, self.base_freqs)
+        freqs = repeat(freqs, '... n -> ... (n r)', r=2)
+        freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim=-1)
+        fc = freqs.cos().view(-1, freqs.shape[-1])
+        fs = freqs.sin().view(-1, freqs.shape[-1])
+        return fc, fs
+
+    def forward(self, t, grid_size=None):
+        if grid_size is not None and grid_size * grid_size != self.freqs_cos.shape[0]:
+            # Dynamic resolution: recompute or use cache.
+            if grid_size not in self._cache:
+                self._cache[grid_size] = self._build_for_grid(grid_size)
+            fc, fs = self._cache[grid_size]
+            return t * fc + rotate_half(t) * fs
+        return t * self.freqs_cos + rotate_half(t) * self.freqs_sin
