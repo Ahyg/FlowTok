@@ -1732,14 +1732,12 @@ def reconstruct_images(model, original_images, fnames, accelerator,
         norm = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
         return cmap(norm(img2d))[..., :3]
 
-    def _save_composite(orig_2d, recon_2d, cmap_name, vmin, vmax, out_path):
-        diff_2d = np.abs(orig_2d - recon_2d)
-        diff_vmax = max(vmax - vmin, 1e-6)
-        orig_rgb = _apply_cmap(orig_2d, cmap_name, vmin, vmax)
-        recon_rgb = _apply_cmap(recon_2d, cmap_name, vmin, vmax)
-        diff_rgb = _apply_cmap(diff_2d, cmap_name, 0.0, diff_vmax)
-        composite = np.concatenate([orig_rgb, recon_rgb, diff_rgb], axis=1)
-        plt.imsave(out_path, composite)
+    def _add_grid_lines(ax, color="black"):
+        for frac in [0.25, 0.5, 0.75]:
+            ax.plot([0, 1], [frac, frac], transform=ax.transAxes,
+                    linestyle='--', linewidth=0.8, color=color, alpha=0.5)
+            ax.plot([frac, frac], [0, 1], transform=ax.transAxes,
+                    linestyle='--', linewidth=0.8, color=color, alpha=0.5)
 
     ir_min, ir_max = 200.0, 320.0
     l_min, l_max = 0.1, 50.0
@@ -1754,35 +1752,62 @@ def reconstruct_images(model, original_images, fnames, accelerator,
         img = original_images[i].detach().cpu().numpy()
 
         if mode == "satellite":
-            # IR channels 0-9 -> bands 7-16 (actual count may be < 10 for reduced-channel models)
+            # All IR channels (and lightning if present) composited into one figure.
+            # Rows = channels; cols = [Original, Reconstructed, |Diff|].
             num_ir = min(10, img.shape[0])
-            ir = img[:num_ir] * (ir_max - ir_min) + ir_min
+            has_lgt = use_lightning and img.shape[0] > 10
+            nrows = num_ir + (1 if has_lgt else 0)
+            fig, axes = plt.subplots(nrows, 3, figsize=(9, 3 * nrows), squeeze=False)
+            for c, label in enumerate(["Original", "Reconstructed", "|Diff|"]):
+                axes[0, c].set_title(label, fontsize=9)
             for ch in range(num_ir):
                 band = 7 + ch
-                # Save composite: original / reconstruction / diff for this channel.
-                orig_ch = ir[ch]
-                recon_ch = reconstructed_images[i, ch].detach().cpu().numpy()
-                recon_ch = recon_ch * (ir_max - ir_min) + ir_min
-                composite_name = f"{global_step:08}_s-{i:03}-{safe_name}_ir{band:02d}.png"
-                composite_path = os.path.join(root, composite_name)
-                _save_composite(orig_ch, recon_ch, cmap_ir, ir_min, ir_max, composite_path)
+                orig_ch  = img[ch] * (ir_max - ir_min) + ir_min
+                recon_ch = reconstructed_images[i, ch].detach().cpu().numpy() * (ir_max - ir_min) + ir_min
+                diff_ch  = np.abs(orig_ch - recon_ch)
+                axes[ch, 0].imshow(orig_ch,  cmap=cmap_ir, vmin=ir_min, vmax=ir_max)
+                axes[ch, 1].imshow(recon_ch, cmap=cmap_ir, vmin=ir_min, vmax=ir_max)
+                axes[ch, 2].imshow(diff_ch,  cmap="hot",   vmin=0,      vmax=ir_max - ir_min)
+                axes[ch, 0].set_ylabel(f"IR Band {band}", fontsize=8)
+                for c in range(3):
+                    axes[ch, c].axis("off")
+                    _add_grid_lines(axes[ch, c])
+            if has_lgt:
+                row = num_ir
+                orig_lgt  = img[10] * (l_max - l_min) + l_min
+                recon_lgt = reconstructed_images[i, 10].detach().cpu().numpy() * (l_max - l_min) + l_min
+                diff_lgt  = np.abs(orig_lgt - recon_lgt)
+                axes[row, 0].imshow(orig_lgt,  cmap=cmap_lgt, vmin=0, vmax=l_max)
+                axes[row, 1].imshow(recon_lgt, cmap=cmap_lgt, vmin=0, vmax=l_max)
+                axes[row, 2].imshow(diff_lgt,  cmap="hot",    vmin=0, vmax=l_max)
+                axes[row, 0].set_ylabel("Lightning", fontsize=8)
+                for c in range(3):
+                    axes[row, c].axis("off")
+                    _add_grid_lines(axes[row, c])
+            fig.suptitle(f"Step {global_step} | {safe_name}", fontsize=10)
+            fig.tight_layout()
+            out_name = f"{global_step:08}_s-{i:03}-{safe_name}_sat.png"
+            fig.savefig(os.path.join(root, out_name), dpi=100)
+            plt.close(fig)
 
-            if use_lightning and img.shape[0] > 10:
-                lgt = img[10] * (l_max - l_min) + l_min
-                orig_ch = lgt
-                recon_ch = reconstructed_images[i, 10].detach().cpu().numpy()
-                recon_ch = recon_ch * (l_max - l_min) + l_min
-                composite_name = f"{global_step:08}_s-{i:03}-{safe_name}_lightning.png"
-                composite_path = os.path.join(root, composite_name)
-                _save_composite(orig_ch, recon_ch, cmap_lgt, 0.0, l_max, composite_path)
         elif mode == "radar":
-            radar = img[0] * (z_max - z_min) + z_min
-            orig_ch = radar
-            recon_ch = reconstructed_images[i, 0].detach().cpu().numpy()
-            recon_ch = recon_ch * (z_max - z_min) + z_min
-            composite_name = f"{global_step:08}_s-{i:03}-{safe_name}_radar.png"
-            composite_path = os.path.join(root, composite_name)
-            _save_composite(orig_ch, recon_ch, cmap_rad, z_min, z_max, composite_path)
+            orig_rad  = img[0] * (z_max - z_min) + z_min
+            recon_rad = reconstructed_images[i, 0].detach().cpu().numpy() * (z_max - z_min) + z_min
+            diff_rad  = np.abs(orig_rad - recon_rad)
+            fig, axes = plt.subplots(1, 3, figsize=(9, 3), squeeze=False)
+            for c, label in enumerate(["Original", "Reconstructed", "|Diff|"]):
+                axes[0, c].set_title(label, fontsize=9)
+            axes[0, 0].imshow(np.ma.masked_less(orig_rad,  1.0), cmap=cmap_rad, vmin=z_min, vmax=z_max)
+            axes[0, 1].imshow(np.ma.masked_less(recon_rad, 1.0), cmap=cmap_rad, vmin=z_min, vmax=z_max)
+            axes[0, 2].imshow(diff_rad, cmap="hot", vmin=0, vmax=z_max - z_min)
+            for c in range(3):
+                axes[0, c].axis("off")
+                _add_grid_lines(axes[0, c])
+            fig.suptitle(f"Step {global_step} | {safe_name}", fontsize=10)
+            fig.tight_layout()
+            out_name = f"{global_step:08}_s-{i:03}-{safe_name}_radar.png"
+            fig.savefig(os.path.join(root, out_name), dpi=100)
+            plt.close(fig)
         else:
             # No channel-specific saving for unknown mode.
             pass

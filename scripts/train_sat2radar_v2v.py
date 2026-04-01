@@ -132,19 +132,28 @@ def _add_grid_lines(ax, color="black"):
 
 
 def _compute_radar_metrics_dbz(gt_dbz, pred_dbz):
-    """Return (rmse_dbz, bias_dbz, csi35) for a single [H,W] frame in dBZ units."""
-    mask = gt_dbz >= 1.0
-    if mask.sum() > 0:
-        rmse = float(np.sqrt(np.mean((gt_dbz[mask] - pred_dbz[mask]) ** 2)))
-        bias = float(np.mean(pred_dbz[mask] - gt_dbz[mask]))
-    else:
-        rmse, bias = 0.0, 0.0
-    thr = 35.0
-    TP = int(((gt_dbz >= thr) & (pred_dbz >= thr)).sum())
-    FP = int(((gt_dbz <  thr) & (pred_dbz >= thr)).sum())
-    FN = int(((gt_dbz >= thr) & (pred_dbz <  thr)).sum())
-    csi35 = TP / max(TP + FP + FN, 1)
-    return rmse, bias, csi35
+    """Return (mse, r2, fss, csi35, pod35, far35) for a single [H,W] frame in dBZ units.
+
+    FSS is the mean over all (thr, scale) combinations, matching proj2_results_analysis_parallel.py.
+    """
+    import itertools
+    import pysteps.verification.spatialscores as pvs
+    import pysteps.verification.detcatscores as pvdcat
+    import pysteps.verification.detcontscores as pvdcont
+    from sklearn.metrics import r2_score as sk_r2
+    gt_dbz   = np.asarray(gt_dbz,   dtype=np.float32)
+    pred_dbz = np.asarray(pred_dbz, dtype=np.float32)
+    mse  = float(pvdcont.det_cont_fct(pred_dbz, gt_dbz, scores='MSE')["MSE"].item())
+    r2   = float(sk_r2(gt_dbz.ravel(), pred_dbz.ravel()))
+    thrs   = np.arange(0, 61, 5)
+    scales = np.arange(1, 11)
+    fss_vals = [pvs.fss(pred_dbz, gt_dbz, thr=t, scale=s)
+                for t, s in itertools.product(thrs, scales)]
+    fss  = float(np.nanmean(fss_vals))
+    csi35 = float(pvdcat.det_cat_fct(pred_dbz, gt_dbz, thr=35, scores='CSI', axis=None)["CSI"].item())
+    pod35 = float(pvdcat.det_cat_fct(pred_dbz, gt_dbz, thr=35, scores='POD', axis=None)["POD"].item())
+    far35 = float(pvdcat.det_cat_fct(pred_dbz, gt_dbz, thr=35, scores='FAR', axis=None)["FAR"].item())
+    return mse, r2, fss, csi35, pod35, far35
 
 
 def _save_three_panel_sat_radar(
@@ -1287,13 +1296,12 @@ def train(config):
                             axes_s[i, 3].axis("off")
                             _add_grid_lines(axes_s[i, 3])
 
-                            rmse, bias, csi35 = _compute_radar_metrics_dbz(gt_dbz, pred_dbz)
+                            mse, r2, fss, csi35, pod35, far35 = _compute_radar_metrics_dbz(gt_dbz, pred_dbz)
                             axes_s[i, 3].text(
                                 0.01, 0.97,
-                                f"RMSE:{rmse:.1f}dBZ\nBias:{bias:+.1f}\nCSI35:{csi35:.2f}",
+                                f"MSE:{mse:.2f}, R\u00b2:{r2:.2f}\nFSS:{fss:.2f}, CSI35:{csi35:.2f}\nPOD35:{pod35:.2f}, FAR35:{far35:.2f}",
                                 transform=axes_s[i, 3].transAxes, ha='left', va='top',
                                 fontsize=7, color='white', fontweight='bold',
-                                bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.5),
                             )
                             axes_s[i, 0].set_ylabel(f"sample {i}", rotation=90, fontsize=10)
 
@@ -1345,13 +1353,12 @@ def train(config):
                                 im_pred.append(axes_g[i, 3].imshow(
                                     np.ma.masked_less(pred0, 1.0),
                                     cmap=cmap_rad, vmin=z_min, vmax=z_max, animated=True))
-                                rmse0, bias0, csi350 = _compute_radar_metrics_dbz(gt0, pred0)
+                                mse0, r20, fss0, csi350, pod350, far350 = _compute_radar_metrics_dbz(gt0, pred0)
                                 txt_mets.append(axes_g[i, 3].text(
                                     0.01, 0.97,
-                                    f"RMSE:{rmse0:.1f}dBZ\nBias:{bias0:+.1f}\nCSI35:{csi350:.2f}",
+                                    f"MSE:{mse0:.2f}, R\u00b2:{r20:.2f}\nFSS:{fss0:.2f}, CSI35:{csi350:.2f}\nPOD35:{pod350:.2f}, FAR35:{far350:.2f}",
                                     transform=axes_g[i, 3].transAxes, ha='left', va='top',
                                     fontsize=7, color='white', fontweight='bold',
-                                    bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.5),
                                     animated=True,
                                 ))
 
@@ -1369,9 +1376,9 @@ def train(config):
                                     im_lgt[i].set_data(lgt_t)
                                     im_gt[i].set_data(np.ma.masked_less(gt_t, 1.0))
                                     im_pred[i].set_data(np.ma.masked_less(pred_t, 1.0))
-                                    rmse, bias, csi35 = _compute_radar_metrics_dbz(gt_t, pred_t)
+                                    mse, r2, fss, csi35, pod35, far35 = _compute_radar_metrics_dbz(gt_t, pred_t)
                                     txt_mets[i].set_text(
-                                        f"RMSE:{rmse:.1f}dBZ\nBias:{bias:+.1f}\nCSI35:{csi35:.2f}"
+                                        f"MSE:{mse:.2f}, R\u00b2:{r2:.2f}\nFSS:{fss:.2f}, CSI35:{csi35:.2f}\nPOD35:{pod35:.2f}, FAR35:{far35:.2f}"
                                     )
                                 title_obj.set_text(
                                     f"Step {train_state.step} | frame {t}/{T_gif}"
