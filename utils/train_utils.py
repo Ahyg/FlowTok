@@ -1754,9 +1754,10 @@ def reconstruct_images(model, original_images, fnames, accelerator,
         img = original_images[i].detach().cpu().numpy()
 
         if mode == "satellite":
-            # IR channels 0-9 -> bands 7-16
-            ir = img[:10] * (ir_max - ir_min) + ir_min
-            for ch in range(10):
+            # IR channels 0-9 -> bands 7-16 (actual count may be < 10 for reduced-channel models)
+            num_ir = min(10, img.shape[0])
+            ir = img[:num_ir] * (ir_max - ir_min) + ir_min
+            for ch in range(num_ir):
                 band = 7 + ch
                 # Save composite: original / reconstruction / diff for this channel.
                 orig_ch = ir[ch]
