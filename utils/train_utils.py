@@ -1816,7 +1816,7 @@ def reconstruct_images(model, original_images, fnames, accelerator,
                 axes[ch, 1].text(
                     0.01, 0.97, _metrics_text(mse, r2, fss, csi, pod, far),
                     transform=axes[ch, 1].transAxes, ha='left', va='top',
-                    fontsize=6, color='white', fontweight='bold',
+                    fontsize=6, color='black', fontweight='bold',
                 )
                 for c in range(3):
                     axes[ch, c].axis("off")
@@ -1835,7 +1835,7 @@ def reconstruct_images(model, original_images, fnames, accelerator,
                 axes[row, 1].text(
                     0.01, 0.97, _metrics_text(mse, r2, fss, csi, pod, far),
                     transform=axes[row, 1].transAxes, ha='left', va='top',
-                    fontsize=6, color='white', fontweight='bold',
+                    fontsize=6, color='black', fontweight='bold',
                 )
                 for c in range(3):
                     axes[row, c].axis("off")
@@ -1861,7 +1861,7 @@ def reconstruct_images(model, original_images, fnames, accelerator,
             axes[0, 1].text(
                 0.01, 0.97, _metrics_text(mse, r2, fss, csi, pod, far),
                 transform=axes[0, 1].transAxes, ha='left', va='top',
-                fontsize=7, color='white', fontweight='bold',
+                fontsize=7, color='black', fontweight='bold',
             )
             for c in range(3):
                 axes[0, c].axis("off")

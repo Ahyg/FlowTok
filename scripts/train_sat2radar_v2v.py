@@ -1326,7 +1326,7 @@ def train(config):
                                 0.01, 0.97,
                                 f"MSE:{mse:.2f}, R\u00b2:{r2:.2f}\nFSS:{fss:.2f}, CSI35:{csi35:.2f}\nPOD35:{pod35:.2f}, FAR35:{far35:.2f}",
                                 transform=axes_s[i, 3].transAxes, ha='left', va='top',
-                                fontsize=7, color='white', fontweight='bold',
+                                fontsize=7, color='black', fontweight='bold',
                             )
                             axes_s[i, 0].set_ylabel(f"sample {i}", rotation=90, fontsize=10)
 
@@ -1383,7 +1383,7 @@ def train(config):
                                     0.01, 0.97,
                                     f"MSE:{mse0:.2f}, R\u00b2:{r20:.2f}\nFSS:{fss0:.2f}, CSI35:{csi350:.2f}\nPOD35:{pod350:.2f}, FAR35:{far350:.2f}",
                                     transform=axes_g[i, 3].transAxes, ha='left', va='top',
-                                    fontsize=7, color='white', fontweight='bold',
+                                    fontsize=7, color='black', fontweight='bold',
                                     animated=True,
                                 ))
 
