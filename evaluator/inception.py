@@ -19,6 +19,7 @@ Reference:
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import torch
 import torch.nn.functional as F
 
@@ -92,8 +93,15 @@ class FeatureExtractorInceptionV3(FeatureExtractorBase):
 
         self.fc = torch.nn.Linear(2048, 1008)
 
-        state_dict = load_state_dict_from_url(FID_WEIGHTS_URL, progress=True)
-        #state_dict = torch.load(FID_WEIGHTS_URL, map_location='cpu')
+        # Prefer local cached weights (compute nodes have no network).
+        _local = os.path.join(
+            os.environ.get("TORCH_HOME", os.path.join(os.path.expanduser("~"), ".cache", "torch")),
+            "hub", "checkpoints", "pt_inception-2015-12-05-6726825d.pth",
+        )
+        if os.path.isfile(_local):
+            state_dict = torch.load(_local, map_location="cpu")
+        else:
+            state_dict = load_state_dict_from_url(FID_WEIGHTS_URL, progress=True)
         self.load_state_dict(state_dict)
 
         self.to(self.feature_extractor_internal_dtype)

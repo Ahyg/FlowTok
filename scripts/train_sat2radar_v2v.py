@@ -122,6 +122,31 @@ def _apply_cmap(img2d, cmap_name, vmin, vmax):
     return cmap(norm(img2d))[..., :3]
 
 
+def _add_grid_lines(ax, color="black"):
+    """Add dashed gridlines at 25/50/75% positions of the axes."""
+    for frac in [0.25, 0.5, 0.75]:
+        ax.plot([0, 1], [frac, frac], transform=ax.transAxes,
+                linestyle='--', linewidth=0.8, color=color, alpha=0.5)
+        ax.plot([frac, frac], [0, 1], transform=ax.transAxes,
+                linestyle='--', linewidth=0.8, color=color, alpha=0.5)
+
+
+def _compute_radar_metrics_dbz(gt_dbz, pred_dbz):
+    """Return (rmse_dbz, bias_dbz, csi35) for a single [H,W] frame in dBZ units."""
+    mask = gt_dbz >= 1.0
+    if mask.sum() > 0:
+        rmse = float(np.sqrt(np.mean((gt_dbz[mask] - pred_dbz[mask]) ** 2)))
+        bias = float(np.mean(pred_dbz[mask] - gt_dbz[mask]))
+    else:
+        rmse, bias = 0.0, 0.0
+    thr = 35.0
+    TP = int(((gt_dbz >= thr) & (pred_dbz >= thr)).sum())
+    FP = int(((gt_dbz <  thr) & (pred_dbz >= thr)).sum())
+    FN = int(((gt_dbz >= thr) & (pred_dbz <  thr)).sum())
+    csi35 = TP / max(TP + FP + FN, 1)
+    return rmse, bias, csi35
+
+
 def _save_three_panel_sat_radar(
     sat_2d,
     gt_2d,
@@ -1183,10 +1208,9 @@ def train(config):
                                 B, T_eff_no_adapter, 1, H_gt, W_gt
                             )
 
-                    # 只可视化每个样本的第 1 帧，使用物理范围和 colormap：
-                    # sat: IR ch0 使用 [200,320] + 'cmc.batlow_r'
-                    #       lightning 通道使用 [0.1,50] + 'Reds'
-                    # radar: [0,60] dBZ + 'HomeyerRainbow'
+                    # Visualization: matplotlib subplot grid [Sat IR | Lightning | GT Radar | Pred Radar]
+                    # Rows = samples; columns = channels.
+                    # Radar panels: pixels < 1 dBZ masked, gridlines at 25/50/75%, metrics on pred.
                     ir_min, ir_max = 200.0, 320.0
                     l_min, l_max = 0.1, 50.0
                     z_min, z_max = 0.0, 60.0
@@ -1202,193 +1226,179 @@ def train(config):
                     )
 
                     max_samples = min(B, 8)
-                    rows_np = []
-                    for i in range(max_samples):
-                        # 第 1 帧
-                        sat_ir = sat_video[i, 0, 0] * (ir_max - ir_min) + ir_min  # [H_gt, W_gt]
-                        radar_gt_2d = (
-                            radar_video_gt[i, 0, 0] * (z_max - z_min) + z_min
-                        )  # [H, W]
-                        radar_pred_2d = (
-                            radar_video_pred[i, 0, 0] * (z_max - z_min) + z_min
-                        )  # [H, W]
 
-                        sat_ir_np = sat_ir.detach().cpu().numpy()
-                        radar_gt_np = radar_gt_2d.detach().cpu().numpy()
-                        radar_pred_np = radar_pred_2d.detach().cpu().numpy()
-
-                        # Lightning channel index follows dataset output:
-                        # [selected IR bands] + [lightning (optional)].
-                        if (
-                            lgt_channel_idx is not None
-                            and sat_video.shape[2] > lgt_channel_idx
-                        ):
-                            sat_lgt = sat_video[i, 0, lgt_channel_idx] * (l_max - l_min) + l_min
-                            sat_lgt_np = sat_lgt.detach().cpu().numpy()
+                    def _get_frame_arrays(sample_idx, frame_idx, radar_pred_vol):
+                        """Return (sat_ir_np, lgt_np, gt_dbz, pred_dbz) for one sample/frame."""
+                        sat_ir_np = (
+                            sat_video[sample_idx, frame_idx, 0].detach().cpu().numpy()
+                            * (ir_max - ir_min) + ir_min
+                        )
+                        gt_dbz = (
+                            radar_video_gt[sample_idx, frame_idx, 0].detach().cpu().numpy()
+                            * (z_max - z_min) + z_min
+                        )
+                        pred_dbz = (
+                            radar_pred_vol[sample_idx, frame_idx, 0].detach().cpu().numpy()
+                            * (z_max - z_min) + z_min
+                        )
+                        if lgt_channel_idx is not None and sat_video.shape[2] > lgt_channel_idx:
+                            lgt_np = (
+                                sat_video[sample_idx, frame_idx, lgt_channel_idx]
+                                .detach().cpu().numpy()
+                                * (l_max - l_min) + l_min
+                            )
                         else:
-                            sat_lgt_np = np.zeros_like(sat_ir_np)
+                            lgt_np = np.zeros_like(sat_ir_np)
+                        return sat_ir_np, lgt_np, gt_dbz, pred_dbz
 
-                        sat_ir_rgb = _apply_cmap(sat_ir_np, cmap_ir, ir_min, ir_max)
-                        sat_lgt_rgb = _apply_cmap(sat_lgt_np, cmap_lgt, l_min, l_max)
-                        gt_rgb = _apply_cmap(radar_gt_np, cmap_rad, z_min, z_max)
-                        pred_rgb = _apply_cmap(radar_pred_np, cmap_rad, z_min, z_max)
-
-                        row = np.concatenate(
-                            [sat_ir_rgb, sat_lgt_rgb, gt_rgb, pred_rgb], axis=1
-                        )  # [H, 4W, 3]
-                        rows_np.append(row)
-
-                    if rows_np:
-                        # 竖直堆叠多行，得到 [H*max_samples, 4W, 3]
-                        stacked = np.concatenate(rows_np, axis=0)
-
-                        if accelerator.is_main_process:
-                            save_path = os.path.join(
-                                config.sample_dir,
-                                f"{train_state.step}_sat_lgt_gt_pred.png",
+                    def _vis_static(radar_pred_vol, fname_suffix):
+                        """Save a static PNG of the first frame for all samples."""
+                        if not accelerator.is_main_process:
+                            return
+                        fig_s, axes_s = plt.subplots(
+                            max_samples, 4, figsize=(16, 4 * max_samples), squeeze=False
+                        )
+                        col_titles = ["Sat IR ch0", "Lightning", "GT Radar", "Pred Radar"]
+                        for j, title in enumerate(col_titles):
+                            axes_s[0, j].set_title(title)
+                        for i in range(max_samples):
+                            sat_np, lgt_np, gt_dbz, pred_dbz = _get_frame_arrays(
+                                i, 0, radar_pred_vol
                             )
-                            plt.imsave(save_path, stacked)
+                            axes_s[i, 0].imshow(sat_np, cmap=cmap_ir, vmin=ir_min, vmax=ir_max)
+                            axes_s[i, 0].axis("off")
+                            _add_grid_lines(axes_s[i, 0])
 
-                    # v2v 训练时，额外保存一段随时间演化的 GIF 视频，
-                    # 每一帧与上面的 PNG 类似，都是多样本堆叠 + 四联图：[sat_IR | sat_lightning | radar_gt | radar_pred]。
-                    if accelerator.is_main_process and getattr(getattr(config, "dataset", {}), "v2v", False) and HAS_IMAGEIO:
-                        video_frames = []
-                        for t in range(T_eff):
-                            rows_t = []
+                            axes_s[i, 1].imshow(lgt_np, cmap=cmap_lgt, vmin=l_min, vmax=l_max)
+                            axes_s[i, 1].axis("off")
+                            _add_grid_lines(axes_s[i, 1])
+
+                            axes_s[i, 2].imshow(
+                                np.ma.masked_less(gt_dbz, 1.0),
+                                cmap=cmap_rad, vmin=z_min, vmax=z_max,
+                            )
+                            axes_s[i, 2].axis("off")
+                            _add_grid_lines(axes_s[i, 2])
+
+                            axes_s[i, 3].imshow(
+                                np.ma.masked_less(pred_dbz, 1.0),
+                                cmap=cmap_rad, vmin=z_min, vmax=z_max,
+                            )
+                            axes_s[i, 3].axis("off")
+                            _add_grid_lines(axes_s[i, 3])
+
+                            rmse, bias, csi35 = _compute_radar_metrics_dbz(gt_dbz, pred_dbz)
+                            axes_s[i, 3].text(
+                                0.01, 0.97,
+                                f"RMSE:{rmse:.1f}dBZ\nBias:{bias:+.1f}\nCSI35:{csi35:.2f}",
+                                transform=axes_s[i, 3].transAxes, ha='left', va='top',
+                                fontsize=7, color='white', fontweight='bold',
+                                bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.5),
+                            )
+                            axes_s[i, 0].set_ylabel(f"sample {i}", rotation=90, fontsize=10)
+
+                        fig_s.suptitle(f"Step {train_state.step}", fontsize=12)
+                        fig_s.tight_layout()
+                        save_path = os.path.join(
+                            config.sample_dir,
+                            f"{train_state.step}_{fname_suffix}.png",
+                        )
+                        fig_s.savefig(save_path, dpi=120)
+                        plt.close(fig_s)
+
+                    _vis_static(radar_video_pred, "sat_lgt_gt_pred")
+                    if radar_video_pred_no_adapterout is not None:
+                        _vis_static(
+                            radar_video_pred_no_adapterout, "sat_lgt_gt_pred_no_adapterout"
+                        )
+
+                    # v2v: save a single animated GIF (B rows × 4 cols) over all T frames.
+                    if (
+                        accelerator.is_main_process
+                        and getattr(getattr(config, "dataset", {}), "v2v", False)
+                    ):
+                        import matplotlib.animation as animation
+
+                        def _vis_gif(radar_pred_vol, T_gif, fname_suffix):
+                            fig_g, axes_g = plt.subplots(
+                                max_samples, 4, figsize=(16, 4 * max_samples), squeeze=False
+                            )
+                            col_titles = ["Sat IR ch0", "Lightning", "GT Radar", "Pred Radar"]
+                            for j, title in enumerate(col_titles):
+                                axes_g[0, j].set_title(title)
                             for i in range(max_samples):
-                                # 物理量缩放与上面保持一致
-                                sat_ir_t = sat_video[i, t, 0] * (ir_max - ir_min) + ir_min
-                                radar_gt_t = (
-                                    radar_video_gt[i, t, 0] * (z_max - z_min) + z_min
-                                )
-                                radar_pred_t = (
-                                    radar_video_pred[i, t, 0] * (z_max - z_min) + z_min
-                                )
+                                for j in range(4):
+                                    axes_g[i, j].axis("off")
+                                    _add_grid_lines(axes_g[i, j])
+                                axes_g[i, 0].set_ylabel(f"sample {i}", rotation=90, fontsize=10)
 
-                                sat_ir_np_t = sat_ir_t.detach().cpu().numpy()
-                                radar_gt_np_t = radar_gt_t.detach().cpu().numpy()
-                                radar_pred_np_t = radar_pred_t.detach().cpu().numpy()
+                            im_sat, im_lgt, im_gt, im_pred, txt_mets = [], [], [], [], []
+                            for i in range(max_samples):
+                                sat0, lgt0, gt0, pred0 = _get_frame_arrays(i, 0, radar_pred_vol)
+                                im_sat.append(axes_g[i, 0].imshow(
+                                    sat0, cmap=cmap_ir, vmin=ir_min, vmax=ir_max, animated=True))
+                                im_lgt.append(axes_g[i, 1].imshow(
+                                    lgt0, cmap=cmap_lgt, vmin=l_min, vmax=l_max, animated=True))
+                                im_gt.append(axes_g[i, 2].imshow(
+                                    np.ma.masked_less(gt0, 1.0),
+                                    cmap=cmap_rad, vmin=z_min, vmax=z_max, animated=True))
+                                im_pred.append(axes_g[i, 3].imshow(
+                                    np.ma.masked_less(pred0, 1.0),
+                                    cmap=cmap_rad, vmin=z_min, vmax=z_max, animated=True))
+                                rmse0, bias0, csi350 = _compute_radar_metrics_dbz(gt0, pred0)
+                                txt_mets.append(axes_g[i, 3].text(
+                                    0.01, 0.97,
+                                    f"RMSE:{rmse0:.1f}dBZ\nBias:{bias0:+.1f}\nCSI35:{csi350:.2f}",
+                                    transform=axes_g[i, 3].transAxes, ha='left', va='top',
+                                    fontsize=7, color='white', fontweight='bold',
+                                    bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.5),
+                                    animated=True,
+                                ))
 
-                                if (
-                                    lgt_channel_idx is not None
-                                    and sat_video.shape[2] > lgt_channel_idx
-                                ):
-                                    sat_lgt_t = sat_video[i, t, lgt_channel_idx] * (l_max - l_min) + l_min
-                                    sat_lgt_np_t = sat_lgt_t.detach().cpu().numpy()
-                                else:
-                                    sat_lgt_np_t = np.zeros_like(sat_ir_np_t)
-
-                                sat_ir_rgb_t = _apply_cmap(
-                                    sat_ir_np_t, cmap_ir, ir_min, ir_max
-                                )
-                                sat_lgt_rgb_t = _apply_cmap(
-                                    sat_lgt_np_t, cmap_lgt, l_min, l_max
-                                )
-                                gt_rgb_t = _apply_cmap(
-                                    radar_gt_np_t, cmap_rad, z_min, z_max
-                                )
-                                pred_rgb_t = _apply_cmap(
-                                    radar_pred_np_t, cmap_rad, z_min, z_max
-                                )
-
-                                row_t = np.concatenate(
-                                    [sat_ir_rgb_t, sat_lgt_rgb_t, gt_rgb_t, pred_rgb_t],
-                                    axis=1,
-                                )  # [H, 4W, 3]
-                                rows_t.append(row_t)
-
-                            if not rows_t:
-                                continue
-
-                            # 与 PNG 一致：按样本在竖直方向堆叠，形成一帧
-                            frame = np.concatenate(rows_t, axis=0)  # [H*max_samples, 4W, 3]
-                            # 转为 uint8，确保 GIF 兼容
-                            frame_uint8 = (np.clip(frame, 0.0, 1.0) * 255).astype(
-                                np.uint8
+                            title_obj = fig_g.suptitle(
+                                f"Step {train_state.step} | frame 0/{T_gif}", fontsize=12
                             )
-                            video_frames.append(frame_uint8)
+                            fig_g.tight_layout()
 
-                        if accelerator.is_main_process and video_frames:
-                            video_path = os.path.join(
+                            def _update(t):
+                                for i in range(max_samples):
+                                    sat_t, lgt_t, gt_t, pred_t = _get_frame_arrays(
+                                        i, t, radar_pred_vol
+                                    )
+                                    im_sat[i].set_data(sat_t)
+                                    im_lgt[i].set_data(lgt_t)
+                                    im_gt[i].set_data(np.ma.masked_less(gt_t, 1.0))
+                                    im_pred[i].set_data(np.ma.masked_less(pred_t, 1.0))
+                                    rmse, bias, csi35 = _compute_radar_metrics_dbz(gt_t, pred_t)
+                                    txt_mets[i].set_text(
+                                        f"RMSE:{rmse:.1f}dBZ\nBias:{bias:+.1f}\nCSI35:{csi35:.2f}"
+                                    )
+                                title_obj.set_text(
+                                    f"Step {train_state.step} | frame {t}/{T_gif}"
+                                )
+                                return im_sat + im_lgt + im_gt + im_pred + txt_mets
+
+                            ani = animation.FuncAnimation(
+                                fig_g, _update, frames=T_gif, interval=300, blit=False
+                            )
+                            gif_path = os.path.join(
                                 config.sample_dir,
-                                f"{train_state.step}_v2v.gif",
+                                f"{train_state.step}_{fname_suffix}.gif",
                             )
                             try:
-                                imageio.mimsave(video_path, video_frames, fps=4)
+                                ani.save(gif_path, writer="pillow", fps=4)
                             except Exception as e:
-                                logging.warning(f"Failed to save v2v GIF: {e}")
+                                logging.warning(f"Failed to save GIF {gif_path}: {e}")
+                            plt.close(fig_g)
 
-                        # Additional comparison GIF: same visualization but bypass adapter_out.
-                        if (
-                            accelerator.is_main_process
-                            and radar_video_pred_no_adapterout is not None
-                        ):
-                            video_frames_no_adapter = []
+                        _vis_gif(radar_video_pred, T_eff, "v2v")
+                        if radar_video_pred_no_adapterout is not None:
                             T_eff_no_adapter = radar_video_pred_no_adapterout.shape[1]
-                            for t in range(T_eff_no_adapter):
-                                rows_t = []
-                                for i in range(max_samples):
-                                    sat_ir_t = sat_video[i, t, 0] * (ir_max - ir_min) + ir_min
-                                    radar_gt_t = (
-                                        radar_video_gt[i, t, 0] * (z_max - z_min) + z_min
-                                    )
-                                    radar_pred_t = (
-                                        radar_video_pred_no_adapterout[i, t, 0] * (z_max - z_min) + z_min
-                                    )
-
-                                    sat_ir_np_t = sat_ir_t.detach().cpu().numpy()
-                                    radar_gt_np_t = radar_gt_t.detach().cpu().numpy()
-                                    radar_pred_np_t = radar_pred_t.detach().cpu().numpy()
-
-                                    if (
-                                        lgt_channel_idx is not None
-                                        and sat_video.shape[2] > lgt_channel_idx
-                                    ):
-                                        sat_lgt_t = sat_video[i, t, lgt_channel_idx] * (l_max - l_min) + l_min
-                                        sat_lgt_np_t = sat_lgt_t.detach().cpu().numpy()
-                                    else:
-                                        sat_lgt_np_t = np.zeros_like(sat_ir_np_t)
-
-                                    sat_ir_rgb_t = _apply_cmap(
-                                        sat_ir_np_t, cmap_ir, ir_min, ir_max
-                                    )
-                                    sat_lgt_rgb_t = _apply_cmap(
-                                        sat_lgt_np_t, cmap_lgt, l_min, l_max
-                                    )
-                                    gt_rgb_t = _apply_cmap(
-                                        radar_gt_np_t, cmap_rad, z_min, z_max
-                                    )
-                                    pred_rgb_t = _apply_cmap(
-                                        radar_pred_np_t, cmap_rad, z_min, z_max
-                                    )
-
-                                    row_t = np.concatenate(
-                                        [sat_ir_rgb_t, sat_lgt_rgb_t, gt_rgb_t, pred_rgb_t],
-                                        axis=1,
-                                    )
-                                    rows_t.append(row_t)
-
-                                if not rows_t:
-                                    continue
-                                frame = np.concatenate(rows_t, axis=0)
-                                frame_uint8 = (np.clip(frame, 0.0, 1.0) * 255).astype(
-                                    np.uint8
-                                )
-                                video_frames_no_adapter.append(frame_uint8)
-
-                            if video_frames_no_adapter:
-                                video_path_no_adapter = os.path.join(
-                                    config.sample_dir,
-                                    f"{train_state.step}_v2v_no_adapterout.gif",
-                                )
-                                try:
-                                    imageio.mimsave(
-                                        video_path_no_adapter, video_frames_no_adapter, fps=4
-                                    )
-                                except Exception as e:
-                                    logging.warning(
-                                        f"Failed to save no-adapterout v2v GIF: {e}"
-                                    )
+                            _vis_gif(
+                                radar_video_pred_no_adapterout,
+                                T_eff_no_adapter,
+                                "v2v_no_adapterout",
+                            )
                 accelerator.wait_for_everyone()
                 torch.cuda.empty_cache()
 

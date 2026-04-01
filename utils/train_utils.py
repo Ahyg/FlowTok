@@ -156,9 +156,16 @@ def create_pretrained_tokenizer(config, accelerator=None):
 
 
 def create_clip_model():
-    clip, _, _ = open_clip.create_model_and_transforms('ViT-L-14-336', pretrained='openai')
+    clip_model_name = 'ViT-L-14-336'
+    local_ckpt = os.environ.get("OPENCLIP_LOCAL_CKPT", None)
+    if local_ckpt is not None and os.path.isfile(local_ckpt):
+        clip, _, _ = open_clip.create_model_and_transforms(clip_model_name, pretrained=None)
+        state_dict = torch.load(local_ckpt, map_location="cpu")
+        clip.load_state_dict(state_dict, strict=False)
+    else:
+        clip, _, _ = open_clip.create_model_and_transforms(clip_model_name, pretrained='openai')
     del clip.visual
-    tokenizer = open_clip.get_tokenizer('ViT-L-14-336')
+    tokenizer = open_clip.get_tokenizer(clip_model_name)
     clip.transformer.batch_first = False
     clip.eval()
     clip.requires_grad_(False)
@@ -895,6 +902,16 @@ def train_one_epoch(config, logger, accelerator,
     _in_decoder_warmup = _decoder_warmup_steps > 0 and global_step < _decoder_warmup_steps
     if _in_decoder_warmup:
         _apply_decoder_warmup_freeze(config, logger, accelerator.unwrap_model(model))
+    elif _finetune_enabled and _decoder_warmup_steps > 0:
+        # Resumed past warmup: re-apply stage-2 freeze (patch_embed frozen, decoder fully trainable).
+        # _release_decoder_warmup_freeze is not called again on resume, so we must replicate
+        # the encoder freeze portion here to restore the correct stage-2 state.
+        freeze_enc_after = finetune_cfg.get("freeze_encoder_after_warmup", True)
+        if freeze_enc_after:
+            enc_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
+            for name, param in accelerator.unwrap_model(model).named_parameters():
+                if name.startswith("encoder.") and any(name.startswith(p) for p in enc_prefixes):
+                    param.requires_grad = False
 
     autoencoder_logs = defaultdict(float)
     discriminator_logs = defaultdict(float)
