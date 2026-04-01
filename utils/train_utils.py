@@ -1739,12 +1739,51 @@ def reconstruct_images(model, original_images, fnames, accelerator,
             ax.plot([frac, frac], [0, 1], transform=ax.transAxes,
                     linestyle='--', linewidth=0.8, color=color, alpha=0.5)
 
+    def _compute_ae_metrics(orig_2d, recon_2d, thrs, scales, thr_cat):
+        """Return (mse, r2, fss, csi, pod, far) for a single [H,W] reconstruction pair.
+
+        thrs/scales match the reference compute_fss_grid_for_single approach (pvs.fss mean).
+        thr_cat is the threshold for CSI/POD/FAR (mapped to the same physical units as the arrays).
+        """
+        import itertools
+        import pysteps.verification.spatialscores as _pvs
+        import pysteps.verification.detcatscores as _pvdcat
+        import pysteps.verification.detcontscores as _pvdcont
+        from sklearn.metrics import r2_score as _r2
+        o = np.asarray(orig_2d,  dtype=np.float32)
+        r = np.asarray(recon_2d, dtype=np.float32)
+        mse  = float(_pvdcont.det_cont_fct(r, o, scores='MSE')["MSE"].item())
+        r2   = float(_r2(o.ravel(), r.ravel()))
+        fss_vals = [_pvs.fss(r, o, thr=float(t), scale=int(s))
+                    for t, s in itertools.product(thrs, scales)]
+        fss  = float(np.nanmean(fss_vals))
+        csi  = float(_pvdcat.det_cat_fct(r, o, thr=float(thr_cat), scores='CSI', axis=None)["CSI"].item())
+        pod  = float(_pvdcat.det_cat_fct(r, o, thr=float(thr_cat), scores='POD', axis=None)["POD"].item())
+        far  = float(_pvdcat.det_cat_fct(r, o, thr=float(thr_cat), scores='FAR', axis=None)["FAR"].item())
+        return mse, r2, fss, csi, pod, far
+
     ir_min, ir_max = 200.0, 320.0
     l_min, l_max = 0.1, 50.0
     z_min, z_max = 0.0, 60.0
     cmap_ir = _cmap_or_fallback("cmc.batlow_r", fallback="viridis")
     cmap_lgt = _cmap_or_fallback("Reds", fallback="Reds")
     cmap_rad = _cmap_or_fallback("HomeyerRainbow", fallback="viridis")
+
+    # Radar FSS/cat thresholds (dBZ): same as reference
+    _rad_thrs   = np.arange(0, 61, 5, dtype=np.float32)
+    _scales     = np.arange(1, 11)
+    _rad_thr35  = 35.0
+    # Satellite FSS/cat thresholds: map [0,60] linearly onto [ir_min, ir_max]
+    _ir_thrs    = ir_min + (_rad_thrs / 60.0) * (ir_max - ir_min)   # 13 evenly-spaced K values
+    _ir_thr35   = ir_min + (35.0 / 60.0) * (ir_max - ir_min)        # ~270 K
+    # Lightning FSS/cat thresholds: map [0,60] linearly onto [l_min, l_max]
+    _lgt_thrs   = l_min + (_rad_thrs / 60.0) * (l_max - l_min)
+    _lgt_thr35  = l_min + (35.0 / 60.0) * (l_max - l_min)
+
+    def _metrics_text(mse, r2, fss, csi, pod, far):
+        return (f"MSE:{mse:.2f}, R\u00b2:{r2:.2f}\n"
+                f"FSS:{fss:.2f}, CSI:{csi:.2f}\n"
+                f"POD:{pod:.2f}, FAR:{far:.2f}")
 
     for i in range(original_images.shape[0]):
         raw_name = str(fnames[i])
@@ -1769,6 +1808,13 @@ def reconstruct_images(model, original_images, fnames, accelerator,
                 axes[ch, 1].imshow(recon_ch, cmap=cmap_ir, vmin=ir_min, vmax=ir_max)
                 axes[ch, 2].imshow(diff_ch,  cmap="hot",   vmin=0,      vmax=ir_max - ir_min)
                 axes[ch, 0].set_ylabel(f"IR Band {band}", fontsize=8)
+                mse, r2, fss, csi, pod, far = _compute_ae_metrics(
+                    orig_ch, recon_ch, _ir_thrs, _scales, _ir_thr35)
+                axes[ch, 1].text(
+                    0.01, 0.97, _metrics_text(mse, r2, fss, csi, pod, far),
+                    transform=axes[ch, 1].transAxes, ha='left', va='top',
+                    fontsize=6, color='white', fontweight='bold',
+                )
                 for c in range(3):
                     axes[ch, c].axis("off")
                     _add_grid_lines(axes[ch, c])
@@ -1781,6 +1827,13 @@ def reconstruct_images(model, original_images, fnames, accelerator,
                 axes[row, 1].imshow(recon_lgt, cmap=cmap_lgt, vmin=0, vmax=l_max)
                 axes[row, 2].imshow(diff_lgt,  cmap="hot",    vmin=0, vmax=l_max)
                 axes[row, 0].set_ylabel("Lightning", fontsize=8)
+                mse, r2, fss, csi, pod, far = _compute_ae_metrics(
+                    orig_lgt, recon_lgt, _lgt_thrs, _scales, _lgt_thr35)
+                axes[row, 1].text(
+                    0.01, 0.97, _metrics_text(mse, r2, fss, csi, pod, far),
+                    transform=axes[row, 1].transAxes, ha='left', va='top',
+                    fontsize=6, color='white', fontweight='bold',
+                )
                 for c in range(3):
                     axes[row, c].axis("off")
                     _add_grid_lines(axes[row, c])
@@ -1800,6 +1853,13 @@ def reconstruct_images(model, original_images, fnames, accelerator,
             axes[0, 0].imshow(np.ma.masked_less(orig_rad,  1.0), cmap=cmap_rad, vmin=z_min, vmax=z_max)
             axes[0, 1].imshow(np.ma.masked_less(recon_rad, 1.0), cmap=cmap_rad, vmin=z_min, vmax=z_max)
             axes[0, 2].imshow(diff_rad, cmap="hot", vmin=0, vmax=z_max - z_min)
+            mse, r2, fss, csi, pod, far = _compute_ae_metrics(
+                orig_rad, recon_rad, _rad_thrs, _scales, _rad_thr35)
+            axes[0, 1].text(
+                0.01, 0.97, _metrics_text(mse, r2, fss, csi, pod, far),
+                transform=axes[0, 1].transAxes, ha='left', va='top',
+                fontsize=7, color='white', fontweight='bold',
+            )
             for c in range(3):
                 axes[0, c].axis("off")
                 _add_grid_lines(axes[0, c])
