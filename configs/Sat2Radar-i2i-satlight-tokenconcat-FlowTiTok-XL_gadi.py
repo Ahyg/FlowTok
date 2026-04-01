@@ -96,6 +96,7 @@ def get_config():
     config.losses = d(
         contrastive_loss_weight=0.0,
         kld_loss_weight=0.0,
+        cond_projector_cosine_weight=1.0,
     )
     config.loss_coeffs = []
     config.use_text_vae_encoder = False

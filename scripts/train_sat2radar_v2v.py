@@ -640,7 +640,10 @@ def train(config):
         elif fusion == "concat":
             # concat 模式：通过 cond_projector 将 sat + lgt tokens 投影融合，
             # 输出与 radar_tokens 同形状 [B, T*L, C]
-            return cond_projector(sat_ir_tokens, lgt_tokens)
+            proj_out = cond_projector(sat_ir_tokens, lgt_tokens)
+            # 缓存输入均值，用于 train_step 中计算 cosine similarity 约束
+            cond_projector._cached_input_mean = 0.5 * (sat_ir_tokens + lgt_tokens)
+            return proj_out
         # default: mean
         return 0.5 * (sat_ir_tokens + lgt_tokens)
 
@@ -866,6 +869,28 @@ def train(config):
             metrics["adapter_out_recon_loss"] = accelerator.gather(
                 adapter_out_recon_loss.detach()
             ).mean()
+
+        # ── Cond projector cosine-similarity constraint ──────────────────
+        # Prevents the projector from collapsing towards radar tokens;
+        # keeps its output directionally close to the input sat+lgt tokens.
+        cond_proj_cos_weight = (
+            float(losses_cfg.get("cond_projector_cosine_weight", 0.0))
+            if losses_cfg is not None
+            else 0.0
+        )
+        if cond_projector is not None and cond_proj_cos_weight > 0:
+            cached_mean = getattr(cond_projector, "_cached_input_mean", None)
+            if cached_mean is not None:
+                cos_sim = F.cosine_similarity(sat_tokens, cached_mean, dim=-1)  # [B, T*L]
+                if token_mask is not None:
+                    cond_proj_cos_loss = ((1.0 - cos_sim) * token_mask).sum() / token_mask.sum().clamp_min(1)
+                else:
+                    cond_proj_cos_loss = (1.0 - cos_sim).mean()
+                total_loss = total_loss + cond_proj_cos_weight * cond_proj_cos_loss
+                metrics["cond_proj_cos_loss"] = accelerator.gather(
+                    cond_proj_cos_loss.detach()
+                ).mean()
+                cond_projector._cached_input_mean = None  # clear cache
 
         if (
             debug_enabled
