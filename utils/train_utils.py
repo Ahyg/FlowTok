@@ -1329,6 +1329,19 @@ def train_one_epoch(config, logger, accelerator,
                             "params": _new_params_no_wd, "lr": _enc_lr,
                             "weight_decay": 0.0,
                         })
+                    # Sync lr_scheduler internals with the new param groups.
+                    # LambdaLR uses zip(lr_lambdas, base_lrs, strict=True) in get_lr(),
+                    # and _update_lr uses zip(param_groups, values, strict=True).
+                    # All three lists must stay the same length.
+                    _sched = getattr(lr_scheduler, "scheduler", lr_scheduler)
+                    n_new = bool(_new_params_wd) + bool(_new_params_no_wd)
+                    if hasattr(_sched, "base_lrs"):
+                        _sched.base_lrs.extend([_enc_lr] * n_new)
+                    if hasattr(_sched, "lr_lambdas"):
+                        # Reuse the first lambda (same schedule shape, LR controlled by base_lr)
+                        _sched.lr_lambdas.extend([_sched.lr_lambdas[0]] * n_new)
+                    if hasattr(_sched, "_last_lr"):
+                        _sched._last_lr.extend([_enc_lr] * n_new)
                     logger.info(
                         f"Added {len(_new_params_wd)+len(_new_params_no_wd)} encoder params "
                         f"to optimizer with lr={_enc_lr}"

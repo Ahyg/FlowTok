@@ -417,7 +417,7 @@ def main():
         "avg_ssim": avg_ssim,
         "avg_fss": avg_fss,
         "num_samples": int(mse_count),
-        "fss_thresholds": thrs,
+        "fss_thresholds": thrs_dbz,
         "fss_scales": scales,
         "fss_method": "pysteps_accumulated" if (pysteps_fss_objects or pysteps_fss_ir or pysteps_fss_lightning) else "none",
     }

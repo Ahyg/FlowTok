@@ -49,7 +49,7 @@ def get_config():
         n_steps=5000,
         batch_size=16,
         log_interval=50,
-        eval_interval=5000,
+        eval_interval=500,
         save_interval=1000,
         n_samples_eval=4,
         val_max_batches=4,
