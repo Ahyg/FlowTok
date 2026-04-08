@@ -26,7 +26,6 @@ model:
     is_legacy: false
 
 losses:
-  reconstruction_only_steps: 200000
   discriminator_start: 400000
   quantizer_weight: 1.0
   discriminator_factor: 1.0

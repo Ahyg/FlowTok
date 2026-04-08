@@ -19,6 +19,9 @@ model = Args(
     cfg_indicator=0.10,
     noising_type="none",
     noising_scale=0.1,
+    # Enable learnable temperature for contrastive alignment loss (L_align).
+    # Required when contrastive_loss_weight > 0 to avoid NoneType error.
+    use_t2t_temperature=True,
     textVAE=Args(
         num_blocks=6,
         hidden_dim=256,
@@ -93,19 +96,20 @@ def get_config():
         model_args=model,
     )
 
+    # ── Key change: enable textVAE as "Sat Token Projector" ──
+    # Following the FlowTok paper (Sec 4.1), the source tokens (sat_tokens)
+    # are projected through context_encoder (6 Transformer blocks) with
+    # KLD regularization + contrastive alignment loss before flow matching.
     config.losses = d(
-        contrastive_loss_weight=0.0,
-        kld_loss_weight=0.0,
-        cond_projector_cosine_weight=1.0,
-        cond_projector_kld_weight=1e-4,
+        contrastive_loss_weight=1.0,   # L_align: preserve semantic info
+        kld_loss_weight=1e-4,          # L_kld: regularize toward N(0,1)
     )
     config.loss_coeffs = []
-    config.use_text_vae_encoder = False
+    config.use_text_vae_encoder = True   # enable context_encoder projector
 
-    # sat IR + lightning token fusion: concat mode (via CondTokenProjector)
+    # sat IR + lightning token fusion for i2i
     config.cond_use_sat_lightning_tokens = True
-    config.cond_token_fusion = "concat"
-    config.cond_projector_reparameterize = True
+    config.cond_token_fusion = "mean"
 
     config.dataset = d(
         filelist_path="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202312_ct005.pkl",
@@ -124,7 +128,7 @@ def get_config():
         ),
     )
 
-    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_run_i2i_satlight_tokenconcat"
+    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_run_i2i_satlight_tokenfusion_textVAE"
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"
 
@@ -137,22 +141,8 @@ def get_config():
         path=config.sample_dir + "/samples_eval",
     )
 
-    config.adapter_in_satellite = d(
-        enabled=False,
-        in_channels=4,
-        mid_channels=32,
-        num_blocks=3,
-    )
-    config.adapter_in_radar = d(
-        enabled=False,
-        in_channels=1,
-        mid_channels=16,
-        num_blocks=2,
-    )
-    config.adapter_out = d(
-        enabled=False,
-        mid_channels=16,
-        num_blocks=2,
-    )
+    config.adapter_in_satellite = d(enabled=False)
+    config.adapter_in_radar = d(enabled=False)
+    config.adapter_out = d(enabled=False)
 
     return config

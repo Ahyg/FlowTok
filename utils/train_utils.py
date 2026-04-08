@@ -358,51 +358,61 @@ def _create_finetune_optimizer(config, logger, model, optimizer_cls,
                                optimizer_config, base_lr):
     """Build optimizer with differential LR for finetune mode.
 
-    Three logical groups (each split into weight-decay / no-weight-decay):
-      1. high_lr: encoder trainable layers (patch_embed) + decoder new layers (ffn, conv_out)
-      2. low_lr:  all other trainable decoder parameters (pretrained transformer, etc.)
+    Four logical groups (each split into weight-decay / no-weight-decay):
+      1. dec_high_lr:  decoder new layers (ffn, conv_out) — base_lr
+      2. dec_low_lr:   decoder pretrained layers — base_lr * decoder_pretrained_lr_scale
+      3. enc_lr:       encoder layers (when unfrozen) — base_lr * encoder_lr_scale
+      4. toplevel_lr:  top-level params (latent_tokens etc.) — same as enc_lr
     """
     finetune_cfg = config.finetune
-    lr_scale = finetune_cfg.get("decoder_pretrained_lr_scale", 0.1)
-    low_lr = base_lr * lr_scale
+    dec_lr_scale = finetune_cfg.get("decoder_pretrained_lr_scale", 0.1)
+    enc_lr_scale = finetune_cfg.get("encoder_lr_scale", dec_lr_scale)
+    dec_low_lr = base_lr * dec_lr_scale
+    enc_lr = base_lr * enc_lr_scale
 
     enc_trainable_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
     dec_new_prefixes = list(finetune_cfg.get("decoder_new_layer_prefixes", []))
-    high_lr_prefixes = enc_trainable_prefixes + dec_new_prefixes
 
-    high_lr_wd, high_lr_no_wd = [], []
-    low_lr_wd, low_lr_no_wd = [], []
+    dec_high_wd, dec_high_no_wd = [], []
+    dec_low_wd, dec_low_no_wd = [], []
+    enc_wd, enc_no_wd = [], []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_high_lr = any(name.startswith(p) for p in high_lr_prefixes)
         is_no_wd = _is_no_weight_decay(name, param)
 
-        if is_high_lr:
-            (high_lr_no_wd if is_no_wd else high_lr_wd).append(param)
+        if name.startswith("encoder."):
+            (enc_no_wd if is_no_wd else enc_wd).append(param)
+        elif name.startswith("decoder."):
+            is_new = any(name.startswith(p) for p in dec_new_prefixes)
+            if is_new:
+                (dec_high_no_wd if is_no_wd else dec_high_wd).append(param)
+            else:
+                (dec_low_no_wd if is_no_wd else dec_low_wd).append(param)
         else:
-            (low_lr_no_wd if is_no_wd else low_lr_wd).append(param)
+            # Top-level params (latent_tokens, etc.) — use encoder LR
+            (enc_no_wd if is_no_wd else enc_wd).append(param)
 
     param_groups = []
-    if high_lr_wd:
-        param_groups.append({"params": high_lr_wd, "lr": base_lr,
-                             "weight_decay": optimizer_config.weight_decay})
-    if high_lr_no_wd:
-        param_groups.append({"params": high_lr_no_wd, "lr": base_lr,
-                             "weight_decay": 0.0})
-    if low_lr_wd:
-        param_groups.append({"params": low_lr_wd, "lr": low_lr,
-                             "weight_decay": optimizer_config.weight_decay})
-    if low_lr_no_wd:
-        param_groups.append({"params": low_lr_no_wd, "lr": low_lr,
-                             "weight_decay": 0.0})
+    wd = optimizer_config.weight_decay
+    for params, lr, use_wd in [
+        (dec_high_wd, base_lr, wd), (dec_high_no_wd, base_lr, 0.0),
+        (dec_low_wd, dec_low_lr, wd), (dec_low_no_wd, dec_low_lr, 0.0),
+        (enc_wd, enc_lr, wd), (enc_no_wd, enc_lr, 0.0),
+    ]:
+        if params:
+            param_groups.append({"params": params, "lr": lr, "weight_decay": use_wd})
 
     total_trainable = sum(len(g["params"]) for g in param_groups)
+    n_enc = len(enc_wd) + len(enc_no_wd)
+    n_dec_high = len(dec_high_wd) + len(dec_high_no_wd)
+    n_dec_low = len(dec_low_wd) + len(dec_low_no_wd)
     logger.info(
-        f"Finetune optimizer: {total_trainable} trainable param tensors, "
-        f"high_lr={base_lr} ({len(high_lr_wd)}+{len(high_lr_no_wd)} tensors), "
-        f"low_lr={low_lr} ({len(low_lr_wd)}+{len(low_lr_no_wd)} tensors)"
+        f"Finetune optimizer: {total_trainable} trainable param tensors — "
+        f"dec_new(lr={base_lr}): {n_dec_high}, "
+        f"dec_pretrained(lr={dec_low_lr}): {n_dec_low}, "
+        f"encoder+toplevel(lr={enc_lr}): {n_enc}"
     )
 
     return optimizer_cls(
@@ -512,9 +522,10 @@ def _release_decoder_warmup_freeze(config, logger, model):
         f"{toplevel_released} top-level params unfrozen (e.g. latent_tokens)"
     )
 
-    # Stage-2: freeze encoder trainable layers (e.g. patch_embed) so only decoder is fine-tuned.
+    # Stage-2: either freeze or unfreeze the encoder.
     freeze_enc_after = finetune_cfg.get("freeze_encoder_after_warmup", True)
     if freeze_enc_after:
+        # Original behavior: freeze encoder trainable layers (e.g. patch_embed).
         enc_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
         frozen_enc = 0
         for name, param in model.named_parameters():
@@ -525,6 +536,19 @@ def _release_decoder_warmup_freeze(config, logger, model):
                 frozen_enc += 1
         logger.info(
             f"Stage-2: froze {frozen_enc} encoder params (prefixes: {enc_prefixes})"
+        )
+    else:
+        # Direction B: unfreeze ALL encoder params for full-model finetuning.
+        unfrozen_enc = 0
+        for name, param in model.named_parameters():
+            if not name.startswith("encoder."):
+                continue
+            if not param.requires_grad:
+                param.requires_grad = True
+                unfrozen_enc += 1
+        logger.info(
+            f"Stage-2: unfroze {unfrozen_enc} encoder params for full-model finetuning "
+            f"(encoder_lr_scale={finetune_cfg.get('encoder_lr_scale', 'default')})"
         )
 
 
@@ -892,6 +916,9 @@ def train_one_epoch(config, logger, accelerator,
     """One epoch training."""
     batch_time_meter = AverageMeter()
     data_time_meter = AverageMeter()
+    _walltime_start = float(os.environ.get("TRAINING_START_TIME", time.time()))
+    _walltime_budget = float(os.environ.get("TRAINING_WALLTIME_SEC", 0))
+    _initial_step = global_step
     end = time.time()
 
     model.train()
@@ -907,8 +934,7 @@ def train_one_epoch(config, logger, accelerator,
         _apply_decoder_warmup_freeze(config, logger, accelerator.unwrap_model(model))
     elif _finetune_enabled and _decoder_warmup_steps > 0:
         # Resumed past warmup: re-apply stage-2 freeze (patch_embed frozen, decoder fully trainable).
-        # _release_decoder_warmup_freeze is not called again on resume, so we must replicate
-        # the encoder freeze portion here to restore the correct stage-2 state.
+        # latent_tokens stays frozen (same as original TiTok stage-2 design).
         freeze_enc_after = finetune_cfg.get("freeze_encoder_after_warmup", True)
         if freeze_enc_after:
             enc_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
@@ -1169,6 +1195,23 @@ def train_one_epoch(config, logger, accelerator,
                 # Wait for everyone to save their checkpoint.
                 accelerator.wait_for_everyone()
 
+                # Walltime-aware early stop: estimate if we can reach the next
+                # save point; if not, stop now so resume has zero overlap.
+                if _walltime_budget > 0 and (global_step + 1) < config.training.max_train_steps:
+                    _elapsed = time.time() - _walltime_start
+                    _steps_done = (global_step + 1) - _initial_step
+                    _sec_per_step = _elapsed / max(_steps_done, 1)
+                    _time_for_next_save = config.experiment.save_every * _sec_per_step
+                    _remaining = _walltime_budget - _elapsed
+                    if _remaining < _time_for_next_save * 1.1:
+                        logger.info(
+                            f"[WALLTIME] Elapsed {_elapsed/3600:.1f}h, "
+                            f"remaining {_remaining/3600:.1f}h, "
+                            f"next save needs ~{_time_for_next_save/3600:.1f}h. "
+                            f"Stopping at step {global_step + 1} to avoid overlap."
+                        )
+                        return global_step + 1
+
             # Generate images.
             if (global_step + 1) % config.experiment.generate_every == 0 and accelerator.is_main_process:
                 # Store the model parameters temporarily and load the EMA parameters to perform inference.
@@ -1256,6 +1299,40 @@ def train_one_epoch(config, logger, accelerator,
                     config, logger, accelerator.unwrap_model(model)
                 )
                 _in_decoder_warmup = False
+                # If encoder was just unfrozen, add its params to the optimizer.
+                _freeze_enc_after = finetune_cfg.get("freeze_encoder_after_warmup", True) if _finetune_enabled else True
+                if _finetune_enabled and not _freeze_enc_after:
+                    _enc_lr_scale = finetune_cfg.get("encoder_lr_scale", 0.1)
+                    _enc_lr = config.optimizer.params.learning_rate * _enc_lr_scale
+                    _raw_model = accelerator.unwrap_model(model)
+                    _new_params_wd, _new_params_no_wd = [], []
+                    for name, param in _raw_model.named_parameters():
+                        if not param.requires_grad:
+                            continue
+                        # Check if param is already in optimizer
+                        _already_in = any(
+                            param is p for pg in optimizer.param_groups for p in pg["params"]
+                        )
+                        if _already_in:
+                            continue
+                        if _is_no_weight_decay(name, param):
+                            _new_params_no_wd.append(param)
+                        else:
+                            _new_params_wd.append(param)
+                    if _new_params_wd:
+                        optimizer.add_param_group({
+                            "params": _new_params_wd, "lr": _enc_lr,
+                            "weight_decay": config.optimizer.params.weight_decay,
+                        })
+                    if _new_params_no_wd:
+                        optimizer.add_param_group({
+                            "params": _new_params_no_wd, "lr": _enc_lr,
+                            "weight_decay": 0.0,
+                        })
+                    logger.info(
+                        f"Added {len(_new_params_wd)+len(_new_params_no_wd)} encoder params "
+                        f"to optimizer with lr={_enc_lr}"
+                    )
                 logger.info(
                     f"Step {global_step}: decoder warmup ended, "
                     f"switching to full loss and joint fine-tuning."

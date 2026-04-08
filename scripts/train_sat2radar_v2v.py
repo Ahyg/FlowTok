@@ -342,11 +342,16 @@ def train(config):
     # ========= Condition token projector (for concat fusion) =========
     cond_projector = None
     if getattr(config, "cond_token_fusion", "mean") == "concat":
+        _reparam = bool(getattr(config, "cond_projector_reparameterize", False))
         cond_projector = CondTokenProjector(
             token_dim=config.nnet.model_args.channels,
             num_latent_tokens=config.vq_model.num_latent_tokens,
+            reparameterize=_reparam,
         )
-        logging.info("CondTokenProjector created for concat fusion mode")
+        logging.info(
+            f"CondTokenProjector created for concat fusion mode "
+            f"(reparameterize={_reparam})"
+        )
 
     # 将 adapter / cond_projector 参数加入优化器，与主干一起训练
     if adapter_in_satellite is not None:
@@ -485,7 +490,8 @@ def train(config):
 
     sat_autoencoder = FlowTiTok(sat_ae_config)
     sat_autoencoder.load_state_dict(
-        torch.load(config.sat_tokenizer_checkpoint, map_location="cpu")
+        torch.load(config.sat_tokenizer_checkpoint, map_location="cpu"),
+        strict=False,
     )
     sat_autoencoder.eval()
     sat_autoencoder.requires_grad_(False)
@@ -493,7 +499,8 @@ def train(config):
 
     radar_autoencoder = FlowTiTok(radar_ae_config)
     radar_autoencoder.load_state_dict(
-        torch.load(config.radar_tokenizer_checkpoint, map_location="cpu")
+        torch.load(config.radar_tokenizer_checkpoint, map_location="cpu"),
+        strict=False,
     )
     radar_autoencoder.eval()
     radar_autoencoder.requires_grad_(False)
@@ -892,6 +899,27 @@ def train(config):
                 ).mean()
                 cond_projector._cached_input_mean = None  # clear cache
 
+        # ── Cond projector KLD loss (reparameterize mode) ───────────────
+        # Regularise the projector posterior toward N(0,1), similar to textVAE.
+        cond_proj_kld_weight = (
+            float(losses_cfg.get("cond_projector_kld_weight", 0.0))
+            if losses_cfg is not None
+            else 0.0
+        )
+        if (cond_projector is not None
+                and cond_proj_kld_weight > 0
+                and cond_projector.last_mu is not None):
+            _mu = cond_projector.last_mu
+            _logvar = cond_projector.last_logvar
+            # Standard VAE KLD: -0.5 * mean(1 + logvar - mu^2 - exp(logvar))
+            cond_proj_kld = -0.5 * torch.mean(
+                1.0 + _logvar - _mu.pow(2) - _logvar.exp()
+            )
+            total_loss = total_loss + cond_proj_kld_weight * cond_proj_kld
+            metrics["cond_proj_kld"] = accelerator.gather(
+                cond_proj_kld.detach()
+            ).mean()
+
         if (
             debug_enabled
             and accelerator.is_main_process
@@ -1068,7 +1096,7 @@ def train(config):
                 x0 = x0 + torch.randn_like(x0) * config.sample.noise_scale
 
             guidance_scale = config.sample.scale
-            has_null_indicator = True
+            has_null_indicator = guidance_scale > 1.0
 
             ode_solver = ODEEulerFlowMatchingSolver(
                 nnet_ema_local,

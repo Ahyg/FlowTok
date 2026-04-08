@@ -384,14 +384,16 @@ def main():
 
     sat_autoencoder = FlowTiTok(sat_ae_config).to(device)
     sat_autoencoder.load_state_dict(
-        torch.load(config.sat_tokenizer_checkpoint, map_location="cpu")
+        torch.load(config.sat_tokenizer_checkpoint, map_location="cpu"),
+        strict=False,
     )
     sat_autoencoder.eval()
     sat_autoencoder.requires_grad_(False)
 
     radar_autoencoder = FlowTiTok(radar_ae_config).to(device)
     radar_autoencoder.load_state_dict(
-        torch.load(config.radar_tokenizer_checkpoint, map_location="cpu")
+        torch.load(config.radar_tokenizer_checkpoint, map_location="cpu"),
+        strict=False,
     )
     radar_autoencoder.eval()
     radar_autoencoder.requires_grad_(False)

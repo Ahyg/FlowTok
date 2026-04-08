@@ -196,6 +196,6 @@ class Solver:
             assert unconditional_guidance_scale > 1
             return _uncond + unconditional_guidance_scale * (_cond - _uncond)
         else:
-            _cond = self.model(x)[-1]
+            _cond = self.model(x, t=t_continuous, null_indicator=torch.tensor([False] * x.shape[0]).to(x.device))[-1]
             return _cond
 
