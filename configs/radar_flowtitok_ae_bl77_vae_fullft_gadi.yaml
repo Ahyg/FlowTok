@@ -1,7 +1,7 @@
 experiment:
-  project: radar_flowtitok_ae_bl77_vae_scratch
-  name: radar_flowtitok_ae_bl77_vae_scratch_run2_gadi
-  output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl77_vae_scratch_run2_gadi
+  project: radar_flowtitok_ae_bl77_vae_fullft
+  name: radar_flowtitok_ae_bl77_vae_fullft_gadi
+  output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl77_vae_fullft_gadi
   max_train_examples: 250000
   save_every: 50000
   eval_every: 10000
@@ -9,7 +9,7 @@ experiment:
   log_every: 1000
   log_grad_norm_every: 1000
   resume: true
-  logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl77_vae_scratch_run2_gadi/logs
+  logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl77_vae_fullft_gadi/logs
 
 model:
   vq_model:
@@ -69,8 +69,19 @@ lr_scheduler:
     end_lr: 1.0e-05
 
 finetune:
-  enabled: false
+  enabled: true
+  pretrained_weight: /g/data/kl02/yh0308/Data/flowtok_ckpts/FlowTiTok_512.bin
+  freeze_encoder: true
+  encoder_trainable_prefixes:
+    - encoder.patch_embed
+  decoder_pretrained_lr_scale: 0.1
+  decoder_new_layer_prefixes:
+    - decoder.ffn
+    - decoder.conv_out
   text_guidance_from_filename: true
+  decoder_warmup_steps: 10000
+  freeze_encoder_after_warmup: false
+  encoder_lr_scale: 0.1
 
 training:
   gradient_accumulation_steps: 1

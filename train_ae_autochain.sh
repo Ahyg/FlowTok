@@ -91,8 +91,10 @@ echo "=== $(date) === Latest checkpoint step: ${LATEST_STEP} / ${AE_MAX_STEP}" >
 
 if (( LATEST_STEP >= AE_MAX_STEP )); then
   echo "=== Training complete (step ${LATEST_STEP} >= ${AE_MAX_STEP}). No resubmit. ===" >&2
+elif (( LATEST_STEP == 0 )); then
+  echo "=== No checkpoint produced (step 0). Likely a config/code error. NOT resubmitting. ===" >&2
 else
-  echo "=== Training incomplete. Resubmitting... ===" >&2
+  echo "=== Training incomplete (step ${LATEST_STEP} < ${AE_MAX_STEP}). Resubmitting... ===" >&2
   cd "${FLOWTOK_ROOT}"
   qsub -N "${PBS_JOBNAME}" \
        -v "AE_CONFIG=${AE_CONFIG},AE_MAX_STEP=${AE_MAX_STEP}" \

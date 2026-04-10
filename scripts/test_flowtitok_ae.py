@@ -27,7 +27,11 @@ if ROOT_DIR not in sys.path:
 
 from data.dataset import SatelliteRadarNpyDataset
 from libs.flowtitok import FlowTiTok
-from utils.train_utils import _build_flowtitok_config
+from utils.train_utils import (
+    _build_flowtitok_config,
+    create_clip_model,
+    _encode_text_with_clip,
+)
 
 
 def _cmap_or_fallback(name, fallback="viridis"):
@@ -232,6 +236,22 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # ── CLIP text guidance (must match training) ──────────────────────
+    clip_encoder, clip_tokenizer = create_clip_model()
+    clip_encoder = clip_encoder.to(device)
+    mode = ds_cfg.get("mode", "satellite")
+
+    def _build_text_guidance(paths, batch_size):
+        """Build CLIP text guidance from file paths, matching training."""
+        texts = []
+        for p in paths:
+            fname = os.path.basename(str(p))
+            if mode == "radar":
+                texts.append(f"A radar reflectivity image from {fname}.")
+            else:
+                texts.append(f"A multispectral satellite infrared and lightning image from {fname}.")
+        return _encode_text_with_clip(texts, clip_tokenizer, clip_encoder, device)
+
     thrs_dbz = _parse_csv_numbers(args.fss_thresholds, cast=float)
     scales = _parse_csv_numbers(args.fss_scales, cast=int)
     fss_mode = ds_cfg.get("mode", "satellite")
@@ -280,14 +300,7 @@ def main():
         images = batch["image"].to(device)
         paths = batch.get("path", [f"sample_{b_idx}_{i}" for i in range(images.shape[0])])
 
-        # FlowTiTok uses zero text guidance.
-        text_guidance = torch.zeros(
-            images.shape[0],
-            config.model.vq_model.get("text_context_length", 77),
-            config.model.vq_model.get("text_embed_dim", 768),
-            device=device,
-            dtype=images.dtype,
-        )
+        text_guidance = _build_text_guidance(paths, images.shape[0])
 
         recon, _ = model(images, text_guidance)
         recon = torch.clamp(recon, 0.0, 1.0)

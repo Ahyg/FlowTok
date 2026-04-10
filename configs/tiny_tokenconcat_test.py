@@ -96,16 +96,15 @@ def get_config():
     config.losses = d(
         contrastive_loss_weight=0.0,
         kld_loss_weight=0.0,
-        cond_projector_cosine_weight=1.0,
+        cond_projector_contrastive_weight=1.0,
         cond_projector_kld_weight=1e-4,
     )
     config.loss_coeffs = []
     config.use_text_vae_encoder = False
 
-    # concat fusion with reparameterization
+    # concat fusion (textVAE design: encoder + projector + contrastive)
     config.cond_use_sat_lightning_tokens = True
     config.cond_token_fusion = "concat"
-    config.cond_projector_reparameterize = True
 
     config.dataset = d(
         filelist_path="/scratch/kl02/yh0308/Projv2v/FlowTok/configs/tiny_filelist_16samples.pkl",
@@ -124,7 +123,7 @@ def get_config():
         ),
     )
 
-    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/tiny_tokenconcat_reparam"
+    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/tiny_tokenconcat_reparam_v5"
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"
 

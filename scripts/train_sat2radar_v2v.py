@@ -342,16 +342,17 @@ def train(config):
     # ========= Condition token projector (for concat fusion) =========
     cond_projector = None
     if getattr(config, "cond_token_fusion", "mean") == "concat":
-        _reparam = bool(getattr(config, "cond_projector_reparameterize", False))
+        # Mirror textVAE architecture: FlowEncoder + projector + contrastive loss.
+        _tvae = config.nnet.model_args.textVAE
         cond_projector = CondTokenProjector(
             token_dim=config.nnet.model_args.channels,
             num_latent_tokens=config.vq_model.num_latent_tokens,
-            reparameterize=_reparam,
+            num_blocks=getattr(_tvae, "num_blocks", 6),
+            num_attention_heads=getattr(_tvae, "num_attention_heads", 4),
+            d_ff=getattr(_tvae, "hidden_dim", 256),
+            dropout=getattr(_tvae, "dropout_prob", 0.1),
         )
-        logging.info(
-            f"CondTokenProjector created for concat fusion mode "
-            f"(reparameterize={_reparam})"
-        )
+        logging.info("CondTokenProjector created for concat fusion mode (textVAE design)")
 
     # 将 adapter / cond_projector 参数加入优化器，与主干一起训练
     if adapter_in_satellite is not None:
@@ -596,7 +597,8 @@ def train(config):
                 has_grad = True
         return float(grad_sq**0.5) if has_grad else 0.0
 
-    def build_condition_tokens_from_sat_video(sat_video, require_grad=False):
+    def build_condition_tokens_from_sat_video(sat_video, require_grad=False,
+                                                 deterministic=False):
         """
         Build condition tokens for FlowMatching.
 
@@ -647,9 +649,9 @@ def train(config):
         elif fusion == "concat":
             # concat 模式：通过 cond_projector 将 sat + lgt tokens 投影融合，
             # 输出与 radar_tokens 同形状 [B, T*L, C]
-            proj_out = cond_projector(sat_ir_tokens, lgt_tokens)
-            # 缓存输入均值，用于 train_step 中计算 cosine similarity 约束
-            cond_projector._cached_input_mean = 0.5 * (sat_ir_tokens + lgt_tokens)
+            proj_out = cond_projector(sat_ir_tokens, lgt_tokens,
+                                     deterministic=deterministic)
+            # last_direct is cached inside cond_projector.forward()
             return proj_out
         # default: mean
         return 0.5 * (sat_ir_tokens + lgt_tokens)
@@ -877,27 +879,39 @@ def train(config):
                 adapter_out_recon_loss.detach()
             ).mean()
 
-        # ── Cond projector cosine-similarity constraint ──────────────────
-        # Prevents the projector from collapsing towards radar tokens;
-        # keeps its output directionally close to the input sat+lgt tokens.
-        cond_proj_cos_weight = (
-            float(losses_cfg.get("cond_projector_cosine_weight", 0.0))
+        # ── Cond projector contrastive loss (= textVAE L_align) ─────────
+        # CLIP-style batch contrastive loss between encoder output (sat_tokens)
+        # and projector output, with learnable temperature.  Identical to
+        # the contrastive loss in flow_matching.py for textVAE.
+        cond_proj_contrastive_weight = (
+            float(losses_cfg.get("cond_projector_contrastive_weight", 0.0))
             if losses_cfg is not None
             else 0.0
         )
-        if cond_projector is not None and cond_proj_cos_weight > 0:
-            cached_mean = getattr(cond_projector, "_cached_input_mean", None)
-            if cached_mean is not None:
-                cos_sim = F.cosine_similarity(sat_tokens, cached_mean, dim=-1)  # [B, T*L]
-                if token_mask is not None:
-                    cond_proj_cos_loss = ((1.0 - cos_sim) * token_mask).sum() / token_mask.sum().clamp_min(1)
-                else:
-                    cond_proj_cos_loss = (1.0 - cos_sim).mean()
-                total_loss = total_loss + cond_proj_cos_weight * cond_proj_cos_loss
-                metrics["cond_proj_cos_loss"] = accelerator.gather(
-                    cond_proj_cos_loss.detach()
+        if cond_projector is not None and cond_proj_contrastive_weight > 0:
+            proj_out = getattr(cond_projector, "last_proj", None)
+            if proj_out is not None:
+                B_cp = sat_tokens.shape[0]
+                # Flatten and L2-normalise (same as textVAE)
+                x0_flat = sat_tokens.reshape(B_cp, -1)          # [B, T*L*C]
+                proj_flat = proj_out.reshape(B_cp, -1)           # [B, T*L*C]
+                x0_norm = F.normalize(x0_flat, dim=-1)
+                proj_norm = F.normalize(proj_flat, dim=-1)
+
+                logit_scale = cond_projector.t2t_temperature.exp()
+                logits_per_x0 = logit_scale * x0_norm @ proj_norm.T    # [B, B]
+                logits_per_proj = logit_scale * proj_norm @ x0_norm.T  # [B, B]
+
+                targets = torch.arange(B_cp, device=sat_tokens.device)
+                cond_proj_contrastive = (
+                    F.cross_entropy(logits_per_x0, targets)
+                    + F.cross_entropy(logits_per_proj, targets)
+                ) / 2
+                total_loss = total_loss + cond_proj_contrastive_weight * cond_proj_contrastive
+                metrics["cond_proj_contrastive"] = accelerator.gather(
+                    cond_proj_contrastive.detach()
                 ).mean()
-                cond_projector._cached_input_mean = None  # clear cache
+                cond_projector.last_proj = None  # clear cache
 
         # ── Cond projector KLD loss (reparameterize mode) ───────────────
         # Regularise the projector posterior toward N(0,1), similar to textVAE.
@@ -911,9 +925,9 @@ def train(config):
                 and cond_projector.last_mu is not None):
             _mu = cond_projector.last_mu
             _logvar = cond_projector.last_logvar
-            # Standard VAE KLD: -0.5 * mean(1 + logvar - mu^2 - exp(logvar))
-            cond_proj_kld = -0.5 * torch.mean(
-                1.0 + _logvar - _mu.pow(2) - _logvar.exp()
+            # KLD matching textVAE: soft mu penalty (0.3*mu)^6 + sum reduction
+            cond_proj_kld = -0.5 * torch.sum(
+                1.0 + _logvar - (0.3 * _mu).pow(6) - _logvar.exp()
             )
             total_loss = total_loss + cond_proj_kld_weight * cond_proj_kld
             metrics["cond_proj_kld"] = accelerator.gather(
@@ -1079,13 +1093,13 @@ def train(config):
             )
             B = sat_video.shape[0]
             sat_tokens = build_condition_tokens_from_sat_video(
-                sat_video, require_grad=False
-            )  # [B, L, C]
+                sat_video, require_grad=False, deterministic=True,
+            )  # [B, L, C]  — deterministic: use mu (no sampling noise)
 
             # 采样阶段与训练阶段保持一致：
             # - 默认：使用 textVAE，对 sat_tokens 做编码得到 x0 作为 flow 起点；
             # - 可选（config.use_text_vae_encoder == False）：直接使用 sat_tokens 作为起点，实现
-            #   “从卫星 tokens → 雷达 tokens” 的显式 flow，而不经过 textVAE。
+            #   "从卫星 tokens → 雷达 tokens" 的显式 flow，而不经过 textVAE。
             use_text_vae_encoder = getattr(config, "use_text_vae_encoder", True)
             if use_text_vae_encoder:
                 x0, _, _ = nnet_ema_local(sat_tokens, text_encoder=True)

@@ -29,7 +29,7 @@ losses:
   discriminator_start: 60000
   quantizer_weight: 1.0
   discriminator_factor: 1.0
-  discriminator_weight: 0.1
+  discriminator_weight: 0.005
   perceptual_loss: lpips-convnext_s-1.0-0.1
   perceptual_weight: 0.01
   reconstruction_loss: l2

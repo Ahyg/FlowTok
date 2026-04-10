@@ -964,12 +964,10 @@ def train_one_epoch(config, logger, accelerator,
                         text_from_fname, clip_tokenizer, clip_encoder, accelerator.device
                     )
             else:
-                text_guidance = torch.zeros(
-                    images.shape[0],
-                    config.model.vq_model.get("text_context_length", 77),
-                    config.model.vq_model.get("text_embed_dim", 768),
-                    device=accelerator.device,
-                    dtype=images.dtype,
+                raise RuntimeError(
+                    "flowtitok model_type requires text_guidance but "
+                    "clip_encoder/clip_tokenizer is None or text_from_fname is None. "
+                    "Ensure CLIP model is loaded and text_guidance_from_filename is set."
                 )
 
         fnames = batch.get("__key__", batch.get("path", [str(i) for i in range(images.shape[0])]))
@@ -1737,12 +1735,10 @@ def eval_reconstruction(
                         text_from_fname, clip_tokenizer, clip_encoder, accelerator.device
                     )
                 else:
-                    text_guidance = torch.zeros(
-                        images.shape[0],
-                        config.model.vq_model.get("text_context_length", 77),
-                        config.model.vq_model.get("text_embed_dim", 768),
-                        device=accelerator.device,
-                        dtype=images.dtype,
+                    raise RuntimeError(
+                        "flowtitok model_type requires text_guidance but "
+                        "clip_encoder/clip_tokenizer is None or text_from_fname is None. "
+                        "Ensure CLIP model is loaded and text_guidance_from_filename is set."
                     )
             reconstructed_images, model_dict = local_model(images, text_guidance)
         else:
