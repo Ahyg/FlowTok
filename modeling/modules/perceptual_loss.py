@@ -61,11 +61,16 @@ def _load_convnext_small_imagenet():
 
 
 class PerceptualLoss(torch.nn.Module):
-    def __init__(self, model_name: str = "convnext_s"):
+    def __init__(self, model_name: str = "convnext_s", per_channel: bool = False):
         """Initializes the PerceptualLoss class.
 
         Args:
             model_name: A string, the name of the perceptual loss model to use.
+            per_channel: If True, run LPIPS/ConvNeXt on each channel independently
+                (replicated to 3-channel grayscale-RGB) and average the losses.
+                If False (default), fall back to the legacy behavior that adapts
+                non-3-channel inputs via replicate (C=1) or channel-drop
+                (C>=7: [0,2,6]; 4<=C<7: [:3]).
 
         Raise:
             ValueError: If the model_name does not contain "lpips" or "convnext_s".
@@ -74,6 +79,7 @@ class PerceptualLoss(torch.nn.Module):
         if ("lpips" not in model_name) and (
             "convnext_s" not in model_name):
             raise ValueError(f"Unsupported Perceptual Loss model name {model_name}")
+        self.per_channel = bool(per_channel)
         self.lpips = None
         self.convnext = None
         self.loss_weight_lpips = None
@@ -136,10 +142,15 @@ class PerceptualLoss(torch.nn.Module):
     def forward(self, input: torch.Tensor, target: torch.Tensor):
         """Computes the perceptual loss.
 
-        Per-channel replicated LPIPS/ConvNeXt: every input channel is replicated to
-        a 3-channel grayscale-RGB tensor, fed through the perceptual backbone, and
-        the per-channel losses are averaged. This ensures all channels receive
-        structural gradients (including sparse channels like lightning).
+        Two modes controlled by ``self.per_channel``:
+          - ``per_channel=True``: every input channel is replicated to a
+            3-channel grayscale-RGB tensor, fed through the perceptual backbone,
+            and the per-channel losses are averaged. All channels (including
+            sparse ones like lightning) receive structural gradients.
+          - ``per_channel=False`` (default, legacy): adapt non-3-channel inputs
+            by replicating (C=1) or channel-dropping (C>=7 -> [0,2,6];
+            4<=C<7 -> [:3]), then run one forward. Preserved to keep
+            reproducibility of experiments trained before the per-channel switch.
 
         Args:
             input: A tensor of shape (B, C, H, W), the input image. Normalized to [0, 1].
@@ -152,16 +163,27 @@ class PerceptualLoss(torch.nn.Module):
         self.eval()
         B, C, H, W = input.shape
 
-        # Single-channel shortcut: replicate once to 3 channels (one forward).
-        if C == 1:
-            return self._compute_loss_3ch(
-                input.repeat(1, 3, 1, 1), target.repeat(1, 3, 1, 1))
+        if self.per_channel:
+            if C == 1:
+                return self._compute_loss_3ch(
+                    input.repeat(1, 3, 1, 1), target.repeat(1, 3, 1, 1))
+            total = None
+            for c in range(C):
+                x = input[:, c:c + 1].repeat(1, 3, 1, 1)
+                y = target[:, c:c + 1].repeat(1, 3, 1, 1)
+                loss_c = self._compute_loss_3ch(x, y)
+                total = loss_c if total is None else total + loss_c
+            return total / float(C)
 
-        # Multi-channel: per-channel replicated LPIPS, averaged.
-        total = None
-        for c in range(C):
-            x = input[:, c:c + 1].repeat(1, 3, 1, 1)
-            y = target[:, c:c + 1].repeat(1, 3, 1, 1)
-            loss_c = self._compute_loss_3ch(x, y)
-            total = loss_c if total is None else total + loss_c
-        return total / float(C)
+        # Legacy path: pre-2026-04 behavior.
+        if C != 3:
+            if C == 1:
+                input = input.repeat(1, 3, 1, 1)
+                target = target.repeat(1, 3, 1, 1)
+            elif C >= 7:
+                input = input[:, [0, 2, 6], ...]
+                target = target[:, [0, 2, 6], ...]
+            else:
+                input = input[:, :3]
+                target = target[:, :3]
+        return self._compute_loss_3ch(input, target)

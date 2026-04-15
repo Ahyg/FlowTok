@@ -32,6 +32,7 @@ losses:
   discriminator_weight: 0.005
   perceptual_loss: lpips-convnext_s-1.0-0.1
   perceptual_weight: 1.0
+  perceptual_per_channel: true
   reconstruction_loss: l2
   reconstruction_weight: 1.0
   lecam_regularization_weight: 0.01

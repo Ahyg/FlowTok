@@ -133,7 +133,9 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             self.ssim_loss = SSIMLoss()
         else:
             self.perceptual_loss = PerceptualLoss(
-                loss_config.perceptual_loss).eval()
+                loss_config.perceptual_loss,
+                per_channel=loss_config.get("perceptual_per_channel", False),
+            ).eval()
             self.ssim_loss = None
         
         self.perceptual_weight = loss_config.perceptual_weight
