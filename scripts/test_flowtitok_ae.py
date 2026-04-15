@@ -291,6 +291,11 @@ def main():
     mse_count = 0
     ssim_total = 0.0
     ssim_count = 0
+    # Per-channel accumulators (initialized on first batch once we know C)
+    per_ch_mse_sum = None     # np.ndarray [C]
+    per_ch_mse_count = None   # np.ndarray [C]
+    per_ch_ssim_sum = None    # np.ndarray [C]
+    per_ch_ssim_count = None  # np.ndarray [C]
 
     for b_idx, batch in enumerate(eval_loader):
         do_metrics = args.max_batches_metrics < 0 or b_idx < args.max_batches_metrics
@@ -310,9 +315,18 @@ def main():
 
         # Metrics (on normalized 0-1)
         if do_metrics:
-            per_channel_mse = torch.mean((recon - images) ** 2, dim=(2, 3))
+            per_channel_mse = torch.mean((recon - images) ** 2, dim=(2, 3))  # [B, C]
             mse_total += per_channel_mse.sum().item()
             mse_count += per_channel_mse.numel()
+
+            C_now = int(per_channel_mse.shape[1])
+            if per_ch_mse_sum is None:
+                per_ch_mse_sum = np.zeros(C_now, dtype=np.float64)
+                per_ch_mse_count = np.zeros(C_now, dtype=np.int64)
+                per_ch_ssim_sum = np.zeros(C_now, dtype=np.float64)
+                per_ch_ssim_count = np.zeros(C_now, dtype=np.int64)
+            per_ch_mse_sum += per_channel_mse.sum(dim=0).detach().cpu().numpy()
+            per_ch_mse_count += int(per_channel_mse.shape[0])
 
             for i in range(images_cpu.shape[0]):
                 img = images_cpu[i].numpy()
@@ -320,8 +334,12 @@ def main():
 
                 # SSIM + FSS per channel
                 for ch in range(img.shape[0]):
-                    ssim_total += ssim(img[ch], rec[ch], data_range=1.0)
+                    ssim_val = ssim(img[ch], rec[ch], data_range=1.0)
+                    ssim_total += ssim_val
                     ssim_count += 1
+                    if per_ch_ssim_sum is not None and ch < per_ch_ssim_sum.shape[0]:
+                        per_ch_ssim_sum[ch] += ssim_val
+                        per_ch_ssim_count[ch] += 1
 
                     # pysteps accumulated FSS
                     if fss_mode == "radar" and pysteps_fss_objects:
@@ -415,20 +433,45 @@ def main():
     avg_ssim = ssim_total / max(ssim_count, 1)
     # Combine FSS from radar or (IR + lightning) accumulators
     all_fss_vals = []
+    ir_fss_vals = []
+    lgt_fss_vals = []
     if pysteps_fss_objects:
         _, all_fss_vals = _pysteps_fss_compute_avg(pysteps_fss_objects)
     if pysteps_fss_ir:
-        _, v = _pysteps_fss_compute_avg(pysteps_fss_ir)
-        all_fss_vals.extend(v)
+        _, ir_fss_vals = _pysteps_fss_compute_avg(pysteps_fss_ir)
+        all_fss_vals.extend(ir_fss_vals)
     if pysteps_fss_lightning:
-        _, v = _pysteps_fss_compute_avg(pysteps_fss_lightning)
-        all_fss_vals.extend(v)
+        _, lgt_fss_vals = _pysteps_fss_compute_avg(pysteps_fss_lightning)
+        all_fss_vals.extend(lgt_fss_vals)
     avg_fss = float(np.nanmean(all_fss_vals)) if all_fss_vals else 0.0
+
+    # ── Per-channel + excl_lgt breakdown (satellite modes with lightning) ──
+    has_lgt = (fss_mode != "radar") and bool(ds_cfg.get("use_lightning", True))
+    per_channel_mse_avg = []
+    per_channel_ssim_avg = []
+    if per_ch_mse_sum is not None:
+        per_channel_mse_avg = (per_ch_mse_sum / np.maximum(per_ch_mse_count, 1)).tolist()
+        per_channel_ssim_avg = (per_ch_ssim_sum / np.maximum(per_ch_ssim_count, 1)).tolist()
+
+    avg_mse_excl_lgt = None
+    avg_ssim_excl_lgt = None
+    avg_fss_excl_lgt = None
+    if has_lgt and len(per_channel_mse_avg) >= 2:
+        # Lightning is the last channel in satellite datasets when use_lightning=True
+        avg_mse_excl_lgt = float(np.mean(per_channel_mse_avg[:-1]))
+        avg_ssim_excl_lgt = float(np.mean(per_channel_ssim_avg[:-1]))
+        if ir_fss_vals:
+            avg_fss_excl_lgt = float(np.nanmean(ir_fss_vals))
 
     metrics = {
         "avg_mse": avg_mse,
         "avg_ssim": avg_ssim,
         "avg_fss": avg_fss,
+        "avg_mse_excl_lgt": avg_mse_excl_lgt,
+        "avg_ssim_excl_lgt": avg_ssim_excl_lgt,
+        "avg_fss_excl_lgt": avg_fss_excl_lgt,
+        "per_channel_mse": per_channel_mse_avg,
+        "per_channel_ssim": per_channel_ssim_avg,
         "num_samples": int(mse_count),
         "fss_thresholds": thrs_dbz,
         "fss_scales": scales,

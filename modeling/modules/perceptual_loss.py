@@ -102,8 +102,44 @@ class PerceptualLoss(torch.nn.Module):
         for param in self.parameters():
             param.requires_grad = False
     
+    def _compute_loss_3ch(self, input_3ch: torch.Tensor, target_3ch: torch.Tensor):
+        """Compute LPIPS + ConvNeXt loss on a 3-channel tensor [B, 3, H, W]."""
+        loss = 0.
+        num_losses = 0.
+        if self.lpips is not None:
+            lpips_loss = self.lpips(input_3ch, target_3ch)
+            if self.loss_weight_lpips is None:
+                loss = loss + lpips_loss
+                num_losses += 1
+            else:
+                num_losses += self.loss_weight_lpips
+                loss = loss + self.loss_weight_lpips * lpips_loss
+
+        if self.convnext is not None:
+            input_up = torch.nn.functional.interpolate(
+                input_3ch, size=224, mode="bilinear", align_corners=False, antialias=True)
+            target_up = torch.nn.functional.interpolate(
+                target_3ch, size=224, mode="bilinear", align_corners=False, antialias=True)
+            pred_input = self.convnext((input_up - self.imagenet_mean) / self.imagenet_std)
+            pred_target = self.convnext((target_up - self.imagenet_mean) / self.imagenet_std)
+            convnext_loss = torch.nn.functional.mse_loss(
+                pred_input, pred_target, reduction="mean")
+            if self.loss_weight_convnext is None:
+                num_losses += 1
+                loss = loss + convnext_loss
+            else:
+                num_losses += self.loss_weight_convnext
+                loss = loss + self.loss_weight_convnext * convnext_loss
+
+        return loss / num_losses
+
     def forward(self, input: torch.Tensor, target: torch.Tensor):
         """Computes the perceptual loss.
+
+        Per-channel replicated LPIPS/ConvNeXt: every input channel is replicated to
+        a 3-channel grayscale-RGB tensor, fed through the perceptual backbone, and
+        the per-channel losses are averaged. This ensures all channels receive
+        structural gradients (including sparse channels like lightning).
 
         Args:
             input: A tensor of shape (B, C, H, W), the input image. Normalized to [0, 1].
@@ -114,49 +150,18 @@ class PerceptualLoss(torch.nn.Module):
         """
         # Always in eval mode.
         self.eval()
-        # LPIPS/ConvNeXt expect 3 channels; adapt non-RGB inputs.
-        if input.shape[1] != 3:
-            if input.shape[1] == 1:
-                input = input.repeat(1, 3, 1, 1)
-                target = target.repeat(1, 3, 1, 1)
-            elif input.shape[1] >= 7:
-                input = input[:, [0, 2, 6], ...]
-                target = target[:, [0, 2, 6], ...]
-            else:
-                input = input[:, :3]
-                target = target[:, :3]
-        loss = 0.
-        num_losses = 0.
-        lpips_loss = 0.
-        convnext_loss = 0.
-        # Computes LPIPS loss, if available.
-        if self.lpips is not None:
-            lpips_loss = self.lpips(input, target)
-            if self.loss_weight_lpips is None:
-                loss += lpips_loss
-                num_losses += 1
-            else:
-                num_losses += self.loss_weight_lpips
-                loss += self.loss_weight_lpips * lpips_loss
+        B, C, H, W = input.shape
 
-        if self.convnext is not None:
-            # Computes ConvNeXt-s loss, if available.
-            input = torch.nn.functional.interpolate(input, size=224, mode="bilinear", align_corners=False, antialias=True)
-            target = torch.nn.functional.interpolate(target, size=224, mode="bilinear", align_corners=False, antialias=True)
-            pred_input = self.convnext((input - self.imagenet_mean) / self.imagenet_std)
-            pred_target = self.convnext((target - self.imagenet_mean) / self.imagenet_std)
-            convnext_loss = torch.nn.functional.mse_loss(
-                pred_input,
-                pred_target,
-                reduction="mean")
-                
-            if self.loss_weight_convnext is None:
-                num_losses += 1
-                loss += convnext_loss
-            else:
-                num_losses += self.loss_weight_convnext
-                loss += self.loss_weight_convnext * convnext_loss
-        
-        # weighted avg.
-        loss = loss / num_losses
-        return loss
+        # Single-channel shortcut: replicate once to 3 channels (one forward).
+        if C == 1:
+            return self._compute_loss_3ch(
+                input.repeat(1, 3, 1, 1), target.repeat(1, 3, 1, 1))
+
+        # Multi-channel: per-channel replicated LPIPS, averaged.
+        total = None
+        for c in range(C):
+            x = input[:, c:c + 1].repeat(1, 3, 1, 1)
+            y = target[:, c:c + 1].repeat(1, 3, 1, 1)
+            loss_c = self._compute_loss_3ch(x, y)
+            total = loss_c if total is None else total + loss_c
+        return total / float(C)

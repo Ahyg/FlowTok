@@ -1,0 +1,87 @@
+experiment:
+  project: sat10ch_flowtitok_ae_bl77_vae_scratch
+  name: sat10ch_flowtitok_ae_bl77_vae_scratch_run1_gadi
+  output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/sat10ch_flowtitok_ae_bl77_vae_scratch_run1_gadi
+  max_train_examples: 250000
+  save_every: 50000
+  eval_every: 10000
+  generate_every: 5000
+  log_every: 1000
+  log_grad_norm_every: 1000
+  resume: true
+  logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/sat10ch_flowtitok_ae_bl77_vae_scratch_run1_gadi/logs
+
+model:
+  vq_model:
+    quantize_mode: vae
+    token_size: 16
+    vit_enc_model_size: base
+    vit_dec_model_size: large
+    vit_enc_patch_size: 16
+    vit_dec_patch_size: 16
+    num_latent_tokens: 77
+    in_channels: 11
+    out_channels: 11
+    finetune_decoder: false
+    is_legacy: false
+
+losses:
+  discriminator_start: 400000
+  quantizer_weight: 1.0
+  discriminator_factor: 1.0
+  discriminator_weight: 0.1
+  perceptual_loss: lpips-convnext_s-1.0-0.1
+  perceptual_weight: 1.1
+  reconstruction_loss: l2
+  reconstruction_weight: 1.0
+  lecam_regularization_weight: 0.001
+  kl_weight: 1.0e-06
+  logvar_init: 0.0
+
+dataset:
+  params:
+    filelist_path: /g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202312_ct005.pkl
+    filelist_split: train
+    mode: satellite
+    use_lightning: true
+    num_workers: 4
+  preprocessing:
+    resize_shorter_edge: 128
+    crop_size: 128
+    random_crop: true
+    random_flip: true
+    res_ratio_filtering: true
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 0.0001
+    discriminator_learning_rate: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0001
+
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 10000
+    end_lr: 1.0e-05
+
+finetune:
+  enabled: false
+  text_guidance_from_filename: true
+
+training:
+  gradient_accumulation_steps: 1
+  per_gpu_batch_size: 64
+  mixed_precision: "no"
+  enable_tf32: true
+  enable_wandb: false
+  use_ema: true
+  seed: 42
+  max_train_steps: 200000
+  num_generated_images: 1
+  max_grad_norm: 1.0
+  nan_check: false
+  nan_skip: true
