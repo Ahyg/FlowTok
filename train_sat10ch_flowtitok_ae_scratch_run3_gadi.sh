@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -P kl02
 #PBS -q gpuhopper
-#PBS -l walltime=02:00:00
+#PBS -l walltime=48:00:00
 #PBS -l storage=gdata/kl02+scratch/kl02
 #PBS -l ncpus=12
 #PBS -l ngpus=1
@@ -10,15 +10,9 @@
 #PBS -l wd
 #PBS -M auhuyg@gmail.com
 #PBS -m abe
-
-# Usage:
-#   qsub -N ft_tiny_radar -v AE_CONFIG=radar_flowtitok_ae_bl77_vae_fullft_tiny.yaml tiny_ae_fullft.sh
-#   qsub -N ft_tiny_sat   -v AE_CONFIG=sat_flowtitok_ae_bl77_vae_fullft_tiny.yaml   tiny_ae_fullft.sh
-#   qsub -N ft_tiny_s10   -v AE_CONFIG=sat10ch_flowtitok_ae_bl77_vae_fullft_tiny.yaml tiny_ae_fullft.sh
+#PBS -N AE_sat10_r3_resume
 
 set -euo pipefail
-
-: "${AE_CONFIG:?ERROR: pass -v AE_CONFIG=<yaml>}"
 
 export HF_HOME="/scratch/kl02/$USER/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME"
@@ -33,6 +27,13 @@ export LPIPS_VGG_PTH="${LPIPS_VGG_PTH:-${FLOWTOK_STAGING}/vgg.pth}"
 export VGG16_IMAGENET_PTH="${VGG16_IMAGENET_PTH:-${TORCH_HOME}/hub/checkpoints/vgg16-397923af.pth}"
 export CONVNEXT_SMALL_IMAGENET_PTH="${CONVNEXT_SMALL_IMAGENET_PTH:-${TORCH_HOME}/hub/checkpoints/convnext_small-0c510722.pth}"
 
+echo "HF_HOME=$HF_HOME" >&2
+echo "HF_HUB_OFFLINE=$HF_HUB_OFFLINE" >&2
+echo "OPENCLIP_LOCAL_CKPT=$OPENCLIP_LOCAL_CKPT" >&2
+echo "LPIPS_VGG_PTH=$LPIPS_VGG_PTH" >&2
+echo "VGG16_IMAGENET_PTH=$VGG16_IMAGENET_PTH" >&2
+echo "CONVNEXT_SMALL_IMAGENET_PTH=$CONVNEXT_SMALL_IMAGENET_PTH" >&2
+
 for _req in "$OPENCLIP_LOCAL_CKPT" "$LPIPS_VGG_PTH" "$VGG16_IMAGENET_PTH" "$CONVNEXT_SMALL_IMAGENET_PTH"; do
   if [[ ! -f "$_req" ]]; then
     echo "ERROR: offline job requires this file (stage on login node): $_req" >&2
@@ -44,17 +45,16 @@ source /scratch/kl02/$USER/miniconda3/etc/profile.d/conda.sh
 conda activate 1d-tokenizer
 
 FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
-CONFIG_PATH="${FLOWTOK_ROOT}/configs/${AE_CONFIG}"
+CONFIG_PATH="${FLOWTOK_ROOT}/configs/sat10ch_flowtitok_ae_bl77_vae_scratch_run3_gadi.yaml"
 
 mkdir -p "/scratch/kl02/$USER/Projv2v/job_logs"
 
 cd "${FLOWTOK_ROOT}"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 NUM_PROCESSES=${NUM_PROCESSES:-1}
-export PYTHONUNBUFFERED=1
 
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   scripts/train_flowtitok_ae.py \
   --config="${CONFIG_PATH}" \
-  > "/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_tiny_ft_$(basename ${AE_CONFIG} .yaml).log" 2>&1
+  > "/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_train_sat10ch_flowtitok_ae_scratch_run3_resume.log" 2>&1

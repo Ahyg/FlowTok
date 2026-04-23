@@ -1,12 +1,12 @@
 experiment:
-  project: radar_flowtitok_ae_bl77_vae_fullft_tiny
+  project: radar_flowtitok_ae_bl77_vae_fullft
   name: radar_flowtitok_ae_bl77_vae_fullft_tiny
   output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl77_vae_fullft_tiny
-  max_train_examples: 16
+  max_train_examples: 1000
   save_every: 1000
-  eval_every: 5000
-  generate_every: 500
-  log_every: 1
+  eval_every: 500
+  generate_every: 250
+  log_every: 100
   log_grad_norm_every: 500
   resume: true
   logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl77_vae_fullft_tiny/logs
@@ -26,37 +26,38 @@ model:
     is_legacy: false
 
 losses:
-  discriminator_start: 999999    # disable GAN for tiny test
+  discriminator_start: 2500
   quantizer_weight: 1.0
   discriminator_factor: 1.0
-  discriminator_weight: 0.1
+  discriminator_weight: 0.005
   perceptual_loss: lpips-convnext_s-1.0-0.1
-  perceptual_weight: 0.3         # reduced from 1.1 (ImageNet features less useful for weather data)
+  perceptual_weight: 1.0
+  perceptual_per_channel: true
   reconstruction_loss: l2
   reconstruction_weight: 1.0
-  lecam_regularization_weight: 0.001
-  kl_weight: 1.0e-06
+  lecam_regularization_weight: 0.01
+  kl_weight: 1.0e-05
   logvar_init: 0.0
 
 dataset:
   params:
-    filelist_path: /scratch/kl02/yh0308/Projv2v/FlowTok/configs/tiny_filelist_16samples_ae.pkl
+    filelist_path: /g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202312_ct005.pkl
     filelist_split: train
     mode: radar
     use_lightning: false
-    num_workers: 2
+    num_workers: 4
   preprocessing:
     resize_shorter_edge: 128
     crop_size: 128
-    random_crop: false
-    random_flip: false
+    random_crop: true
+    random_flip: true
     res_ratio_filtering: true
 
 optimizer:
   name: adamw
   params:
-    learning_rate: 0.0001         # decoder new layers + base LR
-    discriminator_learning_rate: 0.0001
+    learning_rate: 0.0001
+    discriminator_learning_rate: 0.00005
     beta1: 0.9
     beta2: 0.999
     weight_decay: 0.0001
@@ -65,26 +66,23 @@ lr_scheduler:
   scheduler: cosine
   params:
     learning_rate: ${optimizer.params.learning_rate}
-    warmup_steps: 200
+    warmup_steps: 500
     end_lr: 1.0e-05
 
-# ── Direction B: progressive unfreezing with discriminative LR ──
 finetune:
   enabled: true
   pretrained_weight: /g/data/kl02/yh0308/Data/flowtok_ckpts/FlowTiTok_512.bin
-  # Phase 1 (0 ~ 500 steps): freeze encoder, warmup decoder
   freeze_encoder: true
   encoder_trainable_prefixes:
     - encoder.patch_embed
-  decoder_pretrained_lr_scale: 0.1    # decoder pretrained layers: 1e-5
+  decoder_pretrained_lr_scale: 0.1
   decoder_new_layer_prefixes:
     - decoder.ffn
     - decoder.conv_out
   text_guidance_from_filename: true
-  decoder_warmup_steps: 500           # short warmup (was 200K)
-  # Phase 2 (500+): unfreeze encoder with low LR
-  freeze_encoder_after_warmup: false  # ← KEY: unfreeze encoder after warmup
-  encoder_lr_scale: 0.1               # encoder LR = 0.1 × 1e-4 = 1e-5
+  decoder_warmup_steps: 500
+  freeze_encoder_after_warmup: false
+  encoder_lr_scale: 0.1
 
 training:
   gradient_accumulation_steps: 1

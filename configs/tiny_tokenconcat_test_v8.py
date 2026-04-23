@@ -9,6 +9,12 @@ class Args:
             setattr(self, key, value)
 
 
+# v8: v7 with two changes
+#   1) sample.cond_deterministic=False  → inference uses reparameterized z
+#      (matches training q(z|x) sampling; v7 used mu which was mismatched).
+#   2) cond_projector_monotonic=True    → projector MLP 32 → 24 → 16
+#      (monotonic decrease, no 512-dim up-projection before reducing).
+
 model = Args(
     learn_sigma=False,
     channels=16,
@@ -16,7 +22,7 @@ model = Args(
     clip_dim=16,
     num_clip_token=77,
     gradient_checking=False,
-    cfg_indicator=0.10,  # 10% CFG dropout (same as full-scale config)
+    cfg_indicator=0.10,
     noising_type="none",
     noising_scale=0.1,
     textVAE=Args(
@@ -107,6 +113,9 @@ def get_config():
     config.cond_use_sat_lightning_tokens = True
     config.cond_token_fusion = "concat"
 
+    # v8 change #1: monotonic projector (2C -> 1.5C -> C, no 512-dim up-projection).
+    config.cond_projector_monotonic = True
+
     config.dataset = d(
         filelist_path="/scratch/kl02/yh0308/Projv2v/FlowTok/configs/tiny_filelist_16samples.pkl",
         filelist_split="train",
@@ -124,16 +133,18 @@ def get_config():
         ),
     )
 
-    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/tiny_tokenconcat_recon_v7"
+    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/tiny_tokenconcat_recon_v8"
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"
 
+    # v8 change #2: inference uses reparameterized z to match training.
     config.sample = d(
         sample_steps=20,
         n_samples=4,
         mini_batch_size=4,
-        scale=2.0,   # CFG guidance scale
+        scale=2.0,
         noise_scale=0.1,
+        cond_deterministic=False,
         path=config.sample_dir + "/samples_eval",
     )
 

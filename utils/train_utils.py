@@ -358,11 +358,16 @@ def _create_finetune_optimizer(config, logger, model, optimizer_cls,
                                optimizer_config, base_lr):
     """Build optimizer with differential LR for finetune mode.
 
-    Four logical groups (each split into weight-decay / no-weight-decay):
+    All params (including currently-frozen ones) are placed in groups upfront
+    so that the number of param groups stays constant across warmup / resume
+    boundaries.  Frozen params (requires_grad=False) simply receive no
+    gradient, so the optimizer step is a no-op for them until they are
+    unfrozen.
+
+    Six potential groups (each split into weight-decay / no-weight-decay):
       1. dec_high_lr:  decoder new layers (ffn, conv_out) — base_lr
       2. dec_low_lr:   decoder pretrained layers — base_lr * decoder_pretrained_lr_scale
-      3. enc_lr:       encoder layers (when unfrozen) — base_lr * encoder_lr_scale
-      4. toplevel_lr:  top-level params (latent_tokens etc.) — same as enc_lr
+      3. enc_lr:       encoder + top-level params — base_lr * encoder_lr_scale
     """
     finetune_cfg = config.finetune
     dec_lr_scale = finetune_cfg.get("decoder_pretrained_lr_scale", 0.1)
@@ -370,7 +375,6 @@ def _create_finetune_optimizer(config, logger, model, optimizer_cls,
     dec_low_lr = base_lr * dec_lr_scale
     enc_lr = base_lr * enc_lr_scale
 
-    enc_trainable_prefixes = list(finetune_cfg.get("encoder_trainable_prefixes", []))
     dec_new_prefixes = list(finetune_cfg.get("decoder_new_layer_prefixes", []))
 
     dec_high_wd, dec_high_no_wd = [], []
@@ -378,8 +382,8 @@ def _create_finetune_optimizer(config, logger, model, optimizer_cls,
     enc_wd, enc_no_wd = [], []
 
     for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
+        # Include ALL params regardless of requires_grad so that param-group
+        # count is identical at save and resume time.
         is_no_wd = _is_no_weight_decay(name, param)
 
         if name.startswith("encoder."):
@@ -404,12 +408,13 @@ def _create_finetune_optimizer(config, logger, model, optimizer_cls,
         if params:
             param_groups.append({"params": params, "lr": lr, "weight_decay": use_wd})
 
-    total_trainable = sum(len(g["params"]) for g in param_groups)
+    n_total = sum(len(g["params"]) for g in param_groups)
+    n_trainable = sum(1 for _, p in model.named_parameters() if p.requires_grad)
     n_enc = len(enc_wd) + len(enc_no_wd)
     n_dec_high = len(dec_high_wd) + len(dec_high_no_wd)
     n_dec_low = len(dec_low_wd) + len(dec_low_no_wd)
     logger.info(
-        f"Finetune optimizer: {total_trainable} trainable param tensors — "
+        f"Finetune optimizer: {n_total} params in optimizer ({n_trainable} currently trainable) — "
         f"dec_new(lr={base_lr}): {n_dec_high}, "
         f"dec_pretrained(lr={dec_low_lr}): {n_dec_low}, "
         f"encoder+toplevel(lr={enc_lr}): {n_enc}"
@@ -918,7 +923,11 @@ def train_one_epoch(config, logger, accelerator,
     data_time_meter = AverageMeter()
     _walltime_start = float(os.environ.get("TRAINING_START_TIME", time.time()))
     _walltime_budget = float(os.environ.get("TRAINING_WALLTIME_SEC", 0))
-    _initial_step = global_step
+    # Persist initial step across epoch calls so walltime sec/step uses
+    # job-level totals instead of per-epoch counts.
+    if "TRAINING_INITIAL_STEP" not in os.environ:
+        os.environ["TRAINING_INITIAL_STEP"] = str(global_step)
+    _initial_step = int(os.environ["TRAINING_INITIAL_STEP"])
     end = time.time()
 
     model.train()
@@ -1297,53 +1306,10 @@ def train_one_epoch(config, logger, accelerator,
                     config, logger, accelerator.unwrap_model(model)
                 )
                 _in_decoder_warmup = False
-                # If encoder was just unfrozen, add its params to the optimizer.
-                _freeze_enc_after = finetune_cfg.get("freeze_encoder_after_warmup", True) if _finetune_enabled else True
-                if _finetune_enabled and not _freeze_enc_after:
-                    _enc_lr_scale = finetune_cfg.get("encoder_lr_scale", 0.1)
-                    _enc_lr = config.optimizer.params.learning_rate * _enc_lr_scale
-                    _raw_model = accelerator.unwrap_model(model)
-                    _new_params_wd, _new_params_no_wd = [], []
-                    for name, param in _raw_model.named_parameters():
-                        if not param.requires_grad:
-                            continue
-                        # Check if param is already in optimizer
-                        _already_in = any(
-                            param is p for pg in optimizer.param_groups for p in pg["params"]
-                        )
-                        if _already_in:
-                            continue
-                        if _is_no_weight_decay(name, param):
-                            _new_params_no_wd.append(param)
-                        else:
-                            _new_params_wd.append(param)
-                    if _new_params_wd:
-                        optimizer.add_param_group({
-                            "params": _new_params_wd, "lr": _enc_lr,
-                            "weight_decay": config.optimizer.params.weight_decay,
-                        })
-                    if _new_params_no_wd:
-                        optimizer.add_param_group({
-                            "params": _new_params_no_wd, "lr": _enc_lr,
-                            "weight_decay": 0.0,
-                        })
-                    # Sync lr_scheduler internals with the new param groups.
-                    # LambdaLR uses zip(lr_lambdas, base_lrs, strict=True) in get_lr(),
-                    # and _update_lr uses zip(param_groups, values, strict=True).
-                    # All three lists must stay the same length.
-                    _sched = getattr(lr_scheduler, "scheduler", lr_scheduler)
-                    n_new = bool(_new_params_wd) + bool(_new_params_no_wd)
-                    if hasattr(_sched, "base_lrs"):
-                        _sched.base_lrs.extend([_enc_lr] * n_new)
-                    if hasattr(_sched, "lr_lambdas"):
-                        # Reuse the first lambda (same schedule shape, LR controlled by base_lr)
-                        _sched.lr_lambdas.extend([_sched.lr_lambdas[0]] * n_new)
-                    if hasattr(_sched, "_last_lr"):
-                        _sched._last_lr.extend([_enc_lr] * n_new)
-                    logger.info(
-                        f"Added {len(_new_params_wd)+len(_new_params_no_wd)} encoder params "
-                        f"to optimizer with lr={_enc_lr}"
-                    )
+                # All param groups already exist in the optimizer (created
+                # upfront in _create_finetune_optimizer).  Unfreezing params
+                # via requires_grad=True is sufficient — the optimizer will
+                # start updating them once they produce gradients.
                 logger.info(
                     f"Step {global_step}: decoder warmup ended, "
                     f"switching to full loss and joint fine-tuning."

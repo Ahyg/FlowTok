@@ -26,16 +26,17 @@ model:
     is_legacy: false
 
 losses:
-  discriminator_start: 60000
+  discriminator_start: 100000
   quantizer_weight: 1.0
   discriminator_factor: 1.0
   discriminator_weight: 0.005
   perceptual_loss: lpips-convnext_s-1.0-0.1
-  perceptual_weight: 0.01
+  perceptual_weight: 1.0
+  perceptual_per_channel: true
   reconstruction_loss: l2
   reconstruction_weight: 1.0
-  lecam_regularization_weight: 0.001
-  kl_weight: 1.0e-04
+  lecam_regularization_weight: 0.01
+  kl_weight: 1.0e-05
   logvar_init: 0.0
 
 dataset:
@@ -56,7 +57,7 @@ optimizer:
   name: adamw
   params:
     learning_rate: 0.0001
-    discriminator_learning_rate: 0.0001
+    discriminator_learning_rate: 0.00005
     beta1: 0.9
     beta2: 0.999
     weight_decay: 0.0001

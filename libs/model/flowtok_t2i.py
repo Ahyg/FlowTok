@@ -167,6 +167,10 @@ class FlowTok(nn.Module):
         # 这里改为在前向时按当前序列长度动态生成 1D sin-cos 位置编码。
         # 保留 num_latent_tokens 仅作为默认长度配置，不再用作严格限制。
         self.pos_embed = None
+        # pos_n_per_frame controls the "tokens per frame" used by the pos embed.
+        # Default = num_latent_tokens (77). seqconcat mode sets it to 2*num_latent_tokens
+        # so spatial_pos distinguishes modalities inside each fat frame.
+        self.pos_n_per_frame = num_latent_tokens
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -256,10 +260,13 @@ class FlowTok(nn.Module):
         For I2I (L=77), temporal is all 0; for V2V (L=T*77), temporal distinguishes frames.
         """
         L = seq_len
-        n_per_frame = self.num_latent_tokens
-        # Within-frame spatial position: 0,1,...,76, 0,1,...,76, ... (same pattern each frame)
+        n_per_frame = getattr(self, "pos_n_per_frame", self.num_latent_tokens)
+        # Within-frame spatial position: 0,1,...,n_per_frame-1 repeated each frame.
+        # In seqconcat mode n_per_frame=2L so the first L positions (0..L-1) label
+        # sat tokens and the second L (L..2L-1) label lgt tokens — modality is
+        # encoded directly in spatial_pos.
         spatial_pos = np.arange(L, dtype=np.float32) % n_per_frame
-        # Frame index: 0,0,...,0, 1,1,...,1, ... (77 same values per frame)
+        # Frame index: 0,0,...,0, 1,1,...,1, ... (n_per_frame same values per frame)
         temporal_pos = (np.arange(L, dtype=np.float32) // n_per_frame)
 
         spatial_embed = get_1d_sincos_pos_embed_from_grid(self.hidden_size // 2, spatial_pos)   # (L, D)

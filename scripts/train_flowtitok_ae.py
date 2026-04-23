@@ -115,8 +115,7 @@ def main():
         ema_model.to(accelerator.device)
 
     total_batch_size_without_accum = config.training.per_gpu_batch_size * accelerator.num_processes
-    num_batches = math.ceil(
-        config.experiment.max_train_examples / total_batch_size_without_accum)
+    num_batches = len(train_dataloader)
     num_update_steps_per_epoch = math.ceil(num_batches / config.training.gradient_accumulation_steps)
     num_train_epochs = math.ceil(config.training.max_train_steps / num_update_steps_per_epoch)
 

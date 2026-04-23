@@ -310,6 +310,15 @@ def train(config):
     # ========= FlowTok backbone & optimizer =========
     train_state = flow_utils.initialize_train_state(config, device)
 
+    # In seqconcat mode each fat frame holds 2*L tokens ([sat|lgt]); tell the
+    # DiT pos embed so spatial_pos spans 0..2L-1 (first L=sat, next L=lgt) and
+    # temporal_pos is aligned between sat_t_i and lgt_t_i.
+    if (getattr(config, "cond_use_sat_lightning_tokens", False)
+            and getattr(config, "cond_token_fusion", "mean") == "seqconcat"):
+        _pos_override = 2 * int(config.vq_model.num_latent_tokens)
+        train_state.nnet.pos_n_per_frame = _pos_override
+        train_state.nnet_ema.pos_n_per_frame = _pos_override
+
     # ========= Lightweight adapters =========
     adapter_in_satellite = None
     adapter_in_radar = None
@@ -351,8 +360,12 @@ def train(config):
             num_attention_heads=getattr(_tvae, "num_attention_heads", 4),
             d_ff=getattr(_tvae, "hidden_dim", 256),
             dropout=getattr(_tvae, "dropout_prob", 0.1),
+            projector_monotonic=bool(getattr(config, "cond_projector_monotonic", False)),
         )
-        logging.info("CondTokenProjector created for concat fusion mode (textVAE design)")
+        logging.info(
+            "CondTokenProjector created for concat fusion mode (textVAE design). "
+            f"projector_monotonic={bool(getattr(config, 'cond_projector_monotonic', False))}"
+        )
 
     # 将 adapter / cond_projector 参数加入优化器，与主干一起训练
     if adapter_in_satellite is not None:
@@ -653,8 +666,61 @@ def train(config):
                                      deterministic=deterministic)
             # last_direct is cached inside cond_projector.forward()
             return proj_out
+        elif fusion == "seqconcat":
+            # Per-frame token-dim concat: each frame becomes [sat(L) | lgt(L)] = 2L tokens.
+            # Output layout [sat_t0, lgt_t0, sat_t1, lgt_t1, ...]; with pos_n_per_frame=2L
+            # the DiT sees T frames where spatial_pos 0..L-1=sat, L..2L-1=lgt and
+            # temporal_pos is aligned between sat_t_i and lgt_t_i.
+            B_, _, C_ = sat_ir_tokens.shape
+            L_ = int(config.vq_model.num_latent_tokens)
+            T_ = sat_ir_tokens.shape[1] // L_
+            sat_frames = sat_ir_tokens.view(B_, T_, L_, C_)
+            lgt_frames = lgt_tokens.view(B_, T_, L_, C_)
+            fused = torch.cat([sat_frames, lgt_frames], dim=2)  # [B, T, 2L, C]
+            return fused.reshape(B_, T_ * 2 * L_, C_)
         # default: mean
         return 0.5 * (sat_ir_tokens + lgt_tokens)
+
+    _cond_is_seqconcat = (
+        getattr(config, "cond_use_sat_lightning_tokens", False)
+        and getattr(config, "cond_token_fusion", "mean") == "seqconcat"
+    )
+
+    def _maybe_pad_for_seqconcat(sat_tokens, radar_tokens, token_mask):
+        """Interleaved seqconcat: each fat frame holds [radar(L) | lgt(L)].
+        Pad radar so the second half of every fat frame carries lgt tokens
+        (identity flow on that half) and include them in the loss so the
+        model is explicitly taught to output ~0 velocity on lgt positions —
+        otherwise those positions drift unsupervised during inference and
+        corrupt the radar prediction via self-attention.
+        """
+        if not _cond_is_seqconcat:
+            return radar_tokens, token_mask
+        L_ = int(config.vq_model.num_latent_tokens)
+        B_, L_full, C_ = sat_tokens.shape
+        assert L_full % (2 * L_) == 0, (
+            f"seqconcat cond length {L_full} not divisible by 2*L={2*L_}"
+        )
+        T_ = L_full // (2 * L_)
+        assert radar_tokens.shape[1] == T_ * L_, (
+            f"radar length {radar_tokens.shape[1]} != T*L={T_*L_}"
+        )
+        sat_view = sat_tokens.view(B_, T_, 2 * L_, C_)
+        lgt_frames = sat_view[:, :, L_:, :]                           # [B, T, L, C]
+        radar_frames = radar_tokens.view(B_, T_, L_, C_)
+        fused = torch.cat([radar_frames, lgt_frames], dim=2)          # [B, T, 2L, C]
+        radar_padded = fused.reshape(B_, T_ * 2 * L_, C_)
+        if token_mask is not None:
+            frame_mask = token_mask.view(B_, T_, L_)
+        else:
+            frame_mask = torch.ones(
+                B_, T_, L_, device=sat_tokens.device, dtype=sat_tokens.dtype,
+            )
+        # Both halves share frame-validity mask; lgt half target velocity ≈0
+        # serves as a free supervision keeping lgt stable during inference.
+        mask_frames = torch.cat([frame_mask, frame_mask.clone()], dim=2)
+        mask_padded = mask_frames.reshape(B_, T_ * 2 * L_)
+        return radar_padded, mask_padded
 
     @torch.no_grad()
     def _val_forward_batch(batch):
@@ -689,6 +755,10 @@ def train(config):
             token_mask = valid_mask.repeat_interleave(num_latent_tokens, dim=1)
         else:
             token_mask = None
+
+        radar_tokens, token_mask = _maybe_pad_for_seqconcat(
+            sat_tokens, radar_tokens, token_mask
+        )
 
         loss, loss_dict = flow_matching_model(
             x=radar_tokens,
@@ -829,6 +899,10 @@ def train(config):
         else:
             token_mask = None
 
+        radar_tokens, token_mask = _maybe_pad_for_seqconcat(
+            sat_tokens, radar_tokens, token_mask
+        )
+
         # x_start = radar tokens, cond = sat tokens
         loss, loss_dict = flow_matching_model(
             x=radar_tokens,
@@ -879,10 +953,7 @@ def train(config):
                 adapter_out_recon_loss.detach()
             ).mean()
 
-        # ── Cond projector contrastive loss (= textVAE L_align) ─────────
-        # CLIP-style batch contrastive loss between encoder output (sat_tokens)
-        # and projector output, with learnable temperature.  Identical to
-        # the contrastive loss in flow_matching.py for textVAE.
+        # ── Cond projector contrastive loss (z ↔ projector) ──────────
         cond_proj_contrastive_weight = (
             float(losses_cfg.get("cond_projector_contrastive_weight", 0.0))
             if losses_cfg is not None
@@ -892,26 +963,25 @@ def train(config):
             proj_out = getattr(cond_projector, "last_proj", None)
             if proj_out is not None:
                 B_cp = sat_tokens.shape[0]
-                # Flatten and L2-normalise (same as textVAE)
-                x0_flat = sat_tokens.reshape(B_cp, -1)          # [B, T*L*C]
-                proj_flat = proj_out.reshape(B_cp, -1)           # [B, T*L*C]
-                x0_norm = F.normalize(x0_flat, dim=-1)
+                z_flat = sat_tokens.reshape(B_cp, -1)
+                proj_flat = proj_out.reshape(B_cp, -1)
+                z_norm = F.normalize(z_flat, dim=-1)
                 proj_norm = F.normalize(proj_flat, dim=-1)
 
                 logit_scale = cond_projector.t2t_temperature.exp()
-                logits_per_x0 = logit_scale * x0_norm @ proj_norm.T    # [B, B]
-                logits_per_proj = logit_scale * proj_norm @ x0_norm.T  # [B, B]
+                logits_z = logit_scale * z_norm @ proj_norm.T
+                logits_p = logit_scale * proj_norm @ z_norm.T
 
                 targets = torch.arange(B_cp, device=sat_tokens.device)
                 cond_proj_contrastive = (
-                    F.cross_entropy(logits_per_x0, targets)
-                    + F.cross_entropy(logits_per_proj, targets)
+                    F.cross_entropy(logits_z, targets)
+                    + F.cross_entropy(logits_p, targets)
                 ) / 2
                 total_loss = total_loss + cond_proj_contrastive_weight * cond_proj_contrastive
                 metrics["cond_proj_contrastive"] = accelerator.gather(
                     cond_proj_contrastive.detach()
                 ).mean()
-                cond_projector.last_proj = None  # clear cache
+                cond_projector.last_proj = None
 
         # ── Cond projector KLD loss (reparameterize mode) ───────────────
         # Regularise the projector posterior toward N(0,1), similar to textVAE.
@@ -933,6 +1003,27 @@ def train(config):
             metrics["cond_proj_kld"] = accelerator.gather(
                 cond_proj_kld.detach()
             ).mean()
+
+        # ── Cond projector reconstruction loss ─────────────────────────
+        # Forces z to encode BOTH sat and lgt information (prevents
+        # pass-through shortcut where encoder just drops lgt channels).
+        cond_proj_recon_weight = (
+            float(losses_cfg.get("cond_projector_recon_weight", 0.0))
+            if losses_cfg is not None
+            else 0.0
+        )
+        if (cond_projector is not None
+                and cond_proj_recon_weight > 0
+                and getattr(cond_projector, "last_recon", None) is not None):
+            cond_proj_recon = F.mse_loss(
+                cond_projector.last_recon, cond_projector.last_input
+            )
+            total_loss = total_loss + cond_proj_recon_weight * cond_proj_recon
+            metrics["cond_proj_recon"] = accelerator.gather(
+                cond_proj_recon.detach()
+            ).mean()
+            cond_projector.last_recon = None
+            cond_projector.last_input = None
 
         if (
             debug_enabled
@@ -1092,9 +1183,19 @@ def train(config):
                 non_blocking=True,
             )
             B = sat_video.shape[0]
+            # deterministic flag controls cond_projector mu vs reparameterized z.
+            # Default True (v7-compatible); set config.sample.cond_deterministic=False
+            # to match training (reparameterized z at inference).
+            sample_cfg = getattr(config, "sample", None)
+            _cond_det = True
+            if sample_cfg is not None:
+                try:
+                    _cond_det = bool(sample_cfg.get("cond_deterministic", True))
+                except Exception:
+                    _cond_det = bool(getattr(sample_cfg, "cond_deterministic", True))
             sat_tokens = build_condition_tokens_from_sat_video(
-                sat_video, require_grad=False, deterministic=True,
-            )  # [B, L, C]  — deterministic: use mu (no sampling noise)
+                sat_video, require_grad=False, deterministic=_cond_det,
+            )  # [B, L, C]
 
             # 采样阶段与训练阶段保持一致：
             # - 默认：使用 textVAE，对 sat_tokens 做编码得到 x0 作为 flow 起点；
@@ -1124,6 +1225,16 @@ def train(config):
                 unconditional_guidance_scale=guidance_scale,
                 has_null_indicator=has_null_indicator,
             )
+            # seqconcat: each fat frame holds [radar(L) | lgt(L)]; extract the
+            # radar half per frame before decoding.
+            if _cond_is_seqconcat:
+                L_ = int(config.vq_model.num_latent_tokens)
+                B_, L_full, C_ = z.shape
+                assert L_full % (2 * L_) == 0
+                T_ = L_full // (2 * L_)
+                z = z.view(B_, T_, 2 * L_, C_)[:, :, :L_, :].reshape(
+                    B_, T_ * L_, C_
+                )
             # z: [B, L, C_tok] -> [B*T, C_tok, 1, L_frame] 再 decode
             # 这里假设 T 与训练时一致，可以由 L 和 num_latent_tokens 反推
             L = z.shape[1]

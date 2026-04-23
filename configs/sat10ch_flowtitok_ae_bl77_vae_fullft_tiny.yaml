@@ -1,15 +1,15 @@
 experiment:
-  project: sat_flowtitok_ae_bl77_vae_fullft
-  name: sat_flowtitok_ae_bl77_vae_fullft_gadi
-  output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/sat_flowtitok_ae_bl77_vae_fullft_gadi
-  max_train_examples: 250000
-  save_every: 50000
-  eval_every: 10000
-  generate_every: 5000
-  log_every: 1000
-  log_grad_norm_every: 1000
+  project: sat10ch_flowtitok_ae_bl77_vae_fullft
+  name: sat10ch_flowtitok_ae_bl77_vae_fullft_tiny
+  output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/sat10ch_flowtitok_ae_bl77_vae_fullft_tiny
+  max_train_examples: 1000
+  save_every: 1000
+  eval_every: 500
+  generate_every: 250
+  log_every: 100
+  log_grad_norm_every: 500
   resume: true
-  logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/sat_flowtitok_ae_bl77_vae_fullft_gadi/logs
+  logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/sat10ch_flowtitok_ae_bl77_vae_fullft_tiny/logs
 
 model:
   vq_model:
@@ -20,13 +20,13 @@ model:
     vit_enc_patch_size: 16
     vit_dec_patch_size: 16
     num_latent_tokens: 77
-    in_channels: 4
-    out_channels: 4
+    in_channels: 11
+    out_channels: 11
     finetune_decoder: false
     is_legacy: false
 
 losses:
-  discriminator_start: 100000
+  discriminator_start: 2500
   quantizer_weight: 1.0
   discriminator_factor: 1.0
   discriminator_weight: 0.005
@@ -44,7 +44,6 @@ dataset:
     filelist_path: /g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202312_ct005.pkl
     filelist_split: train
     mode: satellite
-    ir_band_indices: [0, 2, 6]
     use_lightning: true
     num_workers: 4
   preprocessing:
@@ -67,7 +66,7 @@ lr_scheduler:
   scheduler: cosine
   params:
     learning_rate: ${optimizer.params.learning_rate}
-    warmup_steps: 10000
+    warmup_steps: 500
     end_lr: 1.0e-05
 
 finetune:
@@ -81,19 +80,19 @@ finetune:
     - decoder.ffn
     - decoder.conv_out
   text_guidance_from_filename: true
-  decoder_warmup_steps: 10000
+  decoder_warmup_steps: 500
   freeze_encoder_after_warmup: false
   encoder_lr_scale: 0.1
 
 training:
   gradient_accumulation_steps: 1
-  per_gpu_batch_size: 64
+  per_gpu_batch_size: 16
   mixed_precision: "no"
   enable_tf32: true
   enable_wandb: false
   use_ema: true
   seed: 42
-  max_train_steps: 200000
+  max_train_steps: 5000
   num_generated_images: 1
   max_grad_norm: 1.0
   nan_check: false

@@ -9,6 +9,11 @@ class Args:
             setattr(self, key, value)
 
 
+# Tiny overfit twin #2: seqconcat WITHOUT extra gaussian noise (matches train↔infer).
+# Sat/radar tokens are already reparameterized at AE.encode(); this config turns
+# off the extra x0 noising path at both training and inference — the only
+# randomness comes from reparameterization inside the AE.
+
 model = Args(
     learn_sigma=False,
     channels=16,
@@ -16,19 +21,13 @@ model = Args(
     clip_dim=16,
     num_clip_token=77,
     gradient_checking=False,
-    cfg_indicator=0.10,  # 10% CFG dropout (same as full-scale config)
-    noising_type="none",
-    noising_scale=0.1,
+    cfg_indicator=0.0,
+    noising_type="none",        # ← OFF: no extra noise
+    noising_scale=0.0,
     textVAE=Args(
-        num_blocks=6,
-        hidden_dim=256,
-        num_attention_heads=4,
-        dropout_prob=0.1,
-        clip_loss_weight=0.0,
-        align_quantized=False,
-        use_pretrained=False,
-        tokenizer_checkpoint="",
-        freeze_encoder=False,
+        num_blocks=6, hidden_dim=256, num_attention_heads=4,
+        dropout_prob=0.1, clip_loss_weight=0.0, align_quantized=False,
+        use_pretrained=False, tokenizer_checkpoint="", freeze_encoder=False,
     ),
 )
 
@@ -61,11 +60,7 @@ def get_config():
         weight_decay=0.0,
         betas=(0.9, 0.95),
     )
-
-    config.lr_scheduler = d(
-        name="customized",
-        warmup_steps=200,
-    )
+    config.lr_scheduler = d(name="customized", warmup_steps=200)
 
     config.vq_model = d(
         deterministic=False,
@@ -88,24 +83,14 @@ def get_config():
     config.ae_image_size = 512
 
     global model
-    config.nnet = d(
-        name="flowtok-xl",
-        model_args=model,
-    )
+    config.nnet = d(name="flowtok-xl", model_args=model)
 
-    config.losses = d(
-        contrastive_loss_weight=0.0,
-        kld_loss_weight=0.0,
-        cond_projector_contrastive_weight=1.0,
-        cond_projector_kld_weight=1e-4,
-        cond_projector_recon_weight=1.0,
-    )
+    config.losses = d(contrastive_loss_weight=0.0, kld_loss_weight=0.0)
     config.loss_coeffs = []
     config.use_text_vae_encoder = False
 
-    # concat fusion (textVAE design: encoder + projector + contrastive)
     config.cond_use_sat_lightning_tokens = True
-    config.cond_token_fusion = "concat"
+    config.cond_token_fusion = "seqconcat"
 
     config.dataset = d(
         filelist_path="/scratch/kl02/yh0308/Projv2v/FlowTok/configs/tiny_filelist_16samples.pkl",
@@ -117,14 +102,10 @@ def get_config():
         crop_size=128,
         ir_band_indices=[0, 2, 6],
         use_lightning=True,
-        augment=d(
-            enabled=False,
-            hflip=False,
-            vflip=False,
-        ),
+        augment=d(enabled=False, hflip=False, vflip=False),
     )
 
-    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/tiny_tokenconcat_recon_v7"
+    config.workdir = "/scratch/kl02/yh0308/Projv2v/Experiments/tiny_seqconcat_nonoise_v1"
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"
 
@@ -132,8 +113,8 @@ def get_config():
         sample_steps=20,
         n_samples=4,
         mini_batch_size=4,
-        scale=2.0,   # CFG guidance scale
-        noise_scale=0.1,
+        scale=1.0,
+        noise_scale=0.0,          # unused (noising_type='none' gates this)
         path=config.sample_dir + "/samples_eval",
     )
 
