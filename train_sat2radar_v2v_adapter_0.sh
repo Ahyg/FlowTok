@@ -10,6 +10,7 @@ NUM_PROCESSES=${NUM_PROCESSES:-$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F',' '{pr
 
 cd /mnt/ssd_1/yghu/Code/FlowTok
 
+export PYTHONUNBUFFERED=1
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   --mixed_precision bf16 \

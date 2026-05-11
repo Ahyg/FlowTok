@@ -1,4 +1,6 @@
 import argparse
+import itertools
+import json
 import os
 import sys
 from pathlib import Path
@@ -7,9 +9,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from skimage.metrics import structural_similarity as ssim
+from sklearn.metrics import r2_score as sk_r2
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 from matplotlib import colors as mcolors
 from tqdm import tqdm
 import cmweather
@@ -17,22 +21,36 @@ import cmcrameri
 import open_clip
 
 try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+    print("[WARN] cv2 not available. Sobel gradient metrics will be skipped.")
+
+try:
     import imageio
     HAS_IMAGEIO = True
 except ImportError:
     HAS_IMAGEIO = False
 
-# Import pysteps FSS functions
+# Import pysteps verification functions
 try:
     from pysteps.verification.spatialscores import (
         fss_init,
         fss_accum,
         fss_compute,
     )
+    import pysteps.verification.spatialscores as pvs
+    import pysteps.verification.detcatscores as pvdcat
     PYSTEPS_AVAILABLE = True
 except ImportError:
     PYSTEPS_AVAILABLE = False
-    print("[WARN] pysteps not available. FSS computation will be skipped.")
+    pvs = None
+    pvdcat = None
+    print("[WARN] pysteps not available. FSS / categorical metrics will be skipped.")
+
+# Match Diffi2i: radar pixels < 1 dBZ are masked in visualisations.
+_RADAR_THR_01 = 1.0 / 60.0  # 1 dBZ in [0,1] normalized scale
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -74,32 +92,184 @@ def _save_two_panel(orig_2d, pred_2d, cmap_name, vmin, vmax, out_path):
     plt.imsave(out_path, composite)
 
 
+def _add_grid_lines(ax, color="black"):
+    """Match Diffi2i: dashed gridlines at 25/50/75% of the axes."""
+    for frac in [0.25, 0.5, 0.75]:
+        ax.plot([0, 1], [frac, frac], transform=ax.transAxes,
+                linestyle='--', linewidth=0.8, color=color, alpha=0.5)
+        ax.plot([frac, frac], [0, 1], transform=ax.transAxes,
+                linestyle='--', linewidth=0.8, color=color, alpha=0.5)
+
+
+def _compute_radar_metrics_dbz(gt_01, pred_01):
+    """Match Diffi2i `_compute_radar_metrics`. Per-sample text annotation only.
+
+    Args:
+        gt_01, pred_01: [H, W] arrays in [0,1] normalized radar scale.
+    Returns:
+        (mse, r2, fss, csi35, pod35, far35) computed on the dBZ-rescaled frame.
+    """
+    gt_dbz = (gt_01 * 60.0).astype(np.float32)
+    pred_dbz = (pred_01 * 60.0).astype(np.float32)
+    mse = float(np.mean((pred_dbz - gt_dbz) ** 2))
+    try:
+        r2 = float(sk_r2(gt_dbz.ravel(), pred_dbz.ravel()))
+    except Exception:
+        r2 = float("nan")
+    if PYSTEPS_AVAILABLE:
+        thrs = np.arange(0, 61, 5)
+        scales = np.arange(1, 11)
+        fss_vals = [pvs.fss(pred_dbz, gt_dbz, thr=int(t), scale=int(s))
+                    for t, s in itertools.product(thrs, scales)]
+        fss = float(np.nanmean(fss_vals)) if fss_vals else float("nan")
+        try:
+            csi35 = float(pvdcat.det_cat_fct(pred_dbz, gt_dbz, thr=35,
+                                             scores='CSI', axis=None)["CSI"].item())
+            pod35 = float(pvdcat.det_cat_fct(pred_dbz, gt_dbz, thr=35,
+                                             scores='POD', axis=None)["POD"].item())
+            far35 = float(pvdcat.det_cat_fct(pred_dbz, gt_dbz, thr=35,
+                                             scores='FAR', axis=None)["FAR"].item())
+        except Exception:
+            csi35 = pod35 = far35 = float("nan")
+    else:
+        fss = csi35 = pod35 = far35 = float("nan")
+    return mse, r2, fss, csi35, pod35, far35
+
+
+def _sobel_mean(im, k):
+    """Mean Sobel-gradient magnitude over a 2D image (dBZ scale). Match Diffi2i."""
+    if not HAS_CV2:
+        return float("nan")
+    gx = cv2.Sobel(im, cv2.CV_64F, 1, 0, ksize=k)
+    gy = cv2.Sobel(im, cv2.CV_64F, 0, 1, ksize=k)
+    return float(np.sqrt(gx ** 2 + gy ** 2).mean())
+
+
 def _save_four_panel_sat_light_radar(
-    sat_ir_2d,
-    sat_lgt_2d,
-    gt_2d,
-    pred_2d,
+    sat_ir_01,
+    sat_lgt_01,
+    gt_01,
+    pred_01,
     cmap_ir,
     cmap_lgt,
     cmap_rad,
-    ir_min,
-    ir_max,
-    l_min,
-    l_max,
-    z_min,
-    z_max,
     out_path,
+    metrics_text=None,
 ):
+    """Render a 1×4 panel PNG: [Sat IR ch0 | Lightning | GT Radar | Pred Radar].
+
+    Match Diffi2i `save_vis_images`:
+      - inputs in [0,1]; vmin=0, vmax=1 across all panels
+      - radar panels mask pixels < 1 dBZ (1/60 in [0,1])
+      - dashed gridlines at 25/50/75%
+      - per-sample metrics text overlaid on Pred panel (computed on this frame)
     """
-    Save a 4-panel composite [sat_IR | sat_lightning | radar_gt | radar_pred]
-    using AE-style colormaps and physical ranges.
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4), squeeze=False)
+    ax = axes[0]
+    ax[0].imshow(sat_ir_01, cmap=cmap_ir, vmin=0, vmax=1)
+    ax[1].imshow(sat_lgt_01, cmap=cmap_lgt, vmin=0, vmax=1)
+    ax[2].imshow(np.ma.masked_less(gt_01, _RADAR_THR_01),
+                 cmap=cmap_rad, vmin=0, vmax=1)
+    ax[3].imshow(np.ma.masked_less(pred_01, _RADAR_THR_01),
+                 cmap=cmap_rad, vmin=0, vmax=1)
+    titles = ["Sat IR ch0", "Lightning", "GT Radar", "Pred Radar"]
+    for j, ttl in enumerate(titles):
+        ax[j].set_title(ttl)
+    for a in ax:
+        a.axis("off")
+        _add_grid_lines(a)
+
+    if metrics_text is None:
+        mse, r2, fss, csi35, pod35, far35 = _compute_radar_metrics_dbz(gt_01, pred_01)
+        metrics_text = (
+            f"MSE:{mse:.2f}, R²:{r2:.2f}\n"
+            f"FSS:{fss:.2f}, CSI35:{csi35:.2f}\n"
+            f"POD35:{pod35:.2f}, FAR35:{far35:.2f}"
+        )
+    ax[3].text(0.01, 0.97, metrics_text,
+               transform=ax[3].transAxes, ha='left', va='top',
+               fontsize=7, color='black', fontweight='bold')
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+
+def _save_v2v_gif_mpl(
+    sat_video_01,    # [B, T, H, W]
+    lgt_video_01,    # [B, T, H, W]
+    gt_video_01,     # [B, T, H, W]
+    pred_video_01,   # [B, T, H, W]
+    valid_mask,      # [B, T] bool tensor or None
+    out_path,
+    cmap_ir,
+    cmap_lgt,
+    cmap_rad,
+    fps=4,
+):
+    """Render a B×4 panel GIF animating T frames. Matches Diffi2i `save_vis_video`.
+
+    All input arrays in [0,1]. Radar panels mask < 1 dBZ; gridlines at 25/50/75%;
+    per-sample metrics text overlaid on Pred panel (recomputed each frame).
     """
-    sat_ir_rgb = _apply_cmap(sat_ir_2d, cmap_ir, ir_min, ir_max)
-    sat_lgt_rgb = _apply_cmap(sat_lgt_2d, cmap_lgt, l_min, l_max)
-    gt_rgb = _apply_cmap(gt_2d, cmap_rad, z_min, z_max)
-    pred_rgb = _apply_cmap(pred_2d, cmap_rad, z_min, z_max)
-    composite = np.concatenate([sat_ir_rgb, sat_lgt_rgb, gt_rgb, pred_rgb], axis=1)
-    plt.imsave(out_path, composite)
+    B, T, H, W = sat_video_01.shape
+    fig, axes = plt.subplots(B, 4, figsize=(16, 4 * B), squeeze=False)
+    titles = ["Sat IR ch0", "Lightning", "GT Radar", "Pred Radar"]
+    for j, ttl in enumerate(titles):
+        axes[0, j].set_title(ttl)
+    for i in range(B):
+        for j in range(4):
+            axes[i, j].axis("off")
+            _add_grid_lines(axes[i, j])
+        axes[i, 0].set_ylabel(f"sample {i}", rotation=90, fontsize=10)
+
+    im_sat = [axes[i, 0].imshow(sat_video_01[i, 0], cmap=cmap_ir,
+                                vmin=0, vmax=1, animated=True) for i in range(B)]
+    im_lgt = [axes[i, 1].imshow(lgt_video_01[i, 0], cmap=cmap_lgt,
+                                vmin=0, vmax=1, animated=True) for i in range(B)]
+    im_gt = [axes[i, 2].imshow(np.ma.masked_less(gt_video_01[i, 0], _RADAR_THR_01),
+                               cmap=cmap_rad, vmin=0, vmax=1, animated=True) for i in range(B)]
+    im_pred = [axes[i, 3].imshow(np.ma.masked_less(pred_video_01[i, 0], _RADAR_THR_01),
+                                 cmap=cmap_rad, vmin=0, vmax=1, animated=True) for i in range(B)]
+
+    txt_metrics = []
+    for i in range(B):
+        mse, r2, fss, csi35, pod35, far35 = _compute_radar_metrics_dbz(
+            gt_video_01[i, 0], pred_video_01[i, 0])
+        txt = axes[i, 3].text(
+            0.01, 0.97,
+            f"MSE:{mse:.2f}, R²:{r2:.2f}\n"
+            f"FSS:{fss:.2f}, CSI35:{csi35:.2f}\n"
+            f"POD35:{pod35:.2f}, FAR35:{far35:.2f}",
+            transform=axes[i, 3].transAxes, ha='left', va='top',
+            fontsize=7, color='black', fontweight='bold', animated=True,
+        )
+        txt_metrics.append(txt)
+
+    title_obj = fig.suptitle(f"frame 0/{T}", fontsize=12)
+    fig.tight_layout()
+
+    def _update(t):
+        for i in range(B):
+            if valid_mask is not None and not bool(valid_mask[i, t]):
+                continue
+            im_sat[i].set_data(sat_video_01[i, t])
+            im_lgt[i].set_data(lgt_video_01[i, t])
+            im_gt[i].set_data(np.ma.masked_less(gt_video_01[i, t], _RADAR_THR_01))
+            im_pred[i].set_data(np.ma.masked_less(pred_video_01[i, t], _RADAR_THR_01))
+            mse, r2, fss, csi35, pod35, far35 = _compute_radar_metrics_dbz(
+                gt_video_01[i, t], pred_video_01[i, t])
+            txt_metrics[i].set_text(
+                f"MSE:{mse:.2f}, R²:{r2:.2f}\n"
+                f"FSS:{fss:.2f}, CSI35:{csi35:.2f}\n"
+                f"POD35:{pod35:.2f}, FAR35:{far35:.2f}"
+            )
+        title_obj.set_text(f"frame {t}/{T}")
+        return im_sat + im_lgt + im_gt + im_pred + txt_metrics + [title_obj]
+
+    ani = animation.FuncAnimation(fig, _update, frames=T, interval=300, blit=False)
+    ani.save(out_path, writer="pillow", fps=fps)
+    plt.close(fig)
 
 
 @torch.no_grad()
@@ -260,6 +430,14 @@ def main():
     parser.add_argument("--filelist_path", default=None, help="Optional override for config.dataset.filelist_path")
     parser.add_argument("--fss_thresholds", default="0,5,10,15,20,25,30,35,40,45,50,55,60")
     parser.add_argument("--fss_scales", default="1,2,3,4,5,6,7,8,9,10")
+    parser.add_argument("--cat_thresholds", default="5,15,25,35,45,55",
+                        help="dBZ thresholds for CSI/POD/FAR/HSS (matches Diffi2i)")
+    parser.add_argument("--metrics_json", default=None,
+                        help="Path to write metrics JSON (default: <out_dir>/metrics.json)")
+    parser.add_argument("--dump_arrays", action="store_true",
+                        help="Save per-frame dBZ arrays gt_dbz.npy / pred_dbz.npy under <out_dir>/arrays")
+    parser.add_argument("--arrays_dir", default=None,
+                        help="Override directory for --dump_arrays output")
     args = parser.parse_args()
 
     if args.gpu is not None:
@@ -434,16 +612,25 @@ def main():
 
     thrs = _parse_csv_numbers(args.fss_thresholds, cast=float)
     scales = _parse_csv_numbers(args.fss_scales, cast=int)
+    cat_thresholds = _parse_csv_numbers(args.cat_thresholds, cast=float)
     z_min, z_max = 0.0, 60.0  # radar scaling range in dataset
 
-    mse_total = 0.0
+    # Per-frame counters / sums (all on dBZ scale to match Diffi2i)
+    mse_total = 0.0   # mean((p-g)^2) over (sample, frame), in dBZ
     mse_count = 0
-    ssim_total = 0.0
+    ssim_total = 0.0  # SSIM with data_range=60 (dBZ scale)
     ssim_count = 0
-    
+    mae_sum = 0.0     # sum of mean(|p-g|) per frame, in dBZ
+    sq_sum = 0.0      # sum of mean((p-g)^2) per frame, in dBZ (RMSE)
+    bias_sum = 0.0    # sum of mean(p-g) per frame, in dBZ
+    n_frames = 0
+    seen_samples = 0
+    # Per-frame dBZ arrays for global metrics (R², CSI/POD/FAR/HSS, Sobel, hist)
+    all_gt_dbz = []
+    all_pred_dbz = []
+
     # pysteps FSS accumulators (one per threshold-scale combination)
     pysteps_fss_objects = {}
-    
     if PYSTEPS_AVAILABLE:
         for thr in thrs:
             for scale in scales:
@@ -452,6 +639,7 @@ def main():
 
     def infer_batch(batch, batch_idx: int):
         nonlocal mse_total, mse_count, ssim_total, ssim_count, pysteps_fss_objects
+        nonlocal mae_sum, sq_sum, bias_sum, n_frames, seen_samples
 
         sat_video = batch["sat_video"].to(
             device,
@@ -494,7 +682,7 @@ def main():
             batch_size=B,
             sample_steps=config.sample.sample_steps,
             unconditional_guidance_scale=guidance_scale,
-            has_null_indicator=True,
+            has_null_indicator=guidance_scale > 1.0,
         )  # [B, L, C_tok]
 
         # Reshape tokens back to [B, T_eff, C_tok, 1, L_frame] and decode.
@@ -575,34 +763,47 @@ def main():
             )
             radar_pred = radar_pred_flat.view(Bv, Tv, 1, H_gt, W_gt)
 
-        # Metrics per (b, t) where valid_mask is True (or all frames if mask is None)
+        # Metrics per (b, t) where valid_mask is True (or all frames if mask is None).
+        # All metrics computed on dBZ scale to match Diffi2i validate_test_ckpt.py.
         radar_pred_cpu = radar_pred.detach().cpu()
         radar_gt_cpu = radar_gt.detach().cpu()
 
-        for b in range(B):
-            for t in range(T_eff):
-                if valid_mask is not None and not valid_mask[b, t]:
-                    continue
-                gt = radar_gt_cpu[b, t, 0].numpy()
-                pred = radar_pred_cpu[b, t, 0].numpy()
+        do_metrics_this_batch = (args.max_batches_metrics < 0
+                                 or batch_idx < args.max_batches_metrics)
 
-                # MSE
-                mse_total += float(np.mean((pred - gt) ** 2))
-                mse_count += 1
+        if do_metrics_this_batch:
+            for b in range(B):
+                any_valid = False
+                for t in range(T_eff):
+                    if valid_mask is not None and not valid_mask[b, t]:
+                        continue
+                    any_valid = True
+                    gt = radar_gt_cpu[b, t, 0].numpy()
+                    pred = radar_pred_cpu[b, t, 0].numpy()
 
-                # SSIM on 0-1 normalized
-                ssim_total += ssim(gt, pred, data_range=1.0)
-                ssim_count += 1
+                    g_dbz = (gt * (z_max - z_min) + z_min).astype(np.float32)
+                    p_dbz = (pred * (z_max - z_min) + z_min).astype(np.float32)
 
-                # FSS on physical dBZ range (accumulated method only)
-                if PYSTEPS_AVAILABLE:
-                    pred_np = pred * (z_max - z_min) + z_min
-                    tgt_np = gt * (z_max - z_min) + z_min
+                    diff = p_dbz - g_dbz
+                    mse_total += float(np.mean(diff ** 2))
+                    mse_count += 1
+                    sq_sum += float(np.mean(diff ** 2))
+                    mae_sum += float(np.mean(np.abs(diff)))
+                    bias_sum += float(np.mean(diff))
+                    ssim_total += float(ssim(g_dbz, p_dbz, data_range=60.0))
+                    ssim_count += 1
+                    n_frames += 1
 
-                    for thr in thrs:
-                        for scale in scales:
-                            key = (thr, scale)
-                            fss_accum(pysteps_fss_objects[key], pred_np, tgt_np)
+                    all_gt_dbz.append(g_dbz)
+                    all_pred_dbz.append(p_dbz)
+
+                    if PYSTEPS_AVAILABLE:
+                        for thr in thrs:
+                            for scale in scales:
+                                key = (thr, scale)
+                                fss_accum(pysteps_fss_objects[key], p_dbz, g_dbz)
+                if any_valid:
+                    seen_samples += 1
 
         # Save images / videos：
         #   - PNG：每个样本保存第一个有效帧的 [sat_IR | sat_lightning | radar_gt | radar_pred]
@@ -611,8 +812,6 @@ def main():
             cmap_rad = _cmap_or_fallback("HomeyerRainbow", fallback="viridis")
             cmap_ir = _cmap_or_fallback("cmc.batlow_r", fallback="viridis")
             cmap_lgt = _cmap_or_fallback("Reds", fallback="Reds")
-            ir_min, ir_max = 200.0, 320.0
-            l_min, l_max = 0.1, 50.0
             ir_band_indices = getattr(config.dataset, "ir_band_indices", None)
             lgt_channel_idx = (
                 len(ir_band_indices)
@@ -621,27 +820,22 @@ def main():
                 else None
             )
 
+            sat_ir_video_01 = sat_video[:, :T_eff, 0].detach().cpu().numpy()
+            if lgt_channel_idx is not None and sat_video.shape[2] > lgt_channel_idx:
+                sat_lgt_video_01 = sat_video[:, :T_eff, lgt_channel_idx].detach().cpu().numpy()
+            else:
+                sat_lgt_video_01 = np.zeros_like(sat_ir_video_01)
+            gt_video_01 = radar_gt_cpu[:, :T_eff, 0].numpy()
+            pred_video_01 = radar_pred_cpu[:, :T_eff, 0].numpy()
+
             # PNG：每样本一张，取第一个有效帧
             for i in range(B):
-                # choose first t where valid, else t=0
                 t0 = 0
                 if valid_mask is not None:
                     valid_t = torch.nonzero(valid_mask[i], as_tuple=False)
                     if len(valid_t) > 0:
                         t0 = int(valid_t[0].item())
-                # Scale back to physical ranges for visualization
-                gt_2d = (radar_gt[i, t0, 0] * (z_max - z_min) + z_min).cpu().numpy()
-                pred_2d = (radar_pred[i, t0, 0] * (z_max - z_min) + z_min).cpu().numpy()
-                sat_ir = sat_video[i, t0, 0] * (ir_max - ir_min) + ir_min  # [H, W]
-                sat_ir_2d = sat_ir.detach().cpu().numpy()
-                # Lightning channel index follows dataset output:
-                # [selected IR bands] + [lightning (optional)].
-                if lgt_channel_idx is not None and sat_video.shape[2] > lgt_channel_idx:
-                    sat_lgt = sat_video[i, t0, lgt_channel_idx] * (l_max - l_min) + l_min
-                    sat_lgt_2d = sat_lgt.detach().cpu().numpy()
-                else:
-                    # If lightning channel not available, fall back to zeros
-                    sat_lgt_2d = np.zeros_like(sat_ir_2d)
+
                 time_stem = ""
                 radar_paths = batch.get("radar_paths")
                 if radar_paths and i < len(radar_paths) and t0 < len(radar_paths[i]):
@@ -650,75 +844,36 @@ def main():
                 out_name = f"{time_stem}.png" if time_stem else f"batch{batch_idx}_i{i}.png"
                 out_path = os.path.join(args.out_dir, out_name)
                 _save_four_panel_sat_light_radar(
-                    sat_ir_2d,
-                    sat_lgt_2d,
-                    gt_2d,
-                    pred_2d,
+                    sat_ir_video_01[i, t0],
+                    sat_lgt_video_01[i, t0],
+                    gt_video_01[i, t0],
+                    pred_video_01[i, t0],
                     cmap_ir,
                     cmap_lgt,
                     cmap_rad,
-                    ir_min,
-                    ir_max,
-                    l_min,
-                    l_max,
-                    z_min,
-                    z_max,
                     out_path,
                 )
 
-            # GIF：仅在 v2v 模式下，为多个样本保存时间序列视频
-            if args.mode == "v2v" and HAS_IMAGEIO:
+            # GIF：仅在 v2v 模式下，使用 matplotlib FuncAnimation（与 Diffi2i 一致）
+            if args.mode == "v2v" and T_eff > 1:
                 max_samples = min(B, 8)
-                video_frames = []
-                for t in range(T_eff):
-                    rows_t = []
-                    for i in range(max_samples):
-                        if valid_mask is not None and not valid_mask[i, t]:
-                            continue
-                        gt_2d = (
-                            radar_gt[i, t, 0] * (z_max - z_min) + z_min
-                        ).detach().cpu().numpy()
-                        pred_2d = (
-                            radar_pred[i, t, 0] * (z_max - z_min) + z_min
-                        ).detach().cpu().numpy()
-                        sat_ir = (
-                            sat_video[i, t, 0] * (ir_max - ir_min) + ir_min
-                        )  # [H, W]
-                        sat_ir_2d = sat_ir.detach().cpu().numpy()
-                        if (
-                            lgt_channel_idx is not None
-                            and sat_video.shape[2] > lgt_channel_idx
-                        ):
-                            sat_lgt = sat_video[i, t, lgt_channel_idx] * (l_max - l_min) + l_min
-                            sat_lgt_2d = sat_lgt.detach().cpu().numpy()
-                        else:
-                            sat_lgt_2d = np.zeros_like(sat_ir_2d)
-
-                        sat_ir_rgb = _apply_cmap(sat_ir_2d, cmap_ir, ir_min, ir_max)
-                        sat_lgt_rgb = _apply_cmap(
-                            sat_lgt_2d, cmap_lgt, l_min, l_max
-                        )
-                        gt_rgb = _apply_cmap(gt_2d, cmap_rad, z_min, z_max)
-                        pred_rgb = _apply_cmap(pred_2d, cmap_rad, z_min, z_max)
-
-                        row_t = np.concatenate(
-                            [sat_ir_rgb, sat_lgt_rgb, gt_rgb, pred_rgb], axis=1
-                        )  # [H, 4W, 3]
-                        rows_t.append(row_t)
-
-                    if not rows_t:
-                        continue
-                    frame = np.concatenate(rows_t, axis=0)  # [H*max_samples, 4W, 3]
-                    frame_uint8 = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
-                    video_frames.append(frame_uint8)
-
-                if video_frames:
-                    gif_name = f"batch{batch_idx}_v2v.gif"
-                    gif_path = os.path.join(args.out_dir, gif_name)
-                    try:
-                        imageio.mimsave(gif_path, video_frames, fps=4)
-                    except Exception as e:
-                        print(f"[WARN] Failed to save GIF {gif_path}: {e}")
+                gif_path = os.path.join(args.out_dir, f"batch{batch_idx}_v2v.gif")
+                vmask = valid_mask[:max_samples].cpu() if valid_mask is not None else None
+                try:
+                    _save_v2v_gif_mpl(
+                        sat_ir_video_01[:max_samples],
+                        sat_lgt_video_01[:max_samples],
+                        gt_video_01[:max_samples],
+                        pred_video_01[:max_samples],
+                        vmask,
+                        gif_path,
+                        cmap_ir,
+                        cmap_lgt,
+                        cmap_rad,
+                        fps=4,
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to save GIF {gif_path}: {e}")
 
     n_batches = len(loader)
     total = (
@@ -736,36 +891,180 @@ def main():
         if mse_count > 0:
             pbar.set_postfix(mse=f"{mse_total / mse_count:.4f}", refresh=False)
 
-    # Print metrics
-    if mse_count > 0:
-        print(f"MSE: {mse_total / mse_count:.6f}")
-    if ssim_count > 0:
-        print(f"SSIM: {ssim_total / ssim_count:.6f}")
-    # Compute accumulated pysteps FSS
-    if PYSTEPS_AVAILABLE and pysteps_fss_objects:
+    # ── Aggregate metrics (match Diffi2i validate_test_ckpt.py) ──────────────
+    metrics = {
+        "ckpt": args.ckpt,
+        "config": args.config,
+        "split": args.split,
+        "mode": args.mode,
+        "n_frames": int(n_frames),
+        "seen_samples": int(seen_samples),
+        "fss_thresholds": list(thrs),
+        "fss_scales": list(scales),
+        "cat_thresholds": list(cat_thresholds),
+    }
+
+    if n_frames == 0:
+        print("[WARN] No valid frames seen — skipping metric aggregation.")
+    else:
+        all_gt = np.stack(all_gt_dbz)      # [N, H, W] in dBZ
+        all_pred = np.stack(all_pred_dbz)
+        gt_flat = all_gt.ravel()
+        pred_flat = all_pred.ravel()
+
+        # Frame-averaged scalars (dBZ)
+        mse_dbz = mse_total / mse_count
+        ssim_val = ssim_total / ssim_count
+        mae_dbz = mae_sum / n_frames
+        rmse_dbz = float(np.sqrt(sq_sum / n_frames))
+        bias_dbz = bias_sum / n_frames
+        psnr_db = float(20.0 * np.log10(60.0 / rmse_dbz)) if rmse_dbz > 0 else float("inf")
+        try:
+            r2 = float(sk_r2(gt_flat, pred_flat))
+        except Exception:
+            r2 = float("nan")
+
+        metrics.update({
+            "mse_dbz": mse_dbz,
+            "mae_dbz": mae_dbz,
+            "rmse_dbz": rmse_dbz,
+            "psnr_db": psnr_db,
+            "bias_dbz": bias_dbz,
+            "ssim": ssim_val,
+            "r2": r2,
+        })
+
+        # FSS (accumulated) — avg + weighted
+        fss_per = {}
+        if PYSTEPS_AVAILABLE and pysteps_fss_objects:
+            for (thr, scale), fss_obj in pysteps_fss_objects.items():
+                fv = fss_compute(fss_obj)
+                fss_per[(float(thr), int(scale))] = float(fv) if np.isfinite(fv) else float("nan")
+
+            thrs_arr = np.asarray(thrs, dtype=float)
+            scales_arr = np.asarray(scales, dtype=int)
+            fss_matrix = np.full((len(thrs_arr), len(scales_arr)), np.nan, dtype=float)
+            for (thr, scale), val in fss_per.items():
+                fss_matrix[np.where(thrs_arr == thr)[0][0],
+                           np.where(scales_arr == scale)[0][0]] = val
+            avg_fss = float(np.nanmean(fss_matrix))
+
+            # Diffi2i weighted-FSS scheme
+            thr_weights_dict = {0: 0.5, 5: 0.7, 10: 0.9, 15: 1.0, 20: 1.2, 25: 1.3,
+                                30: 1.5, 35: 2.0, 40: 2.0, 45: 1.8, 50: 1.6,
+                                55: 1.4, 60: 1.2}
+            thr_w = np.array([thr_weights_dict.get(int(t), 1.0) for t in thrs_arr],
+                             dtype=float)
+            thr_profile = np.nanmean(fss_matrix, axis=1)
+            mask = ~np.isnan(thr_profile)
+            if mask.any():
+                w_eff = np.where(mask, thr_w, 0.0)
+                w_eff = w_eff / w_eff.sum() if w_eff.sum() > 0 else w_eff
+                weighted_fss = float(np.nansum(thr_profile * w_eff))
+            else:
+                weighted_fss = float("nan")
+
+            metrics["avg_fss"] = avg_fss
+            metrics["weighted_fss"] = weighted_fss
+            metrics["fss_per_thr_scale"] = {
+                f"thr{int(thr) if float(thr).is_integer() else thr}_scale{int(scale)}": v
+                for (thr, scale), v in fss_per.items()
+            }
+
+        # Categorical metrics @ multiple thresholds (match Diffi2i)
+        if PYSTEPS_AVAILABLE and pvdcat is not None:
+            cat_per_thr = {}
+            for thr in cat_thresholds:
+                try:
+                    sc = pvdcat.det_cat_fct(pred_flat, gt_flat, thr=float(thr),
+                                            scores=["CSI", "POD", "FAR", "HSS"], axis=None)
+                    cat_per_thr[str(int(thr) if float(thr).is_integer() else thr)] = {
+                        "csi": float(sc["CSI"]),
+                        "pod": float(sc["POD"]),
+                        "far": float(sc["FAR"]),
+                        "hss": float(sc["HSS"]),
+                    }
+                except Exception as e:
+                    print(f"[WARN] det_cat_fct failed at thr={thr}: {e}")
+            metrics["cat_per_thr"] = cat_per_thr
+            if "35" in cat_per_thr:
+                metrics["csi35"] = cat_per_thr["35"]["csi"]
+                metrics["pod35"] = cat_per_thr["35"]["pod"]
+                metrics["far35"] = cat_per_thr["35"]["far"]
+                metrics["hss35"] = cat_per_thr["35"]["hss"]
+
+        # Sobel mean gradient per-frame for k=1,3,5,7
+        if HAS_CV2:
+            grad_sobel = {}
+            for k in [1, 3, 5, 7]:
+                pred_g = np.array([_sobel_mean(im, k) for im in all_pred], dtype=np.float64)
+                gt_g = np.array([_sobel_mean(im, k) for im in all_gt], dtype=np.float64)
+                grad_sobel[f"k{k}"] = {
+                    "pred_per_sample": pred_g.tolist(),
+                    "gt_per_sample": gt_g.tolist(),
+                    "pred_mean": float(pred_g.mean()),
+                    "pred_std": float(pred_g.std()),
+                    "gt_mean": float(gt_g.mean()),
+                    "gt_std": float(gt_g.std()),
+                }
+            metrics["grad_sobel"] = grad_sobel
+
+        # Reflectivity histogram (60 bins, 0–60 dBZ)
+        hist_bins = np.arange(0, 61, 1, dtype=float)
+        pred_hist, _ = np.histogram(pred_flat, bins=hist_bins, density=True)
+        gt_hist, _ = np.histogram(gt_flat, bins=hist_bins, density=True)
+        metrics["refl_hist_60bins"] = {
+            "bin_edges": hist_bins.tolist(),
+            "pred_density": pred_hist.tolist(),
+            "gt_density": gt_hist.tolist(),
+        }
+
+        # ── Print summary ─────────────────────────────────────────────────────
         print("\n" + "=" * 60)
-        print("FSS (pysteps accumulated)")
+        print(f"Metrics on {n_frames} frames ({seen_samples} samples), all in dBZ:")
+        print("=" * 60)
+        print(f"  MSE={mse_dbz:.4f} | MAE={mae_dbz:.4f} | RMSE={rmse_dbz:.4f} | "
+              f"PSNR={psnr_db:.2f} dB | bias={bias_dbz:+.4f}")
+        print(f"  SSIM={ssim_val:.4f} | R²={r2:.4f}")
+        if "avg_fss" in metrics:
+            print(f"  avg_FSS={metrics['avg_fss']:.4f} | weighted_FSS={metrics['weighted_fss']:.4f}")
+        if "csi35" in metrics:
+            print(f"  CSI35={metrics['csi35']:.4f} | POD35={metrics['pod35']:.4f} | "
+                  f"FAR35={metrics['far35']:.4f} | HSS35={metrics['hss35']:.4f}")
+        if "grad_sobel" in metrics:
+            g3 = metrics["grad_sobel"]["k3"]
+            print(f"  Sobel|k3 grad: pred {g3['pred_mean']:.3f}+/-{g3['pred_std']:.3f}, "
+                  f"gt {g3['gt_mean']:.3f}+/-{g3['gt_std']:.3f}")
+
+        # Per (thr, scale) FSS breakdown
+        if PYSTEPS_AVAILABLE and pysteps_fss_objects:
+            print("\nPer threshold-scale FSS breakdown (accumulated):")
+            print(f"{'Threshold':<12} {'Scale':<8} {'FSS':<15}")
+            print("-" * 40)
+            for (thr, scale) in sorted(pysteps_fss_objects.keys()):
+                print(f"{thr:<12.1f} {scale:<8} "
+                      f"{fss_per[(float(thr), int(scale))]:<15.6f}")
         print("=" * 60)
 
-        pysteps_fss_values = []
-        for (thr, scale), fss_obj in pysteps_fss_objects.items():
-            fss_val = fss_compute(fss_obj)
-            pysteps_fss_values.append(fss_val)
+    # ── Write metrics.json ───────────────────────────────────────────────────
+    metrics_json_path = args.metrics_json or os.path.join(args.out_dir, "metrics.json")
+    metrics_dir = os.path.dirname(metrics_json_path)
+    if metrics_dir:
+        os.makedirs(metrics_dir, exist_ok=True)
+    with open(metrics_json_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"[METRICS] wrote {metrics_json_path}")
 
-        pysteps_avg_fss_accumulated = np.mean(pysteps_fss_values) if pysteps_fss_values else 0.0
-        print(f"FSS (accumulated average): {pysteps_avg_fss_accumulated:.6f}")
-
-        # Per threshold-scale breakdown
-        print("\nPer threshold-scale FSS breakdown (accumulated method):")
-        print(f"{'Threshold':<12} {'Scale':<8} {'pysteps FSS':<15}")
-        print("-" * 40)
-        for (thr, scale), fss_obj in sorted(pysteps_fss_objects.items()):
-            fss_val = fss_compute(fss_obj)
-            print(f"{thr:<12.1f} {scale:<8} {fss_val:<15.6f}")
-        
-        print("=" * 60)
-    elif not PYSTEPS_AVAILABLE:
-        print("\n[INFO] pysteps not available. Skipping FSS computation.")
+    # ── Optional: dump per-frame dBZ arrays for downstream analysis ──────────
+    if args.dump_arrays and n_frames > 0:
+        arrays_dir = args.arrays_dir or os.path.join(args.out_dir, "arrays")
+        os.makedirs(arrays_dir, exist_ok=True)
+        gt_path = os.path.join(arrays_dir, "gt_dbz.npy")
+        pred_path = os.path.join(arrays_dir, "pred_dbz.npy")
+        np.save(gt_path, all_gt.astype(np.float32))
+        np.save(pred_path, all_pred.astype(np.float32))
+        print(f"[ARRAYS] dumped {gt_path}, {pred_path} "
+              f"(shape {all_gt.shape}, ~{all_gt.nbytes / 1e9:.2f} GB each)")
 
     print(f"\nSaved sat2radar {args.mode} predictions to {args.out_dir}")
 

@@ -8,6 +8,7 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-1}
 
 cd /mnt/ssd_1/yghu/Code/FlowTok
 
+export PYTHONUNBUFFERED=1
 accelerate launch \
   --num_processes 1 \
   scripts/train_sat2radar_v2v.py \

@@ -11,7 +11,7 @@ BATCH_SIZE=8
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3}
 
-python scripts/validate_sat2radar_v2v.py \
+python -u scripts/validate_sat2radar_v2v.py \
   --config "${CONFIG_PATH}" \
   --ckpt "${CKPT_PATH}" \
   --out_dir "${OUTPUT_DIR}" \

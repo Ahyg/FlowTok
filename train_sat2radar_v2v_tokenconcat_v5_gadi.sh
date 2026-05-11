@@ -36,6 +36,7 @@ NUM_PROCESSES=${NUM_PROCESSES:-1}
 
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs
 
+export PYTHONUNBUFFERED=1
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   scripts/train_sat2radar_v2v.py \

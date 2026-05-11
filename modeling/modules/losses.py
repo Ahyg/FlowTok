@@ -126,6 +126,21 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
 
         self.reconstruction_loss = loss_config.reconstruction_loss
         self.reconstruction_weight = loss_config.reconstruction_weight
+        # Optional per-channel reconstruction loss override:
+        #   recon_loss_per_channel: list[str] of length C, e.g. ["l2"]*10 + ["l1"]
+        #   recon_loss_per_channel_weights: list[float] of length C
+        # If absent, fall back to the global reconstruction_loss/_weight.
+        self.recon_loss_per_channel = list(
+            loss_config.get("recon_loss_per_channel", []) or [])
+        self.recon_loss_per_channel_weights = list(
+            loss_config.get("recon_loss_per_channel_weights", []) or [])
+        if (self.recon_loss_per_channel and
+                self.recon_loss_per_channel_weights and
+                len(self.recon_loss_per_channel) !=
+                    len(self.recon_loss_per_channel_weights)):
+            raise ValueError(
+                "recon_loss_per_channel and recon_loss_per_channel_weights "
+                "must have the same length")
         self.quantizer_weight = loss_config.quantizer_weight
         self.perceptual_loss_type = loss_config.perceptual_loss
         if str(self.perceptual_loss_type).lower().startswith("ssim"):
@@ -135,6 +150,8 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
             self.perceptual_loss = PerceptualLoss(
                 loss_config.perceptual_loss,
                 per_channel=loss_config.get("perceptual_per_channel", False),
+                per_channel_weights=loss_config.get(
+                    "perceptual_per_channel_weights", None),
             ).eval()
             self.ssim_loss = None
         
@@ -173,6 +190,50 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
     def should_discriminator_be_trained(self, global_step : int):
         return global_step >= self.discriminator_iter_start
 
+    def _compute_recon_loss(self, inputs: torch.Tensor,
+                            reconstructions: torch.Tensor) -> torch.Tensor:
+        """Reconstruction loss (global or per-channel weighted average).
+
+        If ``recon_loss_per_channel`` is set in the config, compute one loss
+        per channel using its own type ("l1" or "l2") and average them with
+        ``recon_loss_per_channel_weights``. Else fall back to the global
+        ``reconstruction_loss``. Returned value has ``reconstruction_weight``
+        already multiplied in.
+        """
+        if not self.recon_loss_per_channel:
+            if self.reconstruction_loss == "l1":
+                rl = F.l1_loss(inputs, reconstructions, reduction="mean")
+            elif self.reconstruction_loss == "l2":
+                rl = F.mse_loss(inputs, reconstructions, reduction="mean")
+            else:
+                raise ValueError(
+                    f"Unsupported reconstruction_loss {self.reconstruction_loss}")
+            return rl * self.reconstruction_weight
+
+        C = inputs.shape[1]
+        types = self.recon_loss_per_channel
+        weights = self.recon_loss_per_channel_weights or [1.0] * C
+        if len(types) != C or len(weights) != C:
+            raise ValueError(
+                f"recon_loss_per_channel/_weights length must equal C={C}, "
+                f"got types={len(types)} weights={len(weights)}")
+        total = None
+        wsum = 0.0
+        for c, (t, w) in enumerate(zip(types, weights)):
+            x = inputs[:, c:c + 1]
+            y = reconstructions[:, c:c + 1]
+            if t == "l1":
+                rl = F.l1_loss(x, y, reduction="mean")
+            elif t == "l2":
+                rl = F.mse_loss(x, y, reduction="mean")
+            else:
+                raise ValueError(
+                    f"Unsupported recon_loss_per_channel[{c}]={t}")
+            term = w * rl
+            total = term if total is None else total + term
+            wsum += float(w)
+        return (total / wsum) * self.reconstruction_weight
+
     def _forward_generator(self,
                            inputs: torch.Tensor,
                            reconstructions: torch.Tensor,
@@ -182,13 +243,7 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
         """Generator training step."""
         inputs = inputs.contiguous()
         reconstructions = reconstructions.contiguous()
-        if self.reconstruction_loss == "l1":
-            reconstruction_loss = F.l1_loss(inputs, reconstructions, reduction="mean")
-        elif self.reconstruction_loss == "l2":
-            reconstruction_loss = F.mse_loss(inputs, reconstructions, reduction="mean")
-        else:
-            raise ValueError(f"Unsuppored reconstruction_loss {self.reconstruction_loss}")
-        reconstruction_loss *= self.reconstruction_weight
+        reconstruction_loss = self._compute_recon_loss(inputs, reconstructions)
 
         # Compute perceptual loss if enabled.
         if self.perceptual_weight > 0:
@@ -300,13 +355,7 @@ class ReconstructionLoss_Single_Stage(ReconstructionLoss_Stage2):
         """Generator training step."""
         inputs = inputs.contiguous()
         reconstructions = reconstructions.contiguous()
-        if self.reconstruction_loss == "l1":
-            reconstruction_loss = F.l1_loss(inputs, reconstructions, reduction="mean")
-        elif self.reconstruction_loss == "l2":
-            reconstruction_loss = F.mse_loss(inputs, reconstructions, reduction="mean")
-        else:
-            raise ValueError(f"Unsuppored reconstruction_loss {self.reconstruction_loss}")
-        reconstruction_loss *= self.reconstruction_weight
+        reconstruction_loss = self._compute_recon_loss(inputs, reconstructions)
 
         # Compute perceptual loss if enabled.
         if self.perceptual_weight > 0:

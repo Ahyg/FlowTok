@@ -12,6 +12,6 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3}
 
 cd /mnt/ssd_1/yghu/Code/FlowTok
 
-python scripts/train_sat2radar_v2v.py \
+python -u scripts/train_sat2radar_v2v.py \
   --config="${CONFIG_PATH}"
 

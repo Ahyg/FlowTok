@@ -40,6 +40,7 @@ cd "${FLOWTOK_ROOT}"
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
+export PYTHONUNBUFFERED=1
 accelerate launch \
   --num_processes 1 \
   scripts/train_sat2radar_v2v.py \

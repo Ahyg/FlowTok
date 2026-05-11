@@ -61,7 +61,8 @@ def _load_convnext_small_imagenet():
 
 
 class PerceptualLoss(torch.nn.Module):
-    def __init__(self, model_name: str = "convnext_s", per_channel: bool = False):
+    def __init__(self, model_name: str = "convnext_s", per_channel: bool = False,
+                 per_channel_weights=None):
         """Initializes the PerceptualLoss class.
 
         Args:
@@ -71,6 +72,9 @@ class PerceptualLoss(torch.nn.Module):
                 If False (default), fall back to the legacy behavior that adapts
                 non-3-channel inputs via replicate (C=1) or channel-drop
                 (C>=7: [0,2,6]; 4<=C<7: [:3]).
+            per_channel_weights: Optional list/tuple of per-channel weights
+                used as a weighted average when ``per_channel=True``. Length
+                must match the input C. None -> uniform 1/C.
 
         Raise:
             ValueError: If the model_name does not contain "lpips" or "convnext_s".
@@ -80,6 +84,11 @@ class PerceptualLoss(torch.nn.Module):
             "convnext_s" not in model_name):
             raise ValueError(f"Unsupported Perceptual Loss model name {model_name}")
         self.per_channel = bool(per_channel)
+        if per_channel_weights is not None:
+            w = torch.tensor(list(per_channel_weights), dtype=torch.float32)
+            self.register_buffer("per_channel_weights", w)
+        else:
+            self.per_channel_weights = None
         self.lpips = None
         self.convnext = None
         self.loss_weight_lpips = None
@@ -167,13 +176,25 @@ class PerceptualLoss(torch.nn.Module):
             if C == 1:
                 return self._compute_loss_3ch(
                     input.repeat(1, 3, 1, 1), target.repeat(1, 3, 1, 1))
+            weights = self.per_channel_weights
+            if weights is not None:
+                if weights.numel() != C:
+                    raise ValueError(
+                        f"per_channel_weights len {weights.numel()} != input C {C}")
+                weights = weights.to(device=input.device, dtype=input.dtype)
             total = None
+            wsum = 0.0
             for c in range(C):
                 x = input[:, c:c + 1].repeat(1, 3, 1, 1)
                 y = target[:, c:c + 1].repeat(1, 3, 1, 1)
                 loss_c = self._compute_loss_3ch(x, y)
+                if weights is not None:
+                    loss_c = weights[c] * loss_c
+                    wsum += float(weights[c].item())
+                else:
+                    wsum += 1.0
                 total = loss_c if total is None else total + loss_c
-            return total / float(C)
+            return total / wsum
 
         # Legacy path: pre-2026-04 behavior.
         if C != 3:

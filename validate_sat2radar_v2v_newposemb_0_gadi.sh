@@ -40,7 +40,7 @@ BATCH_SIZE=4
 cd "${FLOWTOK_ROOT}"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
-python scripts/validate_sat2radar_v2v.py \
+python -u scripts/validate_sat2radar_v2v.py \
   --config "${CONFIG_PATH}" \
   --filelist_path "${FILELIST_PATH}" \
   --ckpt "${CKPT_PATH}" \
