@@ -64,6 +64,21 @@ from libs.flowtitok import FlowTiTok  # noqa: E402
 from libs.adapters import AdapterIn, AdapterOut  # noqa: E402
 import flow_utils  # noqa: E402
 
+# Generation-quality metrics: i2i (FID/sFID/KID via torchmetrics) and
+# v2v (FVD/KVD via I3D-Kinetics + Temporal Consistency via RAFT).
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _generation_metrics import (
+        make_i2i_metrics,
+        make_v2v_metrics,
+        TemporalConsistency,
+        radar_to_3ch,
+    )
+    GEN_METRICS_AVAILABLE = True
+except ImportError as _e:
+    GEN_METRICS_AVAILABLE = False
+    print(f"[WARN] generation metrics module failed to load: {_e}")
+
 
 def _cmap_or_fallback(name, fallback="viridis"):
     """Return a valid colormap name, falling back if needed."""
@@ -438,6 +453,19 @@ def main():
                         help="Save per-frame dBZ arrays gt_dbz.npy / pred_dbz.npy under <out_dir>/arrays")
     parser.add_argument("--arrays_dir", default=None,
                         help="Override directory for --dump_arrays output")
+    # ── Generation-quality metrics (i2i: FID/sFID/KID, v2v: FVD/KVD/TC) ─────
+    parser.add_argument("--skip_gen_metrics", action="store_true",
+                        help="Disable all generation-quality metrics (FID/sFID/KID for i2i; FVD/KVD/TC for v2v)")
+    parser.add_argument("--skip_fid", action="store_true", help="i2i: skip FID")
+    parser.add_argument("--skip_sfid", action="store_true", help="i2i: skip sFID")
+    parser.add_argument("--skip_kid", action="store_true", help="i2i: skip KID")
+    parser.add_argument("--skip_fvd", action="store_true", help="v2v: skip FVD")
+    parser.add_argument("--skip_kvd", action="store_true", help="v2v: skip KVD")
+    parser.add_argument("--skip_tc", action="store_true", help="v2v: skip Temporal Consistency (RAFT)")
+    parser.add_argument("--kid_subsets", type=int, default=50,
+                        help="KID/KVD number of subsets for unbiased estimator")
+    parser.add_argument("--kid_subset_size", type=int, default=100,
+                        help="KID/KVD subset size (must be <= total samples per call)")
     args = parser.parse_args()
 
     if args.gpu is not None:
@@ -637,6 +665,35 @@ def main():
                 key = (thr, scale)
                 pysteps_fss_objects[key] = fss_init(thr=thr, scale=float(scale))
 
+    # ── Generation-quality metrics (mode-specific) ─────────────────────────
+    gen_metrics: dict = {}
+    tc_metric = None
+    use_gen = GEN_METRICS_AVAILABLE and not args.skip_gen_metrics
+    if use_gen:
+        if args.mode == "i2i":
+            gen_metrics = make_i2i_metrics(
+                device,
+                use_fid=not args.skip_fid,
+                use_sfid=not args.skip_sfid,
+                use_kid=not args.skip_kid,
+                kid_subsets=args.kid_subsets,
+                kid_subset_size=args.kid_subset_size,
+            )
+        else:  # v2v
+            gen_metrics = make_v2v_metrics(
+                device,
+                use_fvd=not args.skip_fvd,
+                use_kvd=not args.skip_kvd,
+                kid_subsets=args.kid_subsets,
+                kid_subset_size=args.kid_subset_size,
+            )
+            if not args.skip_tc:
+                tc_metric = TemporalConsistency(device, dbz_scale=z_max - z_min)
+        active = [k for k in gen_metrics if not k.startswith("_")]
+        if tc_metric is not None:
+            active.append("tc")
+        print(f"[INFO] Generation-quality metrics enabled ({args.mode}): {active}")
+
     def infer_batch(batch, batch_idx: int):
         nonlocal mse_total, mse_count, ssim_total, ssim_count, pysteps_fss_objects
         nonlocal mae_sum, sq_sum, bias_sum, n_frames, seen_samples
@@ -804,6 +861,42 @@ def main():
                                 fss_accum(pysteps_fss_objects[key], p_dbz, g_dbz)
                 if any_valid:
                     seen_samples += 1
+
+            # ── Generation-quality metrics (mode-specific) ──────────────────
+            if gen_metrics or tc_metric is not None:
+                # radar_pred / radar_gt are still on device; both [B, T_eff, 1, H, W] in [0,1]
+                if args.mode == "i2i":
+                    # Flatten (b, t) -> N images, drop invalid frames via valid_mask
+                    if valid_mask is not None:
+                        keep = valid_mask[:, :T_eff].reshape(-1).to(radar_gt.device).bool()
+                    else:
+                        keep = torch.ones(B * T_eff, dtype=torch.bool, device=radar_gt.device)
+                    if keep.any():
+                        gt_flat = radar_gt[:, :T_eff].reshape(B * T_eff, 1, radar_gt.shape[-2], radar_gt.shape[-1])[keep]
+                        pr_flat = radar_pred[:, :T_eff].reshape(B * T_eff, 1, radar_pred.shape[-2], radar_pred.shape[-1])[keep]
+                        gt3 = radar_to_3ch(gt_flat)
+                        pr3 = radar_to_3ch(pr_flat)
+                        for k in ("fid", "sfid", "kid"):
+                            if k in gen_metrics:
+                                gen_metrics[k].update(gt3, real=True)
+                                gen_metrics[k].update(pr3, real=False)
+                else:  # v2v
+                    gt3_clip = radar_to_3ch(radar_gt[:, :T_eff])    # [B, T_eff, 3, H, W]
+                    pr3_clip = radar_to_3ch(radar_pred[:, :T_eff])
+                    for k in ("fvd", "kvd"):
+                        if k in gen_metrics:
+                            gen_metrics[k].update(gt3_clip, real=True)
+                            gen_metrics[k].update(pr3_clip, real=False)
+                    if tc_metric is not None and T_eff >= 2:
+                        vm = valid_mask[:, :T_eff] if valid_mask is not None else None
+                        try:
+                            tc_metric.update(
+                                radar_gt[:, :T_eff],
+                                radar_pred[:, :T_eff],
+                                valid_mask=vm,
+                            )
+                        except Exception as e:
+                            print(f"[WARN] TC update failed for batch {batch_idx}: {e}")
 
         # Save images / videos：
         #   - PNG：每个样本保存第一个有效帧的 [sat_IR | sat_lightning | radar_gt | radar_pred]
@@ -1035,6 +1128,41 @@ def main():
             g3 = metrics["grad_sobel"]["k3"]
             print(f"  Sobel|k3 grad: pred {g3['pred_mean']:.3f}+/-{g3['pred_std']:.3f}, "
                   f"gt {g3['gt_mean']:.3f}+/-{g3['gt_std']:.3f}")
+
+        # ── Generation-quality metrics (FID/sFID/KID for i2i; FVD/KVD/TC for v2v) ──
+        gen = {}
+        for k in ("fid", "sfid", "kid", "fvd", "kvd"):
+            if k in gen_metrics:
+                try:
+                    out = gen_metrics[k].compute()
+                    if isinstance(out, (tuple, list)):
+                        gen[k] = {"mean": float(out[0].item()), "std": float(out[1].item())}
+                    else:
+                        gen[k] = float(out.item())
+                except Exception as e:
+                    print(f"[WARN] failed to compute {k}: {e}")
+                    gen[k] = None
+        if tc_metric is not None:
+            tc_val = tc_metric.compute()
+            gen["tc_dbz_sq"] = tc_val
+            gen["tc_count_pairs"] = int(tc_metric.tc_count)
+        if gen:
+            metrics["gen_metrics"] = gen
+            label_line = []
+            if "fid" in gen and gen["fid"] is not None:
+                label_line.append(f"FID={gen['fid']:.3f}")
+            if "sfid" in gen and gen["sfid"] is not None:
+                label_line.append(f"sFID={gen['sfid']:.3f}")
+            if "kid" in gen and gen["kid"] is not None:
+                label_line.append(f"KID={gen['kid']['mean']:.4f}±{gen['kid']['std']:.4f}")
+            if "fvd" in gen and gen["fvd"] is not None:
+                label_line.append(f"FVD={gen['fvd']:.3f}")
+            if "kvd" in gen and gen["kvd"] is not None:
+                label_line.append(f"KVD={gen['kvd']['mean']:.4f}±{gen['kvd']['std']:.4f}")
+            if "tc_dbz_sq" in gen and gen["tc_dbz_sq"] is not None:
+                label_line.append(f"TC={gen['tc_dbz_sq']:.2f} dBZ² (n={gen['tc_count_pairs']})")
+            if label_line:
+                print("  " + " | ".join(label_line))
 
         # Per (thr, scale) FSS breakdown
         if PYSTEPS_AVAILABLE and pysteps_fss_objects:

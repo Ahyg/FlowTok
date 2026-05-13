@@ -7,7 +7,22 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr_skimage
 from torch.utils.data import DataLoader
+
+try:
+    import lpips as _lpips_pkg
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("[WARN] lpips not available; LPIPS will be skipped.")
+
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    TORCHMETRICS_FID_AVAILABLE = True
+except ImportError:
+    TORCHMETRICS_FID_AVAILABLE = False
+    print("[WARN] torchmetrics.image.fid not available; rFID will be skipped.")
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -184,6 +199,12 @@ def main():
                         help="Comma-separated thresholds (dBZ for radar; auto-scaled for sat/lgt)")
     parser.add_argument("--fss_scales", default="1,2,3,4,5,6,7,8,9,10",
                         help="Comma-separated window sizes")
+    parser.add_argument("--skip_lpips", action="store_true",
+                        help="Skip LPIPS metric (uses AlexNet, ~233MB cache)")
+    parser.add_argument("--skip_fid", action="store_true",
+                        help="Skip rFID metric (uses InceptionV3, slower)")
+    parser.add_argument("--lpips_net", default="alex", choices=("alex", "vgg"),
+                        help="LPIPS backbone (alex = original LPIPS default, vgg = VQGAN paper)")
     args = parser.parse_args()
 
     if args.gpu is not None:
@@ -291,11 +312,25 @@ def main():
     mse_count = 0
     ssim_total = 0.0
     ssim_count = 0
+    psnr_total = 0.0
+    psnr_count = 0
+    lpips_total = 0.0
+    lpips_count = 0
     # Per-channel accumulators (initialized on first batch once we know C)
     per_ch_mse_sum = None     # np.ndarray [C]
     per_ch_mse_count = None   # np.ndarray [C]
     per_ch_ssim_sum = None    # np.ndarray [C]
     per_ch_ssim_count = None  # np.ndarray [C]
+    per_ch_psnr_sum = None    # np.ndarray [C]
+    per_ch_psnr_count = None  # np.ndarray [C]
+    per_ch_lpips_sum = None   # np.ndarray [C]
+    per_ch_lpips_count = None # np.ndarray [C]
+
+    # Lazy-init LPIPS + per-channel FID metrics (created on first metric batch)
+    lpips_model = None
+    fid_metrics = None  # dict[int, FrechetInceptionDistance]
+    use_lpips = LPIPS_AVAILABLE and not args.skip_lpips
+    use_fid = TORCHMETRICS_FID_AVAILABLE and not args.skip_fid
 
     for b_idx, batch in enumerate(eval_loader):
         do_metrics = args.max_batches_metrics < 0 or b_idx < args.max_batches_metrics
@@ -325,14 +360,42 @@ def main():
                 per_ch_mse_count = np.zeros(C_now, dtype=np.int64)
                 per_ch_ssim_sum = np.zeros(C_now, dtype=np.float64)
                 per_ch_ssim_count = np.zeros(C_now, dtype=np.int64)
+                per_ch_psnr_sum = np.zeros(C_now, dtype=np.float64)
+                per_ch_psnr_count = np.zeros(C_now, dtype=np.int64)
+                per_ch_lpips_sum = np.zeros(C_now, dtype=np.float64)
+                per_ch_lpips_count = np.zeros(C_now, dtype=np.int64)
+                if use_lpips:
+                    lpips_model = _lpips_pkg.LPIPS(net=args.lpips_net, verbose=False).to(device)
+                    lpips_model.requires_grad_(False)
+                    lpips_model.train(False)
+                if use_fid:
+                    fid_metrics = {c: FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+                                   for c in range(C_now)}
             per_ch_mse_sum += per_channel_mse.sum(dim=0).detach().cpu().numpy()
             per_ch_mse_count += int(per_channel_mse.shape[0])
+
+            # Batched LPIPS + FID per channel (replicate single channel -> 3ch RGB)
+            for ch in range(C_now):
+                img_ch3 = images[:, ch:ch+1].repeat(1, 3, 1, 1).clamp(0.0, 1.0)
+                rec_ch3 = recon[:, ch:ch+1].repeat(1, 3, 1, 1).clamp(0.0, 1.0)
+                if use_lpips and lpips_model is not None:
+                    # LPIPS with normalize=True accepts [0,1] tensors and rescales internally
+                    d = lpips_model(rec_ch3, img_ch3, normalize=True).view(-1)
+                    d_sum = float(d.sum().item())
+                    d_n = int(d.numel())
+                    per_ch_lpips_sum[ch] += d_sum
+                    per_ch_lpips_count[ch] += d_n
+                    lpips_total += d_sum
+                    lpips_count += d_n
+                if use_fid and fid_metrics is not None:
+                    fid_metrics[ch].update(img_ch3, real=True)
+                    fid_metrics[ch].update(rec_ch3, real=False)
 
             for i in range(images_cpu.shape[0]):
                 img = images_cpu[i].numpy()
                 rec = recon_cpu[i].numpy()
 
-                # SSIM + FSS per channel
+                # SSIM + PSNR + FSS per channel (per-image, CPU via skimage)
                 for ch in range(img.shape[0]):
                     ssim_val = ssim(img[ch], rec[ch], data_range=1.0)
                     ssim_total += ssim_val
@@ -340,6 +403,14 @@ def main():
                     if per_ch_ssim_sum is not None and ch < per_ch_ssim_sum.shape[0]:
                         per_ch_ssim_sum[ch] += ssim_val
                         per_ch_ssim_count[ch] += 1
+
+                    psnr_val = float(psnr_skimage(img[ch], rec[ch], data_range=1.0))
+                    if np.isfinite(psnr_val):
+                        psnr_total += psnr_val
+                        psnr_count += 1
+                        if per_ch_psnr_sum is not None and ch < per_ch_psnr_sum.shape[0]:
+                            per_ch_psnr_sum[ch] += psnr_val
+                            per_ch_psnr_count[ch] += 1
 
                     # pysteps accumulated FSS
                     if fss_mode == "radar" and pysteps_fss_objects:
@@ -431,6 +502,8 @@ def main():
 
     avg_mse = mse_total / max(mse_count, 1)
     avg_ssim = ssim_total / max(ssim_count, 1)
+    avg_psnr = psnr_total / max(psnr_count, 1)
+    avg_lpips = lpips_total / max(lpips_count, 1) if lpips_count > 0 else None
     # Combine FSS from radar or (IR + lightning) accumulators
     all_fss_vals = []
     ir_fss_vals = []
@@ -449,38 +522,118 @@ def main():
     has_lgt = (fss_mode != "radar") and bool(ds_cfg.get("use_lightning", True))
     per_channel_mse_avg = []
     per_channel_ssim_avg = []
+    per_channel_psnr_avg = []
+    per_channel_lpips_avg = []
     if per_ch_mse_sum is not None:
         per_channel_mse_avg = (per_ch_mse_sum / np.maximum(per_ch_mse_count, 1)).tolist()
         per_channel_ssim_avg = (per_ch_ssim_sum / np.maximum(per_ch_ssim_count, 1)).tolist()
+        per_channel_psnr_avg = (per_ch_psnr_sum / np.maximum(per_ch_psnr_count, 1)).tolist()
+        if use_lpips and per_ch_lpips_count is not None and int(per_ch_lpips_count.sum()) > 0:
+            per_channel_lpips_avg = (per_ch_lpips_sum / np.maximum(per_ch_lpips_count, 1)).tolist()
+
+    # ── rFID per channel (mean across channels = aggregate rFID) ──
+    per_channel_rfid = []
+    avg_rfid = None
+    fid_num_real = 0
+    fid_num_fake = 0
+    if use_fid and fid_metrics is not None:
+        for c in range(len(fid_metrics)):
+            try:
+                v = float(fid_metrics[c].compute().item())
+            except Exception as e:
+                print(f"[WARN] FID compute failed for ch {c}: {e}")
+                v = float("nan")
+            per_channel_rfid.append(v)
+        finite_vals = [v for v in per_channel_rfid if np.isfinite(v)]
+        avg_rfid = float(np.mean(finite_vals)) if finite_vals else None
+        # torchmetrics FID exposes the running counts as buffers
+        fid0 = fid_metrics[0]
+        fid_num_real = int(getattr(fid0, "real_features_num_samples", torch.tensor(0)).item())
+        fid_num_fake = int(getattr(fid0, "fake_features_num_samples", torch.tensor(0)).item())
 
     avg_mse_excl_lgt = None
     avg_ssim_excl_lgt = None
+    avg_psnr_excl_lgt = None
+    avg_lpips_excl_lgt = None
+    avg_rfid_excl_lgt = None
     avg_fss_excl_lgt = None
     if has_lgt and len(per_channel_mse_avg) >= 2:
         # Lightning is the last channel in satellite datasets when use_lightning=True
         avg_mse_excl_lgt = float(np.mean(per_channel_mse_avg[:-1]))
         avg_ssim_excl_lgt = float(np.mean(per_channel_ssim_avg[:-1]))
+        avg_psnr_excl_lgt = float(np.mean(per_channel_psnr_avg[:-1])) if per_channel_psnr_avg else None
+        if per_channel_lpips_avg:
+            avg_lpips_excl_lgt = float(np.mean(per_channel_lpips_avg[:-1]))
+        if per_channel_rfid:
+            ir_rfid = [v for v in per_channel_rfid[:-1] if np.isfinite(v)]
+            avg_rfid_excl_lgt = float(np.mean(ir_rfid)) if ir_rfid else None
         if ir_fss_vals:
             avg_fss_excl_lgt = float(np.nanmean(ir_fss_vals))
 
     metrics = {
         "avg_mse": avg_mse,
         "avg_ssim": avg_ssim,
+        "avg_psnr": avg_psnr,
+        "avg_lpips": avg_lpips,
+        "avg_rfid": avg_rfid,
         "avg_fss": avg_fss,
         "avg_mse_excl_lgt": avg_mse_excl_lgt,
         "avg_ssim_excl_lgt": avg_ssim_excl_lgt,
+        "avg_psnr_excl_lgt": avg_psnr_excl_lgt,
+        "avg_lpips_excl_lgt": avg_lpips_excl_lgt,
+        "avg_rfid_excl_lgt": avg_rfid_excl_lgt,
         "avg_fss_excl_lgt": avg_fss_excl_lgt,
         "per_channel_mse": per_channel_mse_avg,
         "per_channel_ssim": per_channel_ssim_avg,
+        "per_channel_psnr": per_channel_psnr_avg,
+        "per_channel_lpips": per_channel_lpips_avg,
+        "per_channel_rfid": per_channel_rfid,
         "num_samples": int(mse_count),
+        "num_samples_fid_real": fid_num_real,
+        "num_samples_fid_fake": fid_num_fake,
+        "lpips_net": args.lpips_net if use_lpips else None,
         "fss_thresholds": thrs_dbz,
         "fss_scales": scales,
         "fss_method": "pysteps_accumulated" if (pysteps_fss_objects or pysteps_fss_ir or pysteps_fss_lightning) else "none",
     }
-    print("Metrics:", metrics)
-    with open(os.path.join(args.out_dir, "metrics.json"), "w", encoding="utf-8") as f:
+
+    # ── Save metrics: JSON (full) + Markdown summary (human-readable) ──
+    json_path = os.path.join(args.out_dir, "metrics.json")
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
+    md_lines = ["# AE reconstruction metrics", ""]
+    md_lines.append(f"- checkpoint: `{args.checkpoint}`")
+    md_lines.append(f"- config: `{args.config}`")
+    md_lines.append(f"- num_samples: {int(mse_count)}  (FID real/fake: {fid_num_real}/{fid_num_fake})")
+    md_lines.append("")
+    md_lines.append("| metric | overall | excl. lightning |")
+    md_lines.append("|---|---|---|")
+    def _fmt(v): return "n/a" if v is None else f"{v:.5f}"
+    md_lines.append(f"| MSE   | {_fmt(avg_mse)} | {_fmt(avg_mse_excl_lgt)} |")
+    md_lines.append(f"| SSIM  | {_fmt(avg_ssim)} | {_fmt(avg_ssim_excl_lgt)} |")
+    md_lines.append(f"| PSNR  | {_fmt(avg_psnr)} | {_fmt(avg_psnr_excl_lgt)} |")
+    md_lines.append(f"| LPIPS | {_fmt(avg_lpips)} | {_fmt(avg_lpips_excl_lgt)} |")
+    md_lines.append(f"| rFID  | {_fmt(avg_rfid)} | {_fmt(avg_rfid_excl_lgt)} |")
+    md_lines.append(f"| FSS   | {_fmt(avg_fss)} | {_fmt(avg_fss_excl_lgt)} |")
+    if per_channel_mse_avg:
+        md_lines.append("")
+        md_lines.append("## Per-channel")
+        md_lines.append("| ch | MSE | SSIM | PSNR | LPIPS | rFID |")
+        md_lines.append("|---|---|---|---|---|---|")
+        for c in range(len(per_channel_mse_avg)):
+            mse_c = per_channel_mse_avg[c]
+            ssim_c = per_channel_ssim_avg[c] if c < len(per_channel_ssim_avg) else None
+            psnr_c = per_channel_psnr_avg[c] if c < len(per_channel_psnr_avg) else None
+            lpips_c = per_channel_lpips_avg[c] if c < len(per_channel_lpips_avg) else None
+            rfid_c = per_channel_rfid[c] if c < len(per_channel_rfid) else None
+            md_lines.append(f"| {c} | {_fmt(mse_c)} | {_fmt(ssim_c)} | {_fmt(psnr_c)} | {_fmt(lpips_c)} | {_fmt(rfid_c)} |")
+    md_path = os.path.join(args.out_dir, "metrics.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines) + "\n")
+
+    print("Metrics:", metrics)
+    print(f"Saved metrics to:\n  {json_path}\n  {md_path}")
     print("Done.")
 
 
