@@ -101,7 +101,7 @@ Headline metrics for the decision: **high-freq MSE, Sobel edge IoU, LPIPS** — 
 | Risk | Mitigation |
 |---|---|
 | `vit_enc_model_size=small` and `=base` already exist in `modeling/`; a true "tiny" may not. If "tiny" isn't a registered size, fall back to `small + small`. | Inspect `modeling/titok.py` (and the size-registry in TA-TiTok) before writing configs. Pick the smallest pair that matches the ~27M target; record the actual pair used in the cell config and in this spec's §3 row. |
-| Per-token KL normalization is wrong if KL is mean-over-tokens, not sum-over-tokens. | Read `losses.py` (or wherever KL is computed) before launch and confirm sum-vs-mean. Adjust §3's `kl_weight(N)` formula accordingly. |
+| ~~Per-token KL normalization is wrong if KL is mean-over-tokens~~ | **Resolved.** Verified in `modeling/quantizer/quantizer.py:164-170` (`torch.sum(..., dim=[1,2])` over `[B,C,N]`) and `modeling/modules/losses.py:407-408` (sum-over-batch then divide by B). KL is **sum-over-(C×N) per sample, mean over batch**. §3 normalization `kl_weight × 77/N` is correct. |
 | `per_gpu_batch_size=32` on 4090 may OOM if attention sequence length 256+small-dec is heavier than expected. | Smoke-test 100 steps per cell before kicking off full run. If OOM, drop to batch=16 (same across cells). |
 | Reading from `/mnt/ssd_1` while writing checkpoints to `/mnt/ssd_2` crosses devices — verify dataloader throughput isn't bottlenecked. | Run `iostat` during the 100-step smoke test. If I/O is the bottleneck, stage the 71_3m train shard to `/mnt/ssd_2` first. |
 | `best_val.ckpt` rolling overwrite races if val happens during ckpt write. | Use atomic rename (write `tmp_best_val.ckpt` then `os.replace`). Standard pattern in `train_flowtitok_ae.py`; verify it's there. |
