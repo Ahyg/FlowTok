@@ -848,22 +848,37 @@ def auto_resume(config, logger, accelerator, ema_model,
     global_step = 0
     first_epoch = 0
     # If resuming training.
-    if config.experiment.resume:            
+    if config.experiment.resume:
         accelerator.wait_for_everyone()
         local_ckpt_list = list(glob.glob(os.path.join(
             config.experiment.output_dir, "checkpoint*")))
         logger.info(f"All globbed checkpoints are: {local_ckpt_list}")
-        if len(local_ckpt_list) >= 1:
-            if len(local_ckpt_list) > 1:
-                fn = lambda x: int(x.split('/')[-1].split('-')[-1])
-                checkpoint_paths = sorted(local_ckpt_list, key=fn, reverse=True)
+        checkpoint_paths = []
+        if local_ckpt_list:
+            # Prefer the canonical 'latest' resume slot if present.
+            latest = [p for p in local_ckpt_list if Path(p).name == "checkpoint-latest"]
+            if latest:
+                checkpoint_paths = latest
             else:
-                checkpoint_paths = local_ckpt_list
+                # Fall back to legacy step-named numeric sort, skipping
+                # non-numeric basenames (e.g. 'checkpoint-best_val',
+                # 'checkpoint-final').
+                def _step_key(x):
+                    tail = x.split('/')[-1].split('-')[-1]
+                    try:
+                        return int(tail)
+                    except ValueError:
+                        return -1
+                numeric = [p for p in local_ckpt_list if _step_key(p) >= 0]
+                if numeric:
+                    checkpoint_paths = sorted(numeric, key=_step_key, reverse=True)
+
+        if checkpoint_paths:
             global_step = load_checkpoint(
                 Path(checkpoint_paths[0]),
                 accelerator,
                 logger=logger,
-                strict=strict
+                strict=strict,
             )
             if config.training.use_ema:
                 ema_model.set_step(global_step)
@@ -1356,11 +1371,6 @@ def train_one_epoch(config, logger, accelerator,
                 break
 
 
-    # Final ckpt at end of training run.
-    if global_step >= config.training.max_train_steps:
-        save_checkpoint(
-            model, config.experiment.output_dir, accelerator, global_step,
-            logger=logger, slot="final")
     return global_step
 
 
@@ -1707,6 +1717,13 @@ def eval_reconstruction(
     evaluator.reset_metrics()
     local_model = accelerator.unwrap_model(model)
 
+    # Accumulate L2 (MSE) on the same _to_3ch normalized images that
+    # evaluator.update() sees, so we can surface "reconstruction_loss" in
+    # the returned dict for best-val tracking (the underlying evaluator
+    # does not report L2 itself).
+    mse_accum = 0.0
+    n_batches = 0
+
     for batch in eval_loader:
         images = batch["image"].to(
             accelerator.device, memory_format=torch.contiguous_format, non_blocking=True
@@ -1767,16 +1784,25 @@ def eval_reconstruction(
 
         original_images = _to_3ch(original_images)
         reconstructed_images = _to_3ch(reconstructed_images)
-        
-        if isinstance(model_dict, dict): 
+
+        # Per-batch L2 over [B, C, H, W] (mean reduction); accumulate.
+        mse_accum += float(
+            torch.nn.functional.mse_loss(reconstructed_images, original_images).item()
+        )
+        n_batches += 1
+
+        if isinstance(model_dict, dict):
             # For VQ model.
             evaluator.update(original_images, reconstructed_images.squeeze(2), model_dict["min_encoding_indices"])
         else:
             # For VAE model.
             evaluator.update(original_images, reconstructed_images.squeeze(2), None)
-            
+
     model.train()
-    return evaluator.result()
+    result = evaluator.result()
+    if n_batches > 0:
+        result["reconstruction_loss"] = mse_accum / n_batches
+    return result
 
 
 @torch.no_grad()

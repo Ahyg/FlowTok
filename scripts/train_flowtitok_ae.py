@@ -155,8 +155,8 @@ def main():
             break
 
     accelerator.wait_for_everyone()
-    # Save checkpoint at the end of training.
-    save_checkpoint(model, output_dir, accelerator, global_step, logger=logger)
+    # Save checkpoint at the end of training (overwrites checkpoint-final/).
+    save_checkpoint(model, output_dir, accelerator, global_step, logger=logger, slot="final")
     # Save the final trained checkpoint
     if accelerator.is_main_process:
         model = accelerator.unwrap_model(model)
