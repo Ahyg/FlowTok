@@ -932,6 +932,11 @@ def train_one_epoch(config, logger, accelerator,
 
     model.train()
 
+    # Best-val tracking — persists across epochs via an attribute on the function.
+    if not hasattr(train_one_epoch, "_best_val_l2"):
+        train_one_epoch._best_val_l2 = float("inf")
+        train_one_epoch._best_val_step = -1
+
     finetune_cfg = config.get("finetune", {})
     _finetune_enabled = finetune_cfg.get("enabled", False) and model_type == "flowtitok"
     _decoder_warmup_steps = finetune_cfg.get("decoder_warmup_steps", 0) if _finetune_enabled else 0
@@ -1198,7 +1203,8 @@ def train_one_epoch(config, logger, accelerator,
             # Save model checkpoint.
             if (global_step + 1) % config.experiment.save_every == 0:
                 save_path = save_checkpoint(
-                    model, config.experiment.output_dir, accelerator, global_step + 1, logger=logger)
+                    model, config.experiment.output_dir, accelerator, global_step + 1,
+                    logger=logger, slot="latest")
                 # Wait for everyone to save their checkpoint.
                 accelerator.wait_for_everyone()
 
@@ -1271,6 +1277,20 @@ def train_one_epoch(config, logger, accelerator,
                     if accelerator.is_main_process:
                         eval_log = {f'ema_eval/'+k: v for k, v in eval_scores.items()}
                         accelerator.log(eval_log, step=global_step + 1)
+                    # Track best val L2 (use EMA scores if EMA, else non-EMA).
+                    val_l2 = float(eval_scores.get("reconstruction_loss",
+                                                    eval_scores.get("l2_loss",
+                                                        eval_scores.get("recon_loss", float("inf")))))
+                    if val_l2 < train_one_epoch._best_val_l2:
+                        train_one_epoch._best_val_l2 = val_l2
+                        train_one_epoch._best_val_step = global_step + 1
+                        logger.info(
+                            f"[BEST-VAL] New best val L2 = {val_l2:.6f} at step {global_step + 1}. Saving."
+                        )
+                        save_checkpoint(
+                            model, config.experiment.output_dir, accelerator, global_step + 1,
+                            logger=logger, slot="best_val")
+                        accelerator.wait_for_everyone()
                     if config.training.get("use_ema", False):
                         # Switch back to the original model parameters for training.
                         ema_model.restore(model.parameters())
@@ -1296,6 +1316,20 @@ def train_one_epoch(config, logger, accelerator,
                     if accelerator.is_main_process:
                         eval_log = {f'eval/'+k: v for k, v in eval_scores.items()}
                         accelerator.log(eval_log, step=global_step + 1)
+                    # Track best val L2 (use EMA scores if EMA, else non-EMA).
+                    val_l2 = float(eval_scores.get("reconstruction_loss",
+                                                    eval_scores.get("l2_loss",
+                                                        eval_scores.get("recon_loss", float("inf")))))
+                    if val_l2 < train_one_epoch._best_val_l2:
+                        train_one_epoch._best_val_l2 = val_l2
+                        train_one_epoch._best_val_step = global_step + 1
+                        logger.info(
+                            f"[BEST-VAL] New best val L2 = {val_l2:.6f} at step {global_step + 1}. Saving."
+                        )
+                        save_checkpoint(
+                            model, config.experiment.output_dir, accelerator, global_step + 1,
+                            logger=logger, slot="best_val")
+                        accelerator.wait_for_everyone()
 
                 accelerator.wait_for_everyone()
 
@@ -1322,6 +1356,11 @@ def train_one_epoch(config, logger, accelerator,
                 break
 
 
+    # Final ckpt at end of training run.
+    if global_step >= config.training.max_train_steps:
+        save_checkpoint(
+            model, config.experiment.output_dir, accelerator, global_step,
+            logger=logger, slot="final")
     return global_step
 
 
@@ -2038,8 +2077,21 @@ def t2i_generate_images(model, tokenizer, captions, aes_scores, clip_tokenizer, 
     return
 
 
-def save_checkpoint(model, output_dir, accelerator, global_step, logger) -> Path:
-    save_path = Path(output_dir) / f"checkpoint-{global_step}"
+def save_checkpoint(model, output_dir, accelerator, global_step, logger, slot=None) -> Path:
+    """Save ckpt to a slot directory (overwrites if exists) or step-named dir.
+
+    Args:
+        slot: if str, saves to f'checkpoint-{slot}' (overwrites). If None, saves to
+              f'checkpoint-{global_step}' (legacy step-named behaviour).
+    """
+    import shutil
+    if slot is None:
+        save_path = Path(output_dir) / f"checkpoint-{global_step}"
+    else:
+        save_path = Path(output_dir) / f"checkpoint-{slot}"
+        if save_path.exists() and accelerator.is_main_process:
+            shutil.rmtree(save_path)
+        accelerator.wait_for_everyone()
 
     state_dict = accelerator.get_state_dict(model)
     if accelerator.is_main_process:
