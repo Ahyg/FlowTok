@@ -63,11 +63,13 @@ def main():
     if config.training.enable_wandb:
         tracker = "wandb"
 
+    # NOTE: accelerate 0.12.0 (lab env) uses kwarg name `logging_dir`; later
+    # versions renamed it to `project_dir`. Use the older name for compat.
     accelerator = Accelerator(
         gradient_accumulation_steps=config.training.gradient_accumulation_steps,
         mixed_precision=config.training.mixed_precision,
         log_with=tracker,
-        project_dir=config.experiment.logging_dir,
+        logging_dir=config.experiment.logging_dir,
         split_batches=False,
     )
 

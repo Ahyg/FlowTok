@@ -331,21 +331,24 @@ class FlowTiTokEncoder(nn.Module):
         self.token_size = config.vq_model.token_size * 2
 
         self.width = {
+                "tiny": 384,
                 "small": 512,
                 "base": 768,
                 "large": 1024,
             }[self.model_size]
         self.num_layers = {
+                "tiny": 6,
                 "small": 8,
                 "base": 12,
                 "large": 24,
             }[self.model_size]
         self.num_heads = {
+                "tiny": 6,
                 "small": 8,
                 "base": 12,
                 "large": 16,
             }[self.model_size]
-        
+
         self.in_channels = config.vq_model.get("in_channels", 3)
         self.nan_debug = config.vq_model.get("nan_debug", False)
         self.patch_embed = nn.Conv2d(
@@ -419,16 +422,19 @@ class FlowTiTokDecoder(nn.Module):
         self.nan_debug = config.vq_model.get("nan_debug", False)
 
         self.width = {
+                "tiny": 384,
                 "small": 512,
                 "base": 768,
                 "large": 1024,
             }[self.model_size]
         self.num_layers = {
+                "tiny": 6,
                 "small": 8,
                 "base": 12,
                 "large": 24,
             }[self.model_size]
         self.num_heads = {
+                "tiny": 6,
                 "small": 8,
                 "base": 12,
                 "large": 16,
