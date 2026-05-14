@@ -225,21 +225,24 @@ class TiTokEncoder(nn.Module):
         self.is_legacy = config.model.vq_model.get("is_legacy", True)
 
         self.width = {
+                "tiny": 384,
                 "small": 512,
                 "base": 768,
                 "large": 1024,
             }[self.model_size]
         self.num_layers = {
+                "tiny": 6,
                 "small": 8,
                 "base": 12,
                 "large": 24,
             }[self.model_size]
         self.num_heads = {
+                "tiny": 6,
                 "small": 8,
                 "base": 12,
                 "large": 16,
             }[self.model_size]
-        
+
         self.patch_embed = nn.Conv2d(
             in_channels=3, out_channels=self.width,
               kernel_size=self.patch_size, stride=self.patch_size, bias=True)
@@ -305,16 +308,19 @@ class TiTokDecoder(nn.Module):
         self.token_size = config.model.vq_model.token_size
         self.is_legacy = config.model.vq_model.get("is_legacy", True)
         self.width = {
+                "tiny": 384,
                 "small": 512,
                 "base": 768,
                 "large": 1024,
             }[self.model_size]
         self.num_layers = {
+                "tiny": 6,
                 "small": 8,
                 "base": 12,
                 "large": 24,
             }[self.model_size]
         self.num_heads = {
+                "tiny": 6,
                 "small": 8,
                 "base": 12,
                 "large": 16,
