@@ -126,6 +126,70 @@ the right instrument: they show, per weight, whether alignment can be gained
 ceiling). A's own 8k tokenizer ceiling is unknown (recon image was pruned);
 the §7 w000 cell (separate, 25k AE / 40k v2v + recon panel) settles it.
 
+### 6.2 Big-budget sweep — operational post-mortem + the verdict it still yields
+
+The reduced big-budget sweep ran 2026-05-18 11:25→17:45 and reported "ALL
+DONE", but **§7b is empty (0/3 decoded)**. Three compounding failures, none of
+which invalidate the AE-phase result that *did* survive:
+
+1. **Launcher ckpt-test bug (mine).** v2v writes the checkpoint as a *directory*
+   `…/ckpts/40000.ckpt/` (a TrainState dir; `test_sat2radar_v2v.py:437`). The
+   launcher gated DECODE on `[ -f "${CK}" ]` — a *regular-file* test, false for a
+   directory. Both **w000 and w005 v2v fully completed all 40000 steps**
+   (`output.log`: "Finish fitting, step=40000", "Save checkpoint 40000…"), but
+   DECODE was skipped on the false `-f`.
+2. **Unconditional end-of-cell prune.** `rm -rf "${V2V}/ckpts"` (and the AE
+   `checkpoint-*` dirs) runs every cell regardless of whether DECODE consumed
+   them — so the completed 40k v2v ckpt *and* the 25k AE ckpts were deleted.
+   Nothing is checkpoint-recoverable; a re-run is required to get §7b.
+3. **Shared-GPU OOM on w025.** The GPU-free wait loop runs *once* at sweep
+   start (11:25, GPU idle). At 17:44 two foreign processes (user `yxma`,
+   `openpi-sdvla`, 2×7.75 GiB) seized GPU 0 mid-sweep; w025 AE OOM'd at step ~0.
+   lab2 GPU 0 is shared and the loop never re-checked per cell.
+
+**What survived is the AE phase for w000/w005 — and it already settles w=0.05**
+(see 7a; the decoded table would only re-confirm). Numbers `eval`'s 7a table
+omits, pulled from `align_{w000,w005}.json`:
+
+| signal | w000 (separate) | w005 (joint 0.05) | read |
+|---|---|---|---|
+| x-modal cosine | −0.031 | **0.990** | alignment loss "works" |
+| linear CKA | 0.387 | **0.204 ↓** | rotation-invariant sim *down* |
+| PCA rank sat | 53.1 | **34.8 (−34%)** | sat latent collapsed |
+| sat recon MSE | 0.000851 | **+46.3%** | ≫ design-§5 +10% gate |
+| radar recon MSE | 0.002250 | **+23.2%** | also ≫ +10% |
+| **near-dead tok / 77 — sat** | **0** | **57** | **74% of codebook dead** |
+| **near-dead tok / 77 — radar** | **0** | **65** | **84% of codebook dead** |
+
+This is *worse* than the §4 sim_weight=0.5 pilot, not better: at 0.5/15k the
+collapse was purely spectral (near_dead=0, PCA-rank only). At the **smaller
+weight 0.05 with the bigger 25k budget** the collapse is so severe it kills
+74–84 % of individual tokens outright. More training at low weight does not
+soften alignment-by-collapse — it *deepens* it.
+
+**Tokenizer-ceiling panels (the reference the user asked for; survived):**
+`joint_tok_align/recon_{w000,w005}.png` — pure encode→decode, no flow, the
+best radar the detokenizer can ever render.
+
+- **w000 (separate):** radar recon tracks the GT storm cells (mild blur, cores
+  roughly placed). Healthy ceiling — if its v2v is poor, blame the flow budget.
+- **w005 (joint 0.05):** radar recon is a diffuse blue smear with **no
+  convective structure**, even with zero flow error. The collapsed latent
+  *physically cannot* render cores; any downstream v2v decode is capped at this
+  smear.
+
+**Verdict (does not need §7b):** index-wise cosine alignment is **refuted as
+implemented**. At the smallest swept weight and the big budget it collapses
+~80 % of the codebook and destroys the radar tokenizer ceiling; it fails the
+design-§5 recon gate by 4–5×. w025 (higher weight) can only be worse. The
+decoded-radar table is now *confirmatory*, not decisive. Recommended next
+lever: drop index-wise cosine; try the **set-level / InfoNCE** alternative
+(spec §3.1), which aligns the *code set* without forcing per-index direction
+equality (the mechanism that drives the collapse). §7 below stays as the
+auto-managed sweep tracker; if a confirmatory decoded run is wanted, the
+launcher fix is in `scripts/launch_jointtok_sweep.sh` (`-f`→`-e`, prune-after-
+decode, per-cell GPU re-check).
+
 ---
 
 ## 7. sim_weight sweep — reduced set, big budget
@@ -136,8 +200,8 @@ the §7 w000 cell (separate, 25k AE / 40k v2v + recon panel) settles it.
 
 | sim_weight | x-modal cosine ↑ | linear CKA | PCA rank sat | PCA rank radar | sat recon MSE | radar recon MSE | sat recon Δ vs w0 |
 |---|---|---|---|---|---|---|---|
-| 0.00 | _pending_ | | | | | | |
-| 0.05 | _pending_ | | | | | | |
+| 0.00 | -0.0310 | 0.3874 | 53.1 | 26.7 | 0.000851 | 0.002250 | +0.0% |
+| 0.05 | 0.9903 | 0.2043 | 34.8 | 24.9 | 0.001245 | 0.002771 | +46.3% |
 | 0.25 | _pending_ | | | | | | |
 
 ### 7b. Decoded-radar pixel-space (DECISIVE — 2024/07 v2v test)

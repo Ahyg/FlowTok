@@ -23,16 +23,18 @@ conda activate flowtok
 cd "${ROOT}"
 export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
 
-log "Waiting for GPU 0..."
-W=0
-while :; do
-  MEM=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d ' ')
-  BUSY=$(pgrep -fc "train_joint_sat_radar_ae|train_sat2radar_v2v|test_sat2radar_v2v|eval_joint_tokenizer" || true)
-  [ "${MEM:-99999}" -lt 2000 ] && [ "${BUSY:-0}" -eq 0 ] && { log "GPU 0 free (${MEM} MiB)."; break; }
-  [ "${W}" -ge 21600 ] && { log "Waited 6h, proceeding."; break; }
-  sleep 120; W=$((W+120))
-done
+# lab2 GPU 0 is shared with other users — re-check before EVERY cell, not just
+# once at start (the previous run OOM'd mid-sweep when a foreign job appeared).
+wait_gpu(){ local W=0; log "Waiting for GPU 0..."
+  while :; do
+    MEM=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d ' ')
+    BUSY=$(pgrep -fc "train_joint_sat_radar_ae|train_sat2radar_v2v|test_sat2radar_v2v|eval_joint_tokenizer" || true)
+    [ "${MEM:-99999}" -lt 2000 ] && [ "${BUSY:-0}" -eq 0 ] && { log "GPU 0 free (${MEM} MiB)."; return 0; }
+    [ "${W}" -ge 21600 ] && { log "Waited 6h, proceeding anyway."; return 0; }
+    sleep 120; W=$((W+120))
+  done; }
 
+wait_gpu
 run ANALYZE_0 python scripts/analyze_jointtok_sweep.py
 
 for TW in w000:0.0 w005:0.05 w025:0.25; do
@@ -42,6 +44,7 @@ for TW in w000:0.0 w005:0.05 w025:0.25; do
   AECFG="configs/joint_ae_sweep_${T}_lab2.yaml"
   VCFG="configs/Sat2Radar-v2v-jointtok-sweep-${T}-FlowTiTok-S.py"
   log "########## CELL ${T} (sim_weight=${WV}) ##########"
+  wait_gpu   # foreign user may have grabbed GPU 0 since the last cell
 
   run AE_${T} accelerate launch --num_processes 1 \
       scripts/train_joint_sat_radar_ae.py --config="${AECFG}"
@@ -65,9 +68,12 @@ for TW in w000:0.0 w005:0.05 w025:0.25; do
     run V2V_${T} accelerate launch --num_processes 1 \
         scripts/train_sat2radar_v2v.py --config="${VCFG}"
 
+    # NOTE: a v2v checkpoint is a *directory* (…/ckpts/40000.ckpt/), so test
+    # with -e (exists) and list dir entries with `ls -1dt`, NOT -f / `ls -1t`
+    # (the previous run's `-f` silently skipped every fully-trained ckpt).
     CK="${V2V}/ckpts/40000.ckpt"
-    [ -f "${CK}" ] || CK=$(ls -1t "${V2V}"/ckpts/*.ckpt 2>/dev/null | head -1)
-    if [ -n "${CK:-}" ] && [ -f "${CK}" ]; then
+    [ -e "${CK}" ] || CK=$(ls -1dt "${V2V}"/ckpts/*.ckpt 2>/dev/null | head -1)
+    if [ -n "${CK:-}" ] && [ -e "${CK}" ]; then
       run DECODE_${T} python -u scripts/test_sat2radar_v2v.py \
           --config "${VCFG}" --ckpt "${CK}" --out_dir "${V2V}/test_final" \
           --mode v2v --split test --filelist_path "${TEST_PKL}" \
@@ -80,10 +86,15 @@ for TW in w000:0.0 w005:0.05 w025:0.25; do
     log "SKIP EVAL/V2V_${T}: AE ckpt missing (${SAT} / ${RAD})"
   fi
 
-  # Prune heavy ckpts; keep test_final/ (metrics+panels), recon_test.png,
-  # align_${T}.json, log0.txt.
-  rm -rf "${AE}/sat/checkpoint-"* "${AE}/radar/checkpoint-"* "${V2V}/ckpts" 2>/dev/null
-  log "pruned heavy ckpts for ${T}"
+  # Prune heavy ckpts ONLY once DECODE has produced metrics.json — otherwise
+  # keep them so a failed/skipped cell stays recoverable (the previous run
+  # nuked fully-trained ckpts before decode ever consumed them).
+  if [ -f "${V2V}/test_final/metrics.json" ]; then
+    rm -rf "${AE}/sat/checkpoint-"* "${AE}/radar/checkpoint-"* "${V2V}/ckpts" 2>/dev/null
+    log "pruned heavy ckpts for ${T} (decode metrics secured)"
+  else
+    log "KEEP ckpts for ${T}: no decode metrics — left recoverable"
+  fi
   run ANALYZE_${T} python scripts/analyze_jointtok_sweep.py
 done
 
