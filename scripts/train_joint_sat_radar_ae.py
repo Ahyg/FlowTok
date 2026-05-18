@@ -135,6 +135,30 @@ def index_wise_cosine_loss(post_sat, post_radar):
     return (1.0 - cos).mean()
 
 
+def index_wise_infonce_loss(post_sat, post_radar, logit_scale):
+    """Per-index symmetric InfoNCE on posterior means (anti-collapse).
+
+    For each latent-token index k the same-timestamp (sat_k, radar_k) pair is
+    the positive; the same-index tokens of the other B-1 batch samples are the
+    negatives. A collapsed code cannot tell sample i from j, so this loss
+    *rises* under collapse instead of vanishing (unlike index-wise cosine —
+    see design §3.3). `logit_scale` is the learnable CLIP log-temperature; it
+    is `.exp()`d here (caller clamps it ≤ ln(100) per step).
+    """
+    s = post_sat.mean.squeeze(2).permute(2, 0, 1)     # [N, B, D]
+    r = post_radar.mean.squeeze(2).permute(2, 0, 1)    # [N, B, D]
+    N, B, _ = s.shape
+    if B < 2:                       # no negatives → InfoNCE undefined; no-op
+        return s.new_zeros(())
+    s = F.normalize(s, dim=-1)
+    r = F.normalize(r, dim=-1)
+    logits = logit_scale.exp() * torch.bmm(s, r.transpose(1, 2))   # [N,B,B]
+    tgt = torch.arange(B, device=s.device).expand(N, B).reshape(-1)
+    s2r = F.cross_entropy(logits.reshape(N * B, B), tgt)              # sat→radar
+    r2s = F.cross_entropy(logits.transpose(1, 2).reshape(N * B, B), tgt)  # radar→sat
+    return 0.5 * (s2r + r2s)
+
+
 # --------------------------------------------------------------------------- #
 # Checkpoint slots (plain pytorch_model.bin, atomic)                          #
 # --------------------------------------------------------------------------- #
@@ -219,11 +243,20 @@ def main():
                           output_file=f"{out_dir}/log{accelerator.process_index}.txt")
 
     sim_weight = float(config.joint.sim_weight)
+    # Backward-compat: old configs lack these → default to the original
+    # cosine path with no warmup, so existing A/B reproduce bit-for-bit.
+    sim_loss_kind = str(config.joint.get("sim_loss", "cosine"))
+    infonce_warmup = int(config.joint.get("infonce_warmup_steps", 1000))
+    infonce_init_temp = float(config.joint.get("infonce_init_temp", 0.07))
+    use_infonce = (sim_loss_kind == "infonce") and (sim_weight > 0.0)
     use_ema = bool(config.training.use_ema)
     crop = int(config.dataset.preprocessing.crop_size)
     if accelerator.is_main_process:
-        logger.info(f"sim_weight={sim_weight} "
-                    f"({'JOINT (Group B)' if sim_weight > 0 else 'SEPARATE (Group A)'})")
+        logger.info(
+            f"sim_weight={sim_weight} sim_loss={sim_loss_kind} "
+            f"({'JOINT (Group B)' if sim_weight > 0 else 'SEPARATE (Group A)'})"
+            + (f" | InfoNCE: init_temp={infonce_init_temp} "
+               f"warmup={infonce_warmup}" if use_infonce else ""))
         OmegaConf.save(config, Path(out_dir) / "config.yaml")
 
     if config.training.seed is not None:
@@ -252,8 +285,18 @@ def main():
             yield p
     params = (list(trainable(sat_model)) + list(trainable(radar_model))
               + list(trainable(sat_loss, True)) + list(trainable(radar_loss, True)))
+    # Learnable CLIP log-temperature for InfoNCE (design §3.3). Created always
+    # (1 scalar, harmless) but only optimized/clamped when InfoNCE is active,
+    # so the sim_weight=0 separate baseline stays a clean disjoint-param
+    # ablation (no extra optimized param, no cross-modal gradient).
+    logit_scale = torch.nn.Parameter(
+        torch.tensor(math.log(1.0 / infonce_init_temp),
+                     device=accelerator.device))
+    param_groups = [{"params": params}]
+    if use_infonce:
+        param_groups.append({"params": [logit_scale], "weight_decay": 0.0})
     opt = torch.optim.AdamW(
-        params,
+        param_groups,
         lr=config.optimizer.params.learning_rate,
         betas=(config.optimizer.params.beta1, config.optimizer.params.beta2),
         weight_decay=config.optimizer.params.weight_decay,
@@ -311,10 +354,20 @@ def main():
                                         mode="generator")
                 l_radar, radar_d = radar_loss(radar, radar_rec, radar_post,
                                               step, mode="generator")
-                l_sim = (index_wise_cosine_loss(sat_post, radar_post)
-                         if sim_weight > 0
-                         else torch.zeros((), device=accelerator.device))
-                loss = l_sat + l_radar + sim_weight * l_sim
+                if sim_weight > 0.0:
+                    if use_infonce:
+                        l_sim = index_wise_infonce_loss(
+                            sat_post, radar_post, logit_scale)
+                        ramp = (min(1.0, step / infonce_warmup)
+                                if infonce_warmup > 0 else 1.0)
+                    else:
+                        l_sim = index_wise_cosine_loss(sat_post, radar_post)
+                        ramp = 1.0          # cosine path: no warmup (compat)
+                else:
+                    l_sim = torch.zeros((), device=accelerator.device)
+                    ramp = 0.0
+                eff_w = sim_weight * ramp
+                loss = l_sat + l_radar + eff_w * l_sim
                 accelerator.backward(loss)
                 if config.training.max_grad_norm and accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(params,
@@ -322,6 +375,9 @@ def main():
                 opt.step()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
+                if use_infonce:                  # CLIP: clamp temp ≤ ln(100)
+                    with torch.no_grad():
+                        logit_scale.clamp_(max=math.log(100.0))
 
             if accelerator.sync_gradients:
                 if use_ema:
@@ -331,10 +387,13 @@ def main():
 
                 if step % config.experiment.log_every == 0:
                     sps = config.training.per_gpu_batch_size * step / (time.time() - t0)
+                    tmsg = (f" temp {logit_scale.exp().item():.2f}"
+                            if use_infonce else "")
                     logger.info(
                         f"step {step}/{max_steps} | loss {loss.item():.4f} "
                         f"| sat {l_sat.item():.4f} radar {l_radar.item():.4f} "
-                        f"| sim {float(l_sim):.4f} (w={sim_weight}) "
+                        f"| sim {float(l_sim):.4f} ({sim_loss_kind} "
+                        f"w={sim_weight} eff={eff_w:.4f}){tmsg} "
                         f"| lr {sched.get_last_lr()[0]:.2e} | {sps:.1f} im/s")
 
                 if step % config.experiment.save_every == 0:

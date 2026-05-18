@@ -1,17 +1,20 @@
-# sim_weight SWEEP cell w000 (SEPARATE baseline). Clone of joint_ae_joint_lab2.yaml;
-# only experiment.* paths + joint.sim_weight + step budget differ. See
-# docs/specs/2026-05-18-joint-sat-radar-tokenizer-design.md
+# InfoNCE sim_weight SWEEP cell w000 (SEPARATE baseline). Clone of joint_ae_joint_lab2.yaml;
+# only experiment.* paths + joint.{sim_weight,sim_loss,...} + step budget differ. See
+# docs/specs/2026-05-18-joint-sat-radar-tokenizer-design.md §3.3
 experiment:
   project: joint_sat_radar_tokenizer
-  name: joint_ae_sweep_w000
-  output_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w000_run1
+  name: joint_ae_infonce_w000
+  output_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_infonce_w000_run1
   log_every: 100
   save_every: 5000
   eval_every: 2500
-  logging_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w000_run1/logs
+  logging_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_infonce_w000_run1/logs
 
 joint:
-  sim_weight: 0.0          # SWEEP cell (SEPARATE baseline)
+  sim_weight: 0.0          # InfoNCE SWEEP cell (SEPARATE baseline)
+  sim_loss: infonce
+  infonce_warmup_steps: 1000
+  infonce_init_temp: 0.07
   sat_in_channels: 11
   sat_out_channels: 11
   radar_in_channels: 1

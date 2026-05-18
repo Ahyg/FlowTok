@@ -1,102 +1,144 @@
 #!/bin/bash
-# sim_weight sweep — REDUCED set, BIG budget (the 8k pilot was visually
-# unconverged: neg R², CSI35=0, low-freq blobs). Per the user's call:
-#   cells w ∈ {0.0 separate, 0.05, 0.25} ; AE 25k ; v2v 40k
-# Per cell: joint AE -> alignment eval + tokenizer-ceiling recon panel ->
-# big-budget v2v -> DECODE to dBZ radar (the decisive metric) -> prune ckpts.
+# InfoNCE sim_weight sweep — BIG budget, MULTI-GPU parallel (design §3.3;
+# index-wise cosine was refuted by alignment-by-collapse). Per-index symmetric
+# InfoNCE, learnable CLIP log-temp, 1k-step sim-loss warmup. Cells:
+#   w ∈ {0.0 separate, 0.1, 0.5, 1.0} ; AE 25k ; v2v 40k
+# Each cell is fully independent (one-knob ablation) → run cells in PARALLEL
+# across every idle GPU on this shared box. A cell is pinned to one GPU for
+# its whole AE→eval→v2v→decode→prune→analyze pipeline; when it finishes the
+# GPU is released for the next queued cell. Foreign/busy GPUs are skipped and
+# picked up later if they free. §7 rewrites are flock-serialized (shared doc).
+# InfoNCE alignment artifacts tagged inf_* so cosine §6.2 ones are preserved.
 #
-# tmux, single GPU 0, continue-on-failure. §7 re-written after every cell.
+# tmux, continue-on-failure, recoverable ckpts on failure.
 set -u
 ROOT="/mnt/ssd_1/yghu/Code/FlowTok"
 EXP="/mnt/ssd_2/yghu/Experiments"
 TEST_PKL="/mnt/ssd_1/yghu/Data/71_3m/filelists/dataset_filelist_v2v_test_202407.pkl"
 ALIGN_DIR="${EXP}/joint_tok_align"
-MLOG="/tmp/jointtok_sweep.log"
-mkdir -p "${ALIGN_DIR}"
+MLOG="/tmp/jointtok_infonce_sweep.log"
+ALCK="/tmp/jointtok_infonce_analyze.lock"
+GPU_MEM_FREE_MIB=2000          # a GPU is "idle" if used mem < this
+CELLS=(w000:0.0 w010:0.1 w050:0.5 w100:1.0)
+GPUS=(0 1 2 3)
+mkdir -p "${ALIGN_DIR}"; : >"${MLOG}"
 log(){ echo "[$(date '+%F %T')] $*" | tee -a "${MLOG}"; }
-run(){ local n="$1"; shift; log "=== START ${n} ==="
-  if "$@" >>"${MLOG}" 2>&1; then log "=== OK ${n} ==="; return 0
-  else log "=== FAIL ${n} (exit $?) ==="; return 1; fi; }
 
 source /home/yghu/miniconda3/etc/profile.d/conda.sh
 conda activate flowtok
 cd "${ROOT}"
-export CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
+export PYTHONUNBUFFERED=1
 
-# lab2 GPU 0 is shared with other users — re-check before EVERY cell, not just
-# once at start (the previous run OOM'd mid-sweep when a foreign job appeared).
-wait_gpu(){ local W=0; log "Waiting for GPU 0..."
-  while :; do
-    MEM=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d ' ')
-    BUSY=$(pgrep -fc "train_joint_sat_radar_ae|train_sat2radar_v2v|test_sat2radar_v2v|eval_joint_tokenizer" || true)
-    [ "${MEM:-99999}" -lt 2000 ] && [ "${BUSY:-0}" -eq 0 ] && { log "GPU 0 free (${MEM} MiB)."; return 0; }
-    [ "${W}" -ge 21600 ] && { log "Waited 6h, proceeding anyway."; return 0; }
-    sleep 120; W=$((W+120))
-  done; }
+# Regenerate the InfoNCE sweep configs fresh (self-contained / reproducible).
+if python scripts/gen_sweep_configs.py >>"${MLOG}" 2>&1; then log "GEN_CONFIGS OK"
+else log "GEN_CONFIGS FAILED — abort"; exit 1; fi
 
-wait_gpu
-run ANALYZE_0 python scripts/analyze_jointtok_sweep.py
+# §7 rewrite touches the shared results doc — serialize across parallel cells.
+analyze(){ flock "${ALCK}" python scripts/analyze_jointtok_sweep.py \
+             >>"${MLOG}" 2>&1; }
+analyze   # seed §7 (all pending) once up front
 
-for TW in w000:0.0 w005:0.05 w025:0.25; do
-  T="${TW%%:*}"; WV="${TW##*:}"
-  AE="${EXP}/joint_ae_sweep_${T}_run1"
-  V2V="${EXP}/v2v_jointtok_sweep_${T}_run1"
-  AECFG="configs/joint_ae_sweep_${T}_lab2.yaml"
-  VCFG="configs/Sat2Radar-v2v-jointtok-sweep-${T}-FlowTiTok-S.py"
-  log "########## CELL ${T} (sim_weight=${WV}) ##########"
-  wait_gpu   # foreign user may have grabbed GPU 0 since the last cell
+# A GPU is usable iff currently idle (no foreign job) — checked at claim time.
+gpu_idle(){ local g="$1"
+  local m; m=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits \
+                 -i "$g" 2>/dev/null | tr -d ' ')
+  [ -n "${m:-}" ] && [ "${m}" -lt "${GPU_MEM_FREE_MIB}" ]; }
 
-  run AE_${T} accelerate launch --num_processes 1 \
+# ── full per-cell pipeline (runs in a subshell, CUDA_VISIBLE_DEVICES pinned) ──
+run_cell(){
+  local T="$1" WV="$2" G="$3"
+  local AE="${EXP}/joint_ae_infonce_${T}_run1"
+  local V2V="${EXP}/v2v_jointtok_infonce_${T}_run1"
+  local AECFG="configs/joint_ae_infonce_${T}_lab2.yaml"
+  local VCFG="configs/Sat2Radar-v2v-jointtok-infonce-${T}-FlowTiTok-S.py"
+  local CLOG="${ALIGN_DIR}/cell_${T}.log"; : >"${CLOG}"
+  # cell-scoped runner: verbose tool output → cell log; 1-line status → MLOG
+  cr(){ local n="$1"; shift; log "[${T}|gpu${G}] START ${n}"
+    if "$@" >>"${CLOG}" 2>&1; then log "[${T}|gpu${G}] OK ${n}"; return 0
+    else log "[${T}|gpu${G}] FAIL ${n} (exit $?)"; return 1; fi; }
+
+  log "########## CELL ${T} (sim_weight=${WV}) on GPU ${G} ##########"
+  cr AE_${T} accelerate launch --num_processes 1 \
       scripts/train_joint_sat_radar_ae.py --config="${AECFG}"
 
+  local M bv fn
   for M in sat radar; do
     bv="${AE}/${M}/checkpoint-best_val/pytorch_model.bin"
     fn="${AE}/${M}/checkpoint-final/pytorch_model.bin"
-    [ -f "${bv}" ] || { [ -f "${fn}" ] && { mkdir -p "${AE}/${M}/checkpoint-best_val"; cp -f "${fn}" "${bv}"; log "best_val<-final ${T}/${M}"; }; }
+    [ -f "${bv}" ] || { [ -f "${fn}" ] && { mkdir -p "${AE}/${M}/checkpoint-best_val"; cp -f "${fn}" "${bv}"; log "[${T}] best_val<-final ${M}"; }; }
   done
-  SAT="${AE}/sat/checkpoint-best_val/pytorch_model.bin"
-  RAD="${AE}/radar/checkpoint-best_val/pytorch_model.bin"
+  local SAT="${AE}/sat/checkpoint-best_val/pytorch_model.bin"
+  local RAD="${AE}/radar/checkpoint-best_val/pytorch_model.bin"
 
   if [ -f "${SAT}" ] && [ -f "${RAD}" ]; then
-    # alignment metrics + tokenizer-ceiling recon panel (pure encode->decode).
-    run EVAL_${T} python scripts/eval_joint_tokenizer.py \
+    cr EVAL_${T} python scripts/eval_joint_tokenizer.py \
         --joint_config "${AECFG}" --sat_ckpt "${SAT}" --radar_ckpt "${RAD}" \
         --filelist "${TEST_PKL}" --split test --n_samples 512 \
-        --n_recon_images 6 --tag "${T}" --out_dir "${ALIGN_DIR}"
-    [ -f "${ALIGN_DIR}/recon_${T}.png" ] && cp -f "${ALIGN_DIR}/recon_${T}.png" "${AE}/recon_test.png" && log "recon panel -> ${AE}/recon_test.png"
+        --n_recon_images 6 --tag "inf_${T}" --out_dir "${ALIGN_DIR}"
+    [ -f "${ALIGN_DIR}/recon_inf_${T}.png" ] && cp -f "${ALIGN_DIR}/recon_inf_${T}.png" "${AE}/recon_test.png" && log "[${T}] recon panel saved"
 
-    run V2V_${T} accelerate launch --num_processes 1 \
+    cr V2V_${T} accelerate launch --num_processes 1 \
         scripts/train_sat2radar_v2v.py --config="${VCFG}"
 
-    # NOTE: a v2v checkpoint is a *directory* (…/ckpts/40000.ckpt/), so test
-    # with -e (exists) and list dir entries with `ls -1dt`, NOT -f / `ls -1t`
-    # (the previous run's `-f` silently skipped every fully-trained ckpt).
-    CK="${V2V}/ckpts/40000.ckpt"
+    # a v2v ckpt is a *directory* (…/ckpts/40000.ckpt/) → test with -e, ls -1dt
+    local CK="${V2V}/ckpts/40000.ckpt"
     [ -e "${CK}" ] || CK=$(ls -1dt "${V2V}"/ckpts/*.ckpt 2>/dev/null | head -1)
     if [ -n "${CK:-}" ] && [ -e "${CK}" ]; then
-      run DECODE_${T} python -u scripts/test_sat2radar_v2v.py \
+      cr DECODE_${T} python -u scripts/test_sat2radar_v2v.py \
           --config "${VCFG}" --ckpt "${CK}" --out_dir "${V2V}/test_final" \
           --mode v2v --split test --filelist_path "${TEST_PKL}" \
           --batch_size 8 --max_batches_metrics 50 --max_batches_images 4 \
           --skip_gen_metrics --gpu 0 --metrics_json "${V2V}/test_final/metrics.json"
     else
-      log "SKIP DECODE_${T}: no v2v ckpt in ${V2V}/ckpts/"
+      log "[${T}] SKIP DECODE: no v2v ckpt in ${V2V}/ckpts/"
     fi
   else
-    log "SKIP EVAL/V2V_${T}: AE ckpt missing (${SAT} / ${RAD})"
+    log "[${T}] SKIP EVAL/V2V: AE ckpt missing"
   fi
 
-  # Prune heavy ckpts ONLY once DECODE has produced metrics.json — otherwise
-  # keep them so a failed/skipped cell stays recoverable (the previous run
-  # nuked fully-trained ckpts before decode ever consumed them).
+  # Prune heavy ckpts ONLY once DECODE produced metrics.json — else keep them
+  # so a failed/contended cell stays recoverable.
   if [ -f "${V2V}/test_final/metrics.json" ]; then
     rm -rf "${AE}/sat/checkpoint-"* "${AE}/radar/checkpoint-"* "${V2V}/ckpts" 2>/dev/null
-    log "pruned heavy ckpts for ${T} (decode metrics secured)"
+    log "[${T}] pruned heavy ckpts (decode metrics secured)"
   else
-    log "KEEP ckpts for ${T}: no decode metrics — left recoverable"
+    log "[${T}] KEEP ckpts: no decode metrics — left recoverable"
   fi
-  run ANALYZE_${T} python scripts/analyze_jointtok_sweep.py
+  analyze
+  log "########## CELL ${T} DONE ##########"
+}
+
+# ── scheduler: dispatch cells onto idle GPUs, reap, repeat ───────────────────
+declare -A GPU_PID             # gpu -> pid of the cell currently on it
+qi=0
+log "scheduler start: ${#CELLS[@]} cells, GPUs ${GPUS[*]} (idle<${GPU_MEM_FREE_MIB}MiB)"
+while :; do
+  # dispatch as many queued cells as there are idle, unclaimed GPUs
+  while [ "${qi}" -lt "${#CELLS[@]}" ]; do
+    g=""
+    for cand in "${GPUS[@]}"; do
+      [ -z "${GPU_PID[$cand]:-}" ] && gpu_idle "${cand}" && { g="${cand}"; break; }
+    done
+    [ -z "${g}" ] && break
+    T="${CELLS[$qi]%%:*}"; WV="${CELLS[$qi]##*:}"
+    ( export CUDA_VISIBLE_DEVICES="${g}"; run_cell "${T}" "${WV}" "${g}" ) &
+    GPU_PID[$g]=$!
+    log "DISPATCH ${T} (w=${WV}) -> GPU ${g} pid ${GPU_PID[$g]}"
+    qi=$((qi+1)); sleep 8
+  done
+  # reap finished cells, freeing their GPU
+  for g in "${!GPU_PID[@]}"; do
+    p="${GPU_PID[$g]}"
+    if [ -n "${p}" ] && ! kill -0 "${p}" 2>/dev/null; then
+      wait "${p}" 2>/dev/null || true
+      log "REAP GPU ${g} (pid ${p} exited)"
+      unset 'GPU_PID[$g]'
+    fi
+  done
+  # done when queue exhausted and no cells in flight
+  [ "${qi}" -ge "${#CELLS[@]}" ] && [ "${#GPU_PID[@]}" -eq 0 ] && break
+  sleep 30
 done
 
-run ANALYZE_FINAL python scripts/analyze_jointtok_sweep.py
+analyze
 log "ALL DONE. §7 in docs/specs/results/2026-05-18-joint-tokenizer-results.md"

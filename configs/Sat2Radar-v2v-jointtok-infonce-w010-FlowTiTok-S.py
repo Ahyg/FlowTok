@@ -9,7 +9,7 @@ class Args:
             setattr(self, key, value)
 
 
-# sim_weight SWEEP cell w005 (w=0.05, big-budget 40000-step v2v): FlowTok-S on joint_ae_sweep_w005_run1 tiny+small
+# InfoNCE SWEEP cell w010 (w=0.1, big-budget 40000-step v2v): FlowTok-S on joint_ae_infonce_w010_run1 tiny+small
 # AE pair (sat/radar best_val). vq_model arch MUST match the trained AE
 # (tiny enc + small dec, 77 tok, token_size 16) or strict=False silently loads garbage.
 # Pilot: 8k steps — reads as a conditioning/convergence signal, not a converged model.
@@ -49,10 +49,10 @@ def get_config():
 
     # Local lab2 AE checkpoints (run1 EMA).
     config.sat_tokenizer_checkpoint = (
-        "/mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w005_run1/sat/checkpoint-best_val/pytorch_model.bin"
+        "/mnt/ssd_2/yghu/Experiments/joint_ae_infonce_w010_run1/sat/checkpoint-best_val/pytorch_model.bin"
     )
     config.radar_tokenizer_checkpoint = (
-        "/mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w005_run1/radar/checkpoint-best_val/pytorch_model.bin"
+        "/mnt/ssd_2/yghu/Experiments/joint_ae_infonce_w010_run1/radar/checkpoint-best_val/pytorch_model.bin"
     )
 
     config.train = d(
@@ -151,7 +151,7 @@ def get_config():
     )
 
     config.workdir = (
-        "/mnt/ssd_2/yghu/Experiments/v2v_jointtok_sweep_w005_run1"
+        "/mnt/ssd_2/yghu/Experiments/v2v_jointtok_infonce_w010_run1"
     )
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"
