@@ -368,7 +368,15 @@ def main():
     save_slot(radar_model, radar_ema, accelerator, f"{out_dir}/radar", "final",
               step, logger, use_ema)
     logger.info(f"Done. best combined val L2 = {best_val:.6f}")
-    accelerator.end_training()
+    # NOTE: no accelerator.init_trackers() in this script, so
+    # accelerator.end_training() raises AttributeError('trackers') on
+    # accelerate 0.12.0 *after* all work+ckpts are saved. Guard it so the
+    # process exits 0 (the earlier overnight run trained fine but exited 1
+    # here, producing misleading FAIL markers in the orchestrator log).
+    try:
+        accelerator.end_training()
+    except AttributeError:
+        pass
 
 
 if __name__ == "__main__":
