@@ -9,7 +9,7 @@ class Args:
             setattr(self, key, value)
 
 
-# sim_weight SWEEP cell w025 (w=0.25): FlowTok-S v2v on the joint_ae_sweep_w025_run1 tiny+small
+# sim_weight SWEEP cell w025 (w=0.25, big-budget 40000-step v2v): FlowTok-S on joint_ae_sweep_w025_run1 tiny+small
 # AE pair (sat/radar best_val). vq_model arch MUST match the trained AE
 # (tiny enc + small dec, 77 tok, token_size 16) or strict=False silently loads garbage.
 # Pilot: 8k steps — reads as a conditioning/convergence signal, not a converged model.
@@ -56,11 +56,11 @@ def get_config():
     )
 
     config.train = d(
-        n_steps=8_000,
+        n_steps=40000,
         batch_size=2,             # single 4090, 16-frame v2v clips
         log_interval=100,
-        eval_interval=2_000,
-        save_interval=4_000,
+        eval_interval=10_000,
+        save_interval=20_000,
         n_samples_eval=4,
         val_max_batches=28,       # ~all of val_small (56 clips / batch 2)
     )
@@ -74,7 +74,7 @@ def get_config():
 
     config.lr_scheduler = d(
         name="customized",
-        warmup_steps=2000,
+        warmup_steps=4000,
     )
 
     config.vq_model = d(

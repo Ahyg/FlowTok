@@ -101,6 +101,10 @@ def main():
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--tag", required=True)
     ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--n_recon_images", type=int, default=6,
+                    help="test frames to dump as a pure encode->decode "
+                         "reconstruction panel (NO flow) — the tokenizer "
+                         "ceiling reference; 0 disables.")
     ap.add_argument("--gpu", default="0")
     args = ap.parse_args()
 
@@ -125,6 +129,7 @@ def main():
     sat_se = radar_se = 0.0
     nb = 0
     seen = 0
+    recon_cap = None                       # first-batch tensors for the panel
     for batch in loader:
         if seen >= args.n_samples:
             break
@@ -147,6 +152,15 @@ def main():
             clip_tok, clip_enc, device)
         sat_rec, sp_post = sat_ae(sat, tg_s)
         radar_rec, rp_post = radar_ae(radar, tg_r)
+        if recon_cap is None and args.n_recon_images > 0:
+            k = min(args.n_recon_images, sat.shape[0])
+            recon_cap = {
+                "sat_in":  sat[:k, 0].cpu().numpy(),
+                "sat_rec": sat_rec[:k, 0].cpu().numpy(),
+                "rad_in":  radar[:k, 0].cpu().numpy(),
+                "rad_rec": radar_rec[:k, 0].cpu().numpy(),
+                "ids": (rp[:k] if rp else [str(i) for i in range(k)]),
+            }
         sat_se += F.mse_loss(sat_rec, sat).item()
         radar_se += F.mse_loss(radar_rec, radar).item()
         nb += 1
@@ -181,6 +195,47 @@ def main():
     jp.write_text(json.dumps(res, indent=2))
     print(json.dumps(res, indent=2))
     print(f"[eval_joint_tokenizer] wrote {jp}")
+
+    # Pure encode->decode reconstruction panel (NO flow) — the tokenizer
+    # ceiling reference the v2v decode can never beat. Defensive: a plotting
+    # failure must not lose the JSON above.
+    if recon_cap is not None:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            k = len(recon_cap["ids"])
+            fig, ax = plt.subplots(k, 4, figsize=(13, 3.1 * k), squeeze=False)
+            cols = ["Sat IR ch0 (in)", "Sat IR ch0 (AE recon)",
+                    "Radar GT", "Radar (AE recon)"]
+            for j, c in enumerate(cols):
+                ax[0, j].set_title(c, fontsize=11)
+            for i in range(k):
+                si, sr = recon_cap["sat_in"][i], recon_cap["sat_rec"][i]
+                ri, rr = recon_cap["rad_in"][i], recon_cap["rad_rec"][i]
+                svmin, svmax = float(si.min()), float(si.max())
+                rvmax = max(float(ri.max()), float(rr.max()), 1e-6)
+                ax[i, 0].imshow(si, cmap="viridis", vmin=svmin, vmax=svmax)
+                ax[i, 1].imshow(sr, cmap="viridis", vmin=svmin, vmax=svmax)
+                ax[i, 2].imshow(ri, cmap="turbo", vmin=0, vmax=rvmax)
+                ax[i, 3].imshow(rr, cmap="turbo", vmin=0, vmax=rvmax)
+                rmse = float(np.sqrt(((rr - ri) ** 2).mean()))
+                ax[i, 0].set_ylabel(str(recon_cap["ids"][i])[:18], fontsize=8)
+                ax[i, 3].set_xlabel(f"radar recon RMSE={rmse:.4f}", fontsize=8)
+                for j in range(4):
+                    ax[i, j].set_xticks([]); ax[i, j].set_yticks([])
+            fig.suptitle(
+                f"Tokenizer ceiling — group {args.tag}: pure AE encode->decode "
+                f"(no flow). sat MSE={res['reconstruction']['sat_mse']:.5f}, "
+                f"radar MSE={res['reconstruction']['radar_mse']:.5f}",
+                fontsize=12)
+            fig.tight_layout(rect=[0, 0, 1, 0.97])
+            rp_img = Path(args.out_dir) / f"recon_{args.tag}.png"
+            fig.savefig(rp_img, dpi=110)
+            plt.close(fig)
+            print(f"[eval_joint_tokenizer] wrote {rp_img}")
+        except Exception as e:                              # noqa: BLE001
+            print(f"[eval_joint_tokenizer] recon panel skipped: {e}")
 
 
 if __name__ == "__main__":

@@ -92,39 +92,27 @@ Read with the §4 caveat: B's tokenizer is collapsed/low-rank, so a lower token-
 
 **This resolves §4 hypothesis 2.** B's lower token-space loss (0.43 vs 0.61) was *entirely* the collapse artifact: decoded to pixels, B is worse on every reconstruction metric (mse_dbz 2.5×, ssim 0.34 vs 0.64, r² −2.40 vs −0.35). The two FSS wins are at near-zero absolute FSS (0.10) with both models scoring **0** on the ≥35 dBZ convective skill scores (csi/pod/far) — i.e. neither 8k-step pilot predicts storm cores yet, so the FSS edge is not meaningful skill. **End-to-end conclusion: joint training at sim_weight=0.5 is net-harmful — the alignment is real but it costs more in reconstruction than it returns in flow conditioning.** Not a refutation of the idea (see §4 verdict); it confirms 0.5 is past the operating point and motivates the §5 sweep. The decision rule (design §5) already returned *helps tokenizers = **False*** in §1; this pixel-space table is the independent end-to-end confirmation of that call.
 
-
-
 ---
 
-## 7. sim_weight sweep `{0, 0.02, 0.05, 0.1, 0.25}` (+0.5 anchor)
+## 7. sim_weight sweep — reduced set, big budget
 
-Same one-knob ablation, same budgets as §1/§6 (AE 15k, v2v 8k, seed 42, shared batch order). w=0 reuses Group A, w=0.5 reuses Group B. **Final ranking is the decoded-radar table — token-space loss is deliberately not used here (see §4).**
+`w ∈ {0.0 separate, 0.05, 0.25}`, **AE 25k / v2v 40k** (the §6 8k pilot was visually unconverged — neg R², CSI35=0, low-freq blobs; those 8k A/B numbers stay in §4/§6 and are *not* mixed into this table). One-knob ablation, seed 42, shared batch order. **Ranking = the decoded-radar table 7b** — token-space loss is deliberately excluded (§4 collapse confound). Tokenizer-ceiling recon panels (pure encode→decode, no flow): `joint_tok_align/recon_{w000,w005,w025}.png` (also copied to each `joint_ae_sweep_*_run1/recon_test.png`) — the decoded radar in 7b can never beat that ceiling.
 
-### 7a. AE trade-off (the §5 collapse question)
+### 7a. AE trade-off + tokenizer ceiling
 
 | sim_weight | x-modal cosine ↑ | linear CKA | PCA rank sat | PCA rank radar | sat recon MSE | radar recon MSE | sat recon Δ vs w0 |
 |---|---|---|---|---|---|---|---|
-| 0.00 | 0.0559 | 0.3261 | 29.9 | 10.4 | 0.001089 | 0.002788 | +0.0% |
-| 0.02 | _pending_ | | | | | | |
+| 0.00 | _pending_ | | | | | | |
 | 0.05 | _pending_ | | | | | | |
-| 0.10 | _pending_ | | | | | | |
 | 0.25 | _pending_ | | | | | | |
-| 0.50 | 0.9987 | 0.2662 | 10.8 | 5.6 | 0.001745 | 0.003091 | +60.2% |
 
 ### 7b. Decoded-radar pixel-space (DECISIVE — 2024/07 v2v test)
 
 | sim_weight | mse_dbz ↓ | rmse_dbz ↓ | ssim ↑ | r² ↑ | avg_fss ↑ | csi35 ↑ |
 |---|---|---|---|---|---|---|
-| 0.00 | 27.3956 | 5.2341 | 0.6349 | -0.3544 | 0.0985 | 0.0000 |
-| 0.02 | _pending_ | | | | | |
+| 0.00 | _pending_ | | | | | |
 | 0.05 | _pending_ | | | | | |
-| 0.10 | _pending_ | | | | | |
 | 0.25 | _pending_ | | | | | |
-| 0.50 | 68.7669 | 8.2926 | 0.3421 | -2.3998 | 0.1024 | 0.0000 |
 
-**Decoded-radar winner (min mse_dbz): sim_weight = 0.00** (mse_dbz 27.3956, ssim 0.6349, r² -0.3544).
-
-**§5 non-collapse operating point:** largest w keeping sat PCA rank ≥ 0.9·w0 and sat recon ≤ +10% is **w = 0.00**. Coincides with the decoded-radar winner — clean result.
-
-→ **No positive sim_weight beats the separate baseline on decoded radar.** Index-wise cosine alignment, at every weight tested, costs more reconstruction than it returns in flow conditioning. Recommend dropping index-wise alignment and revisiting the set-level / InfoNCE alternative (spec §3.1) before further sweeping.
+_Sweep running — 7b fills in per cell (~3.3 h/cell: AE 25k + v2v 40k + decode)._
 

@@ -1,17 +1,17 @@
-# sim_weight SWEEP cell: sim_weight=0.02. Clone of joint_ae_joint_lab2.yaml;
-# only experiment.* paths + joint.sim_weight differ. One-knob ablation; see
+# sim_weight SWEEP cell w000 (SEPARATE baseline). Clone of joint_ae_joint_lab2.yaml;
+# only experiment.* paths + joint.sim_weight + step budget differ. See
 # docs/specs/2026-05-18-joint-sat-radar-tokenizer-design.md
 experiment:
   project: joint_sat_radar_tokenizer
-  name: joint_ae_sweep_w002
-  output_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w002_run1
+  name: joint_ae_sweep_w000
+  output_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w000_run1
   log_every: 100
   save_every: 5000
   eval_every: 2500
-  logging_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w002_run1/logs
+  logging_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w000_run1/logs
 
 joint:
-  sim_weight: 0.02          # SWEEP cell — index-wise cosine alignment
+  sim_weight: 0.0          # SWEEP cell (SEPARATE baseline)
   sat_in_channels: 11
   sat_out_channels: 11
   radar_in_channels: 1
@@ -88,7 +88,7 @@ training:
   enable_wandb: false
   use_ema: true
   seed: 42
-  max_train_steps: 15000
+  max_train_steps: 25000
   max_grad_norm: 1.0
   nan_check: false
   nan_skip: true
