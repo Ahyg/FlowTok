@@ -59,6 +59,36 @@ L_total = L_ae_sat + L_ae_radar + sim_weight · L_sim
 - v2v DiT: **FlowTok-S** (~30M, the existing `Sat2Radar-v2v-uni-...-FlowTiTok-S.py`), frozen tokenizers, 16-frame clips batch 2.
 - Steps cut for an overnight pilot: AE 15k (token-sweep best-val was effectively reached well before 60k on this data), v2v 8k (**pilot — not converged; reads as a conditioning/convergence signal + rough recon, not a final model**).
 
+### 3.3 Follow-up: per-index InfoNCE alignment (added 2026-05-19 — supersedes the §7 cosine-weight-sweep assumption)
+
+**Why index-wise cosine is abandoned.** The pilot + the reduced big-budget sweep (results doc §4, §6, §6.2) showed index-wise cosine produces **alignment-by-collapse**: cosine → 0.99 but PCA effective rank halves, recon degrades +46 % sat / +23 % radar, and at the *smallest* swept weight 0.05 with the *big* 25k budget **~80 % of the 77-token codebook dies** (57/77 sat, 65/77 radar near-dead) and the tokenizer-ceiling recon panel is a coreless smear. The idea (latent-code alignment) is sound; this *loss* is not.
+
+**The weight is not the lever — proven from the surviving AE logs.** The weighted similarity term `sim_weight·L_sim` is ≤ 0.38 % of total loss at its peak (step 100) and ~0.16 % mean over 25k steps. Lowering the weight cannot help — 0.05 is already negligible by magnitude and still fatal. The damage is mechanistic: (a) `1−cos` has a **free degenerate global optimum (collapse)**; (b) cross-modal cosine saturates 0 → 0.99 within the **first ~200 steps**, before reconstruction has built a non-degenerate code, after which the term goes invisible in the loss (~0.13 % share) while the crippled low-rank latent permanently caps recon (w005 sat/radar stays ~20 % worse than the w000 separate baseline through step 25k, gap opens early and never closes). The fix must **remove the degenerate optimum**, not shrink its weight.
+
+**Loss — per-index InfoNCE (spec §3.1 variant b).** Same posterior means S, R squeezed to ℝ^[B,D,N] (the exact tensor the cosine path used). For each token index k:
+
+```
+Ŝ_k, R̂_k = L2-normalize over D of S[:,:,k], R[:,:,k]            # [B,D]
+logits_k  = logit_scale.exp() · (Ŝ_k · R̂_kᵀ)                    # [B,B]
+L_sim_k   = ½·( CE(logits_k, I_B) + CE(logits_kᵀ, I_B) )         # symmetric CLIP, positives = same-timestamp pair
+L_sim     = mean over tokens k of L_sim_k
+L_total   = L_ae_sat + L_ae_radar + ramp(step)·sim_weight·L_sim
+```
+
+Per-index (not pooled variant c) because the flow operates per-token-index — align the exact axis it uses. The B−1 same-index off-diagonal radar tokens of *other* batch samples are the negatives: a collapsed code cannot separate sample *i* from *j*, so InfoNCE **rises** under collapse instead of vanishing — anti-collapse is structural and active from step 0, exactly inside the measured danger window. Fully vectorized as an `[N,B,D]` batched matmul → `[N,B,B]` (negligible cost: lab2 batch, N=77).
+
+**Learnable log-temperature.** A single shared `nn.Parameter` initialised at the CLIP default `log(1/0.07)`, its own tiny optimizer param-group, `exp()` clamped ≤ 100 per step (CLIP convention). It receives gradient only when `sim_weight>0`, so the `sim_weight=0` separate baseline stays a clean disjoint-param ablation (no cross-modal gradient → log-temp frozen too).
+
+**sim-loss warmup.** `ramp(step) = min(1, step / warmup_steps)`, default `warmup_steps=1000` (set 0 to disable). The data localised the collapse window to the first ~1k steps; the ramp lets reconstruction establish a non-degenerate latent before alignment pressure turns on. Orthogonal to InfoNCE's structural anti-collapse — both retained (belt-and-braces; the ablation knob is still only `sim_weight`).
+
+**Config / backward-compat.** New field `joint.sim_loss: "cosine" | "infonce"` (default `"cosine"`), plus `joint.infonce_warmup_steps` (default 1000) and `joint.infonce_init_temp` (default 0.07). Existing A/B and cosine-sweep configs reproduce bit-for-bit; only the new InfoNCE configs set `"infonce"`. The one-knob ablation (`sim_weight=0` ⇒ separate) is unchanged.
+
+**Sweep.** Cells **w ∈ {0.0 separate, 0.1, 0.5, 1.0}** (InfoNCE is anti-collapse, so higher weights are testable, unlike cosine), `sim_loss=infonce`, **AE 25k / v2v 40k**. w000 must re-run (its old ckpt was pruned). Reuses the **bug-fixed** `launch_jointtok_sweep.sh` / `eval_joint_tokenizer.py` / `analyze_jointtok_sweep.py` / `gen_sweep_configs.py` pipeline unchanged (launcher fixes: `[ -f ckpt ]`→`[ -e ]` + `ls -1dt` for the ckpt *directory*; prune only after `metrics.json` exists; per-cell `wait_gpu` re-check for the shared GPU 0).
+
+**Acceptance bar (the question this answers).** Does InfoNCE buy alignment *without* the codebook death cosine caused? Pass = cosine/CKA up by the §5 margins **AND** recon ≤ +10 % on *both* modalities **AND** PCA effective rank ≈ w000 baseline **AND** near-dead ≈ 0 — then the decoded-radar dBZ table (results §7b-style) is the final arbiter. PCA-rank/near-dead are promoted to hard gates here because they, not the loss log, are what exposed the cosine collapse.
+
+**Out of scope (YAGNI):** pooled CLIP-style variant (c); any trainer rewrite (one new loss fn + selector only); a temperature sweep (the learnable log-temp absorbs it).
+
 ## 4. Compute & schedule (single GPU 0; 1/2/3 held by other users)
 
 Sequential on GPU 0, started by an orchestrator that **waits for the token-sweep eval to free GPU 0**, then:
