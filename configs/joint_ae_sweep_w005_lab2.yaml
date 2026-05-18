@@ -1,0 +1,94 @@
+# sim_weight SWEEP cell: sim_weight=0.05. Clone of joint_ae_joint_lab2.yaml;
+# only experiment.* paths + joint.sim_weight differ. One-knob ablation; see
+# docs/specs/2026-05-18-joint-sat-radar-tokenizer-design.md
+experiment:
+  project: joint_sat_radar_tokenizer
+  name: joint_ae_sweep_w005
+  output_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w005_run1
+  log_every: 100
+  save_every: 5000
+  eval_every: 2500
+  logging_dir: /mnt/ssd_2/yghu/Experiments/joint_ae_sweep_w005_run1/logs
+
+joint:
+  sim_weight: 0.05          # SWEEP cell — index-wise cosine alignment
+  sat_in_channels: 11
+  sat_out_channels: 11
+  radar_in_channels: 1
+  radar_out_channels: 1
+  val_filelist_path: /mnt/ssd_1/yghu/Data/71_3m/filelists/dataset_filelist_v2v_val_202406w1.pkl
+  val_max_batches: 32
+
+model:
+  vq_model:
+    quantize_mode: vae
+    token_size: 16
+    vit_enc_model_size: tiny
+    vit_dec_model_size: small
+    vit_enc_patch_size: 16
+    vit_dec_patch_size: 16
+    num_latent_tokens: 77
+    in_channels: 11          # placeholder; script overrides per modality
+    out_channels: 11
+    finetune_decoder: false
+    is_legacy: false
+
+losses:
+  discriminator_start: 9999999   # discriminator OFF (run1 recipe)
+  quantizer_weight: 1.0
+  discriminator_factor: 1.0
+  discriminator_weight: 0.1
+  perceptual_loss: lpips-convnext_s-1.0-0.1
+  perceptual_weight: 1.1
+  reconstruction_loss: l2
+  reconstruction_weight: 1.0
+  lecam_regularization_weight: 0.001
+  kl_weight: 1.0e-06
+  logvar_init: 0.0
+
+dataset:
+  params:
+    filelist_path: /mnt/ssd_1/yghu/Data/71_3m/filelists/dataset_filelist_v2v_train_202105_202110_halfvalid50_ct005.pkl
+    filelist_split: train
+    mode: sat2radar_v2v
+    use_lightning: true
+    num_workers: 4
+  preprocessing:
+    resize_shorter_edge: 128
+    crop_size: 128
+    random_crop: false
+    random_flip: true
+    res_ratio_filtering: true
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 0.0001
+    discriminator_learning_rate: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0001
+
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 1500
+    end_lr: 1.0e-05
+
+finetune:
+  enabled: false
+  text_guidance_from_filename: true
+
+training:
+  gradient_accumulation_steps: 1
+  per_gpu_batch_size: 32
+  mixed_precision: 'no'
+  enable_tf32: true
+  enable_wandb: false
+  use_ema: true
+  seed: 42
+  max_train_steps: 15000
+  max_grad_norm: 1.0
+  nan_check: false
+  nan_skip: true
