@@ -92,6 +92,40 @@ Read with the §4 caveat: B's tokenizer is collapsed/low-rank, so a lower token-
 
 **This resolves §4 hypothesis 2.** B's lower token-space loss (0.43 vs 0.61) was *entirely* the collapse artifact: decoded to pixels, B is worse on every reconstruction metric (mse_dbz 2.5×, ssim 0.34 vs 0.64, r² −2.40 vs −0.35). The two FSS wins are at near-zero absolute FSS (0.10) with both models scoring **0** on the ≥35 dBZ convective skill scores (csi/pod/far) — i.e. neither 8k-step pilot predicts storm cores yet, so the FSS edge is not meaningful skill. **End-to-end conclusion: joint training at sim_weight=0.5 is net-harmful — the alignment is real but it costs more in reconstruction than it returns in flow conditioning.** Not a refutation of the idea (see §4 verdict); it confirms 0.5 is past the operating point and motivates the §5 sweep. The decision rule (design §5) already returned *helps tokenizers = **False*** in §1; this pixel-space table is the independent end-to-end confirmation of that call.
 
+### 6.1 Training-trajectory diagnosis (A vs B, samples 2k→8k)
+
+Reading the `samples/{2000,4000,6000,8000}_sat_lgt_gt_pred.png` arc for both
+groups separates the two failure modes:
+
+- **A (separate AE):** 2k sparse speckle → 4k patchy fill → 6k coherent blobs
+  + some mid-reflectivity → 8k localized blobs that *track GT location* (no
+  cores yet). Monotonically gaining structure, **still moving at 8k**, trending
+  *toward* GT. ⇒ healthy tokenizer, **flow merely undertrained**.
+- **B (joint AE @0.5):** 2k near-empty → 4k thin edge fragments → 6k broad
+  smear → 8k large diffuse over-spread wash that does *not* track GT and is
+  getting **blurrier/broader**, not sharper. Converging toward a degenerate
+  low-rank field, *away* from GT. ⇒ **flow undertrained AND tokenizer
+  collapsed**.
+
+The two groups head to **different attractors** (A sharpens toward GT; B
+smears away) — this is the visible fingerprint of §4 alignment-by-collapse:
+B's radar latent is rank-halved (PCA eff. rank sat 29.9→10.8, radar
+10.4→5.6; 0 near-dead ⇒ spectral, not per-token), so the detokenizer can only
+render a low-dimensional blur regardless of flow quality. A's latent is intact
+(recon MSE ~2× better relative to B's degradation; decoded r² −0.35 vs B
+−2.40), so A is flow-budget-limited, not tokenizer-limited.
+
+**Consequences:** (1) §6's "A > B" is mechanistically explained — not that A's
+flow is good (r²<0) but that B is *doubly* handicapped; the gap should persist
+/ widen with budget since B's ceiling is structurally lower. (2) 8k judged
+neither on quality — both mid-trajectory; the big-budget rerun is necessary.
+(3) At w=0.5 the damage is to the **tokenizer ceiling**, not just the flow —
+so the §7 low-weight cells {0.05, 0.25} **+ the new pure-AE recon panels** are
+the right instrument: they show, per weight, whether alignment can be gained
+*without* dropping PCA rank / raising recon MSE (= without lowering the
+ceiling). A's own 8k tokenizer ceiling is unknown (recon image was pruned);
+the §7 w000 cell (separate, 25k AE / 40k v2v + recon panel) settles it.
+
 ---
 
 ## 7. sim_weight sweep — reduced set, big budget
