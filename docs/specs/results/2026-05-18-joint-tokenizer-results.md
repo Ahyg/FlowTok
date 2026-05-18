@@ -65,3 +65,30 @@ Cosine → 1.0 *with halved effective rank and degraded reconstruction* is **ali
 ## 5. Concrete next step (recommended, NOT auto-run — needs your call)
 
 A **sim_weight sweep** at much lower weights — `{0.0(=A), 0.02, 0.05, 0.1, 0.25}` — plotting the trade-off curve: cross-modal cosine **and** PCA effective rank **and** recon MSE on shared axes. Goal: the largest weight that keeps PCA rank ≈ Group-A level with recon degradation ≤10%. Then re-run the v2v pilot **with pixel-space radar metrics** (decode + MSE/FSS), not token-space loss, to remove the "collapse makes prediction trivially easier" confound. One config knob + the existing pipeline; ≈1 night.
+
+---
+
+## 6. Decoded-radar pixel-space comparison (added — resolves §5 confound)
+
+`test_sat2radar_v2v.py`, 2024/07 v2v test, 241 clips (3856 frames total, 16/clip), step-8000 pilots, identical settings. Metrics on dBZ radar after full decode (sat→flow→radar detokenizer).
+
+| metric | dir | A (separate AE) | B (joint AE) | better |
+|---|---|---|---|---|
+| mse_dbz | ↓ | 27.3956 | 68.7669 | **A** |
+| mae_dbz | ↓ | 1.7631 | 4.6654 | **A** |
+| rmse_dbz | ↓ | 5.2341 | 8.2926 | **A** |
+| psnr_db | ↑ | 21.1862 | 17.1892 | **A** |
+| ssim | ↑ | 0.6349 | 0.3421 | **A** |
+| r2 | ↑ | -0.3544 | -2.3998 | **A** |
+| avg_fss | ↑ | 0.0985 | 0.1024 | **B** |
+| weighted_fss | ↑ | 0.0413 | 0.0446 | **B** |
+| csi35 | ↑ | 0.0000 | 0.0000 | tie |
+| pod35 | ↑ | 0.0000 | 0.0000 | tie |
+| far35 | ↓ | 1.0000 | 1.0000 | tie |
+
+**Tally:** B wins 2 / A wins 6 → **decoded radar: A (separate) better**.
+
+Read with the §4 caveat: B's tokenizer is collapsed/low-rank, so a lower token-loss did not necessarily mean better pixels. This table is the decisive check the pilot was missing. Panels: `/mnt/ssd_2/yghu/Experiments/v2v_jointtok_{A,B}_run1/test8000/`.
+
+**This resolves §4 hypothesis 2.** B's lower token-space loss (0.43 vs 0.61) was *entirely* the collapse artifact: decoded to pixels, B is worse on every reconstruction metric (mse_dbz 2.5×, ssim 0.34 vs 0.64, r² −2.40 vs −0.35). The two FSS wins are at near-zero absolute FSS (0.10) with both models scoring **0** on the ≥35 dBZ convective skill scores (csi/pod/far) — i.e. neither 8k-step pilot predicts storm cores yet, so the FSS edge is not meaningful skill. **End-to-end conclusion: joint training at sim_weight=0.5 is net-harmful — the alignment is real but it costs more in reconstruction than it returns in flow conditioning.** Not a refutation of the idea (see §4 verdict); it confirms 0.5 is past the operating point and motivates the §5 sweep. The decision rule (design §5) already returned *helps tokenizers = **False*** in §1; this pixel-space table is the independent end-to-end confirmation of that call.
+
