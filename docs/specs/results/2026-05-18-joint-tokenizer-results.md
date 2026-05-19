@@ -190,27 +190,85 @@ auto-managed sweep tracker; if a confirmatory decoded run is wanted, the
 launcher fix is in `scripts/launch_jointtok_sweep.sh` (`-f`→`-e`, prune-after-
 decode, per-cell GPU re-check).
 
+### 6.3 InfoNCE sweep — critical interpretation (the §7 auto-verdict is incomplete)
+
+The InfoNCE sweep ran clean (4/4 decoded, multi-GPU, unattended; §7). The
+auto-verdict "promote w=1.0" is the right *headline* but reads as a clean win;
+it is not. The honest read:
+
+**Win (real, on the honest metric):** on decoded radar (§7b, the arbiter)
+*every* InfoNCE weight beats the separate baseline, monotone in w:
+**r² −0.345 → +0.092** (w=1.0) — the *first* model in this entire line to beat
+the climatological mean; mse_dbz 27.2 → 18.4 (−33 %), ssim 0.709 → 0.727.
+This is the exact *reversal* of cosine, which drove r² to −2.40 (§6). The
+original hypothesis-2 (aligned latents help the small flow) finally has clean
+decoded-pixel support, not the token-space confound.
+
+**The anti-collapse goal only half-succeeded:**
+- ✅ *Token death fixed* — near-dead 0/77 at every weight (cosine: 57–65/77).
+  InfoNCE's negatives did exactly what they were designed to.
+- ❌ *Spectral collapse NOT fixed — worse than cosine.* PCA eff. rank sat
+  59.7 → ~12 (cosine w005 was 34.8), radar 23.7 → ~8; sat recon **+187…+242 %**
+  (cosine was +46 %). The §3.3 four-gate check correctly returns *no w clears
+  it*. Ceiling panels confirm: `recon_inf_w100.png` pure encode→decode radar
+  is a coreless low-freq smear (vs `recon_inf_w000.png` which tracks GT cells).
+
+**Mechanism (why decoded radar improves while the tokenizer gets worse).**
+Not a contradiction — it is the §4 "low-rank target is easier for a small
+flow" effect, now measured honestly in pixel space so it is a *genuine* net
+benefit at this scale, not an artifact: the ~12-dim aligned radar code is a
+far easier regression target for the under-budget FlowTok-S than the 24-dim
+unaligned one; the flow's gain (Δr² +0.44) outweighs the tokenizer's loss
+(recon +200 %). This is precisely the spec-§2 realistic payoff ("better-
+conditioned flow, *not* added predictive power"), and the opposite of cosine
+where tokenizer damage dominated.
+
+**Hard limits — do not oversell.** Absolute quality is still poor: r²≈0.09
+(barely above mean) and **csi35 ≈ 0.0001 — essentially zero convective skill,
+*below* the weak separate baseline's 0.0097.** The gain is entirely in
+bulk/low–mid-reflectivity field error, *not* storm cores; the +200 %-recon
+coreless-smear ceiling structurally forces csi35→0. The bottleneck has moved
+from *flow budget* to *tokenizer fidelity under alignment*.
+
+**Refined recommendation.** w=1.0 is the best operating point and the cosine
+failure is genuinely reversed — but the next lever is **not** more weight
+tuning. The persistent +200 %-recon / rank-12 cause is that the InfoNCE loss
+acts *directly on the reconstruction latent* (posterior mean), forcing it onto
+a low-rank shared manifold. Decouple it: align a **learned projection head**
+off the latent (used only for the InfoNCE loss), so the encoder is pushed to
+*carry* aligned information without collapsing the code it must also
+reconstruct from. That directly targets the rank/recon cause while keeping the
+decoded-radar gain. Plus the standard confirmation (2nd seed / held-out month)
+and — since csi35≈0 — a **larger tokenizer** to lift the convective-core
+ceiling. (Design-doc follow-up: a §3.4 if pursued.)
+
 ---
 
-## 7. sim_weight sweep — reduced set, big budget
+## 7. sim_weight sweep — InfoNCE (design §3.3)
 
-`w ∈ {0.0 separate, 0.05, 0.25}`, **AE 25k / v2v 40k** (the §6 8k pilot was visually unconverged — neg R², CSI35=0, low-freq blobs; those 8k A/B numbers stay in §4/§6 and are *not* mixed into this table). One-knob ablation, seed 42, shared batch order. **Ranking = the decoded-radar table 7b** — token-space loss is deliberately excluded (§4 collapse confound). Tokenizer-ceiling recon panels (pure encode→decode, no flow): `joint_tok_align/recon_{w000,w005,w025}.png` (also copied to each `joint_ae_sweep_*_run1/recon_test.png`) — the decoded radar in 7b can never beat that ceiling.
+Per-index **symmetric InfoNCE** alignment (learnable CLIP log-temperature, 1k-step sim-loss warmup) — the anti-collapse replacement for index-wise cosine, which was refuted by alignment-by-collapse (§4/§6/§6.2; the cosine 8k/sweep numbers stay there and are *not* mixed in here). `w ∈ {0.0 separate, 0.1, 0.5, 1.0}`, **AE 25k / v2v 40k**, one-knob ablation, seed 42, shared batch order. **Ranking = the decoded-radar table 7b.** The §3.3 question: does InfoNCE buy alignment *without* the codebook death cosine caused? PCA effective rank **and near-dead tokens** are hard gates in 7a (they, not the loss log, exposed the cosine collapse). Tokenizer-ceiling recon panels: `joint_tok_align/recon_inf_{w000,w010,w050,w100}.png`.
 
-### 7a. AE trade-off + tokenizer ceiling
+### 7a. AE trade-off + tokenizer ceiling (collapse gates)
 
-| sim_weight | x-modal cosine ↑ | linear CKA | PCA rank sat | PCA rank radar | sat recon MSE | radar recon MSE | sat recon Δ vs w0 |
-|---|---|---|---|---|---|---|---|
-| 0.00 | -0.0310 | 0.3874 | 53.1 | 26.7 | 0.000851 | 0.002250 | +0.0% |
-| 0.05 | 0.9903 | 0.2043 | 34.8 | 24.9 | 0.001245 | 0.002771 | +46.3% |
-| 0.25 | _pending_ | | | | | | |
+| sim_weight | x-modal cosine ↑ | linear CKA | PCA rank sat | PCA rank radar | near-dead sat | near-dead radar | sat recon MSE | radar recon MSE | sat recon Δ vs w0 |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.00 | -0.0196 | 0.3777 | 59.7 | 23.7 | 0/77 | 0/77 | 0.000905 | 0.002119 | +0.0% |
+| 0.10 | 0.4323 | 0.4574 | 11.9 | 8.0 | 0/77 | 0/77 | 0.002601 | 0.003635 | +187.4% |
+| 0.50 | 0.4584 | 0.4073 | 12.5 | 8.4 | 0/77 | 0/77 | 0.003080 | 0.003564 | +240.3% |
+| 1.00 | 0.4671 | 0.4190 | 12.5 | 9.3 | 0/77 | 0/77 | 0.003094 | 0.003877 | +241.8% |
 
 ### 7b. Decoded-radar pixel-space (DECISIVE — 2024/07 v2v test)
 
 | sim_weight | mse_dbz ↓ | rmse_dbz ↓ | ssim ↑ | r² ↑ | avg_fss ↑ | csi35 ↑ |
 |---|---|---|---|---|---|---|
-| 0.00 | _pending_ | | | | | |
-| 0.05 | _pending_ | | | | | |
-| 0.25 | _pending_ | | | | | |
+| 0.00 | 27.2071 | 5.2160 | 0.7087 | -0.3451 | 0.2517 | 0.0097 |
+| 0.10 | 19.7921 | 4.4488 | 0.7228 | 0.0215 | 0.2532 | 0.0002 |
+| 0.50 | 19.5504 | 4.4216 | 0.7245 | 0.0334 | 0.2546 | 0.0002 |
+| 1.00 | 18.3568 | 4.2845 | 0.7272 | 0.0924 | 0.2532 | 0.0001 |
 
-_Sweep running — 7b fills in per cell (~3.3 h/cell: AE 25k + v2v 40k + decode)._
+**Decoded-radar winner (min mse_dbz): sim_weight = 1.00** (mse_dbz 18.3568, ssim 0.7272, r² 0.0924).
+
+**§3.3 anti-collapse check:** no swept w>0 clears all four gates (PCA rank ≥ 0.9·w0, near-dead ≤ 10 %, recon ≤ +10 %). InfoNCE mitigated but did not eliminate the trade-off — inspect the recon panels and the per-gate columns in 7a.
+
+→ **A positive sim_weight (1.00) beats the separate baseline on decoded radar.** InfoNCE alignment helps where cosine hurt; promote w=1.00 to the main config and confirm on a held-out month / second seed.
 
