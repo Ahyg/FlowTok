@@ -24,6 +24,9 @@ model = Args(
     cfg_indicator=0.0,          # CFG OFF — sat tokens are the only signal.
     noising_type="constant",
     noising_scale=0.1,
+    # M2: textVAE contrastive branch needs the learnable t2t temperature
+    # (matches the existing ...-textVAE config precedent).
+    use_t2t_temperature=True,
     textVAE=Args(
         num_blocks=6,
         hidden_dim=256,
