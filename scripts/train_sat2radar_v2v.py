@@ -569,7 +569,27 @@ def train(config):
     flow_matching_model = FlowMatching(
         noising_type=config.nnet.model_args.noising_type,
         noising_scale=config.nnet.model_args.noising_scale,
+        flow_prediction_target=getattr(config, "flow_prediction_target", "velocity"),
     )
+
+    # Opt-in token-diffusion generation algorithm (legacy default = flow_matching,
+    # so existing configs/ckpts are unaffected).
+    gen_algo = getattr(config, "generation_algorithm", "flow_matching")
+    token_diffusion_model = None
+    if gen_algo == "diffusion":
+        from diffusion.token_diffusion import TokenDiffusion
+        _dcfg = config.diffusion
+        token_diffusion_model = TokenDiffusion(
+            train_timesteps=int(_dcfg.get("train_timesteps", 1000)),
+            schedule=_dcfg.get("schedule", "linear"),
+            target=_dcfg.get("target", "pred_x0"),
+            gamma=_dcfg.get("gamma", "ddim"),
+        )
+        logging.info(
+            "generation_algorithm=diffusion: TokenDiffusion(schedule=%s target=%s "
+            "T=%s sample_steps=%s)", _dcfg.get("schedule", "linear"),
+            _dcfg.get("target", "pred_x0"), _dcfg.get("train_timesteps", 1000),
+            _dcfg.get("sample_steps", 500))
 
     num_latent_tokens = config.vq_model.num_latent_tokens
 
@@ -760,14 +780,18 @@ def train(config):
             sat_tokens, radar_tokens, token_mask
         )
 
-        loss, loss_dict = flow_matching_model(
-            x=radar_tokens,
-            nnet=nnet,
-            cond=sat_tokens,
-            all_config=config,
-            batch_img_clip=None,
-            valid_mask=token_mask,
-        )
+        if token_diffusion_model is not None:
+            loss, loss_dict = token_diffusion_model.loss(
+                nnet, radar_tokens, sat_tokens)
+        else:
+            loss, loss_dict = flow_matching_model(
+                x=radar_tokens,
+                nnet=nnet,
+                cond=sat_tokens,
+                all_config=config,
+                batch_img_clip=None,
+                valid_mask=token_mask,
+            )
         total_loss = loss
 
         losses_cfg = getattr(config, "losses", None)
@@ -904,14 +928,18 @@ def train(config):
         )
 
         # x_start = radar tokens, cond = sat tokens
-        loss, loss_dict = flow_matching_model(
-            x=radar_tokens,
-            nnet=nnet,
-            cond=sat_tokens,
-            all_config=config,
-            batch_img_clip=None,
-            valid_mask=token_mask,
-        )
+        if token_diffusion_model is not None:
+            loss, loss_dict = token_diffusion_model.loss(
+                nnet, radar_tokens, sat_tokens)
+        else:
+            loss, loss_dict = flow_matching_model(
+                x=radar_tokens,
+                nnet=nnet,
+                cond=sat_tokens,
+                all_config=config,
+                batch_img_clip=None,
+                valid_mask=token_mask,
+            )
         total_loss = loss
 
         # Auxiliary loss for AdapterOut so it receives direct training signal.
@@ -1213,18 +1241,25 @@ def train(config):
             guidance_scale = config.sample.scale
             has_null_indicator = guidance_scale > 1.0
 
-            ode_solver = ODEEulerFlowMatchingSolver(
-                nnet_ema_local,
-                step_size_type="step_in_dsigma",
-                guidance_scale=guidance_scale,
-            )
-            z, _ = ode_solver.sample(
-                x_T=x0,
-                batch_size=B,
-                sample_steps=config.sample.sample_steps,
-                unconditional_guidance_scale=guidance_scale,
-                has_null_indicator=has_null_indicator,
-            )
+            if token_diffusion_model is not None:
+                z = token_diffusion_model.ddim_sample(
+                    nnet_ema_local, cond=sat_tokens,
+                    sample_steps=int(config.diffusion.get("sample_steps", 500)),
+                )
+            else:
+                ode_solver = ODEEulerFlowMatchingSolver(
+                    nnet_ema_local,
+                    step_size_type="step_in_dsigma",
+                    guidance_scale=guidance_scale,
+                )
+                z, _ = ode_solver.sample(
+                    x_T=x0,
+                    batch_size=B,
+                    sample_steps=config.sample.sample_steps,
+                    unconditional_guidance_scale=guidance_scale,
+                    has_null_indicator=has_null_indicator,
+                    prediction_target=getattr(config, "flow_prediction_target", "velocity"),
+                )
             # seqconcat: each fat frame holds [radar(L) | lgt(L)]; extract the
             # radar half per frame before decoding.
             if _cond_is_seqconcat:

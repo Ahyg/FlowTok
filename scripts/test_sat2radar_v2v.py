@@ -729,18 +729,33 @@ def main():
             x0 = x0 + torch.randn_like(x0) * config.sample.noise_scale
 
         guidance_scale = config.sample.scale
-        ode_solver = ODEEulerFlowMatchingSolver(
-            nnet_ema,
-            step_size_type="step_in_dsigma",
-            guidance_scale=guidance_scale,
-        )
-        z, _ = ode_solver.sample(
-            x_T=x0,
-            batch_size=B,
-            sample_steps=config.sample.sample_steps,
-            unconditional_guidance_scale=guidance_scale,
-            has_null_indicator=guidance_scale > 1.0,
-        )  # [B, L, C_tok]
+        if getattr(config, "generation_algorithm", "flow_matching") == "diffusion":
+            from diffusion.token_diffusion import TokenDiffusion
+            _dcfg = config.diffusion
+            _td = TokenDiffusion(
+                train_timesteps=int(_dcfg.get("train_timesteps", 1000)),
+                schedule=_dcfg.get("schedule", "linear"),
+                target=_dcfg.get("target", "pred_x0"),
+                gamma=_dcfg.get("gamma", "ddim"),
+            ).to(sat_tokens.device)
+            z = _td.ddim_sample(
+                nnet_ema, cond=sat_tokens,
+                sample_steps=int(_dcfg.get("sample_steps", 500)),
+            )  # [B, L, C_tok]
+        else:
+            ode_solver = ODEEulerFlowMatchingSolver(
+                nnet_ema,
+                step_size_type="step_in_dsigma",
+                guidance_scale=guidance_scale,
+            )
+            z, _ = ode_solver.sample(
+                x_T=x0,
+                batch_size=B,
+                sample_steps=config.sample.sample_steps,
+                unconditional_guidance_scale=guidance_scale,
+                has_null_indicator=guidance_scale > 1.0,
+                prediction_target=getattr(config, "flow_prediction_target", "velocity"),
+            )  # [B, L, C_tok]
 
         # Reshape tokens back to [B, T_eff, C_tok, 1, L_frame] and decode.
         L = z.shape[1]
