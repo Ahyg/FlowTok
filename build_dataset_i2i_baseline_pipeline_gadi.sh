@@ -36,6 +36,18 @@ for pair in "m2:textvae" "m3:diffusion" "m4:xpred"; do
   mkdir -p "$TD"
   python3 scripts/make_overfit_filelist.py --src "$M" --out "$TD/dataset_filelist.pkl" --n 32 --put-into all
 done
+if [ ! -s "$M" ]; then
+  echo "[$(date '+%F %T')] FATAL: merged filelist $M missing/empty — NOT fanning out"
+  exit 1
+fi
+for pair in "m2:textvae" "m3:diffusion" "m4:xpred"; do
+  dd=${pair##*:}
+  TF=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_i2i_b_${dd}_2021summer_tiny/dataset_filelist.pkl
+  if [ ! -s "$TF" ]; then
+    echo "[$(date '+%F %T')] FATAL: tiny filelist $TF missing/empty — NOT fanning out"
+    exit 1
+  fi
+done
 echo "[$(date '+%F %T')] dataset ready; fanning out jobs"
 cd $FT
 qsub train_i2i_b_m1_full_gadi.sh
