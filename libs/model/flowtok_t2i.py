@@ -144,8 +144,13 @@ class FlowTok(nn.Module):
         num_classes=2, # for cfg indicator
     ):
         super().__init__()
-        self.in_channels = config.channels
-        self.out_channels = self.in_channels
+        # cond_concat_channels: M3 token-diffusion channel-concats sat tokens
+        # with the noisy radar tokens, doubling DiT input width. Default False =
+        # legacy (in == out == config.channels); old ckpts/configs unaffected.
+        self.out_channels = config.channels
+        self.in_channels = (config.channels * 2
+                            if getattr(config, "cond_concat_channels", False)
+                            else config.channels)
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_latent_tokens = num_latent_tokens

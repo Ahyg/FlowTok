@@ -161,6 +161,7 @@ class FlowMatching(nn.Module):
         timescale: float = 1.0,
         noising_type: str = "none",
         noising_scale: float = 0.1,
+        flow_prediction_target: str = "velocity",
         **kwargs,
     ):
         # LatentDiffusion/DDPM will create too many class variables we do not need
@@ -171,6 +172,10 @@ class FlowMatching(nn.Module):
         self.timescale = timescale
         self.noising_type = noising_type
         self.noising_scale = noising_scale
+        # "velocity" (legacy): predict dψ/dt. "radar_tokens": predict x1 (radar
+        # tokens) directly; converted back to velocity for the ODE step — a
+        # mathematically equivalent reparameterization. Default keeps old runs.
+        self.flow_prediction_target = flow_prediction_target
 
         self.clip_loss = ClipLoss()
 
@@ -293,17 +298,20 @@ class FlowMatching(nn.Module):
             x_start[null_indicator] = target_null
         
         x_noisy = self.psi(t, x=noise, x1=x_start)
-        target_velocity = self.Dt_psi(t, x=noise, x1=x_start)
-
         prediction = nnet(x_noisy, t = t, null_indicator = null_indicator)[0]
+
+        if self.flow_prediction_target == "radar_tokens":
+            fm_target = x_start                                  # predict x1
+        else:
+            fm_target = self.Dt_psi(t, x=noise, x1=x_start)      # legacy velocity
 
         # Optional mask for variable-length sequences (e.g. v2v with padding)
         if valid_mask is not None:
             # valid_mask: [B, L]; err: [B, L, C] -> flatten to [B, L] for mask
-            err = (prediction - target_velocity).pow(2).mean(dim=-1)  # [B, L]
+            err = (prediction - fm_target).pow(2).mean(dim=-1)  # [B, L]
             loss_diff = (err * valid_mask).sum() / valid_mask.sum().clamp(min=1)
         else:
-            loss_diff = self.mos(prediction - target_velocity)
+            loss_diff = self.mos(prediction - fm_target)
 
         loss = loss_diff + contrastive_loss + kld_loss
         loss_dict = {'diff_loss': loss_diff, 'contrastive_loss': contrastive_loss, 'kld_loss': kld_loss}
@@ -375,14 +383,20 @@ class ODEEulerFlowMatchingSolver(Solver):
             t[0], t[1], self.num_time_steps, device=x_T.device
         )
 
+        x0_start = x_T.clone()           # fixed flow start; needed for x1->v reparam
+        prediction_target = getattr(self, "prediction_target", "velocity")
         for i in range(self.num_time_steps):
             t_i = discrete_time_steps_to_eval_model_at[i]
-            velocity = self.get_model_output_flowtok(
+            model_out = self.get_model_output_flowtok(
                 x_T,
                 has_null_indicator = has_null_indicator,
                 t_continuous = t_i.repeat(x_T.shape[0]),
                 unconditional_guidance_scale = unconditional_guidance_scale,
             )
+            if prediction_target == "radar_tokens":
+                velocity = (sigma_min / sigma_max - 1.0) * x0_start + model_out
+            else:
+                velocity = model_out
             if self.step_size_type == "step_in_dsigma":
                 step_size = sigma_steps[i + 1] - sigma_steps[i]
             elif self.step_size_type == "step_in_dt":
@@ -416,6 +430,7 @@ class ODEEulerFlowMatchingSolver(Solver):
 
         self.num_time_steps = kwargs.get("sample_steps")
         self.x_T_uncon = kwargs.get("x_T_uncon")
+        self.prediction_target = kwargs.get("prediction_target", "velocity")
 
         samples, intermediates = super().sample(
             *args,
