@@ -60,7 +60,8 @@ def get_config():
 
     config.train = d(
         n_steps=5_000,            # tiny overfit gate
-        batch_size=64,
+        batch_size=16,            # 32-sample tiny set; drop_last -> need bs<=16
+
         log_interval=100,
         eval_interval=500,
         save_interval=2_500,
