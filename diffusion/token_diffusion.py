@@ -40,10 +40,11 @@ class TokenDiffusion(nn.Module):
         self.register_buffer("sigma_t", sigma)   # [T+1]
 
     def _a(self, idx):
-        return self.alpha_t[idx].view(-1, 1, 1)
+        # Device-agnostic: schedule buffers may sit on CPU while idx is on CUDA.
+        return self.alpha_t.to(idx.device)[idx].view(-1, 1, 1)
 
     def _s(self, idx):
-        return self.sigma_t[idx].view(-1, 1, 1)
+        return self.sigma_t.to(idx.device)[idx].view(-1, 1, 1)
 
     def q_sample(self, z1, t_idx, eps):
         return self._a(t_idx) * z1 + self._s(t_idx) * eps

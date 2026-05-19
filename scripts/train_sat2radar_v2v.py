@@ -584,7 +584,7 @@ def train(config):
             schedule=_dcfg.get("schedule", "linear"),
             target=_dcfg.get("target", "pred_x0"),
             gamma=_dcfg.get("gamma", "ddim"),
-        )
+        ).to(device)
         logging.info(
             "generation_algorithm=diffusion: TokenDiffusion(schedule=%s target=%s "
             "T=%s sample_steps=%s)", _dcfg.get("schedule", "linear"),
