@@ -1,7 +1,7 @@
 experiment:
   project: ae_recipe_sweep_20260520
-  name: s10_s1_pc
-  output_dir: /mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/s10_s1_pc
+  name: s10_b0_b8
+  output_dir: /mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/s10_b0_b8
   max_train_examples: 250000
   save_every: 5000
   eval_every: 2000
@@ -9,7 +9,7 @@ experiment:
   log_every: 200
   log_grad_norm_every: 1000
   resume: true
-  logging_dir: /mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/s10_s1_pc/logs
+  logging_dir: /mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/s10_b0_b8/logs
 model:
   vq_model:
     quantize_mode: vae
@@ -35,7 +35,6 @@ losses:
   lecam_regularization_weight: 0.001
   kl_weight: 6.02e-07
   logvar_init: 0.0
-  perceptual_per_channel: true
 dataset:
   params:
     filelist_path: /mnt/ssd_1/yghu/Data/71_3m/filelists/dataset_filelist_i2i_train21_val24w1.pkl
@@ -68,10 +67,9 @@ finetune:
   text_guidance_from_filename: true
 training:
   gradient_accumulation_steps: 1
-  # NOTE: dropped 32 → 8 (not 16: per_channel=True × 11ch OOMs at both 32 and
-  # 16 on 24GB). Single-lever attribution preserved by ALSO running s10_b0_b8
-  # (= s10_b0 at batch=8): per_channel effect = s10_s1_pc - s10_b0_b8; batch
-  # effect = s10_b0 - s10_b0_b8. Same applies to Stage 2 lgt cells (per_channel).
+  # Batch-matched control for s10_s1_pc and Stage 2 lgt cells (all use
+  # per_channel=True on 11ch, which OOMs at batch 32 AND 16 on 24GB → batch=8).
+  # All other levers identical to s10_b0.
   per_gpu_batch_size: 8
   mixed_precision: 'no'
   enable_tf32: true

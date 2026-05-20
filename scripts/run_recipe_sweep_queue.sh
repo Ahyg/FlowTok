@@ -4,9 +4,10 @@
 #
 # Runs 12 GAN-free 40k screening cells. Prioritized queue: baselines +
 # run3-attribution cells (kl10, pc) first so the headline science lands first.
-# Opportunistic multi-GPU: dispatches the next cell to ANY truly-empty GPU
-# (mem.used < 1500 MiB) so other users' reserved GPUs (1,3) and the actively
-# training GPU (2) are never touched; grabs them only if they actually free.
+# Opportunistic multi-GPU: dispatches the next cell to ANY GPU with at least
+# MEM_FREE_REQUIRED MiB free, co-tenanting alongside other users' jobs when
+# capacity permits. Sized for the heaviest sat10ch cell (~12 GiB) plus 3 GiB
+# safety margin against neighbour growth and PyTorch fragmentation.
 #
 # Designed to run detached inside tmux session "ae_sweep". Survives detach.
 
@@ -16,7 +17,7 @@ REPO="/mnt/ssd_1/yghu/Code/FlowTok"
 EXP_ROOT="/mnt/ssd_2/yghu/Experiments/ae_recipe_sweep"
 ORCH_LOG="${EXP_ROOT}/orchestrator.log"
 STATUS="${EXP_ROOT}/STATUS.txt"
-MEM_FREE_THRESH=1500          # MiB — below this a GPU counts as truly empty
+MEM_FREE_REQUIRED=15000       # MiB — GPU needs at least this much FREE memory
 GPUS=(0 1 2 3)
 
 # Priority order: baselines first, then run3-attribution (kl10, pc),
@@ -28,6 +29,7 @@ QUEUE=(
   radar_s1_p16   s10_s1_p16
   radar_s1_p06   s10_s1_p06
   radar_s1_kl05  s10_s1_kl05
+  s10_b0_b8
 )
 
 mkdir -p "${EXP_ROOT}"
@@ -67,10 +69,19 @@ while (( idx < total )) || (( ${#RUN_PID[@]} > 0 )); do
   done
 
   # ---- skip already-completed cells (resume support) ----
+  # Also skip cells with a live training.pid we did not launch (e.g. a manual
+  # run started outside the orchestrator), so we never duplicate a cell on a
+  # second GPU that frees mid-run.
   while (( idx < total )); do
     cell="${QUEUE[$idx]}"
+    pid_file="${EXP_ROOT}/${cell}/training.pid"
     if [[ -f "${EXP_ROOT}/${cell}/checkpoint-final/metadata.json" ]]; then
       log "SKIP ${cell} — checkpoint-final exists (resume; $((idx+1))/${total})"
+      idx=$((idx+1))
+    elif [[ -f "$pid_file" ]] \
+         && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null \
+         && [[ -z "${RUN_PID[$cell]:-}" ]]; then
+      log "SKIP ${cell} — externally running (pid=$(cat "$pid_file"); $((idx+1))/${total})"
       idx=$((idx+1))
     else
       break
@@ -82,14 +93,14 @@ while (( idx < total )) || (( ${#RUN_PID[@]} > 0 )); do
     for g in "${GPUS[@]}"; do
       (( idx < total )) || break
       [[ -n "${GPU_BUSY[$g]:-}" ]] && continue
-      used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g" 2>/dev/null | tr -d ' ' || echo 999999)
-      [[ "$used" =~ ^[0-9]+$ ]] || used=999999
-      if (( used < MEM_FREE_THRESH )); then
+      free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$g" 2>/dev/null | tr -d ' ' || echo 0)
+      [[ "$free" =~ ^[0-9]+$ ]] || free=0
+      if (( free >= MEM_FREE_REQUIRED )); then
         cell="${QUEUE[$idx]}"
         cfg="${REPO}/configs/rs_${cell}.yaml"
         out="${EXP_ROOT}/${cell}"
         mkdir -p "$out"
-        log "LAUNCH ${cell} on GPU ${g} (mem ${used} MiB; $((idx+1))/${total})"
+        log "LAUNCH ${cell} on GPU ${g} (free ${free} MiB; $((idx+1))/${total})"
         CUDA_VISIBLE_DEVICES="$g" WANDB_MODE=disabled PYTHONUNBUFFERED=1 setsid bash -c \
           "cd '${REPO}' && conda run --no-capture-output -n flowtok accelerate launch --num_processes 1 scripts/train_flowtitok_ae.py --config '${cfg}'" \
           > "${out}/training.log" 2>&1 &
