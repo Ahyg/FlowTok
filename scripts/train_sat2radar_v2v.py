@@ -570,6 +570,7 @@ def train(config):
         noising_type=config.nnet.model_args.noising_type,
         noising_scale=config.nnet.model_args.noising_scale,
         flow_prediction_target=getattr(config, "flow_prediction_target", "velocity"),
+        flow_cond_mode=getattr(config, "flow_cond_mode", "none"),
     )
 
     # Opt-in token-diffusion generation algorithm (legacy default = flow_matching,
@@ -1248,18 +1249,25 @@ def train(config):
                     sample_steps=int(config.diffusion.get("sample_steps", 500)),
                 )
             else:
+                _flow_cond_mode = getattr(config, "flow_cond_mode", "none")
+                if _flow_cond_mode == "token_concat":
+                    x_T_init = torch.randn_like(sat_tokens)
+                else:
+                    x_T_init = x0
                 ode_solver = ODEEulerFlowMatchingSolver(
                     nnet_ema_local,
                     step_size_type="step_in_dsigma",
                     guidance_scale=guidance_scale,
                 )
                 z, _ = ode_solver.sample(
-                    x_T=x0,
+                    x_T=x_T_init,
                     batch_size=B,
                     sample_steps=config.sample.sample_steps,
                     unconditional_guidance_scale=guidance_scale,
                     has_null_indicator=has_null_indicator,
                     prediction_target=getattr(config, "flow_prediction_target", "velocity"),
+                    flow_cond_mode=_flow_cond_mode,
+                    cond_tokens=sat_tokens if _flow_cond_mode == "token_concat" else None,
                 )
             # seqconcat: each fat frame holds [radar(L) | lgt(L)]; extract the
             # radar half per frame before decoding.

@@ -153,7 +153,7 @@ class UniformTimeSampler(TimeStepSampler):
         return torch.rand(x_start.shape[0], device=x_start.device)
 
 
-class FlowMatching(nn.Module):  
+class FlowMatching(nn.Module):
     def __init__(
         self,
         sigma_min: float = 1e-5,
@@ -162,6 +162,7 @@ class FlowMatching(nn.Module):
         noising_type: str = "none",
         noising_scale: float = 0.1,
         flow_prediction_target: str = "velocity",
+        flow_cond_mode: str = "none",
         **kwargs,
     ):
         # LatentDiffusion/DDPM will create too many class variables we do not need
@@ -176,6 +177,11 @@ class FlowMatching(nn.Module):
         # tokens) directly; converted back to velocity for the ODE step — a
         # mathematically equivalent reparameterization. Default keeps old runs.
         self.flow_prediction_target = flow_prediction_target
+        # "none" (legacy): cond enters as flow x0 (sat tokens are the noise).
+        # "token_concat": noise=randn, cond prepended in seq-dim at every nnet
+        # call; output's last L tokens are supervised. Default keeps old runs.
+        assert flow_cond_mode in ("none", "token_concat")
+        self.flow_cond_mode = flow_cond_mode
 
         self.clip_loss = ClipLoss()
 
@@ -237,6 +243,36 @@ class FlowMatching(nn.Module):
         # 可选：允许在某些任务中关闭 textVAE，直接使用 cond 作为噪声起点（例如 sat tokens -> radar tokens）。
         # 为了兼容旧配置，默认启用 textVAE，只有在 config.use_text_vae_encoder == False 时才跳过。
         use_text_vae_encoder = getattr(all_config, "use_text_vae_encoder", True)
+
+        # token_concat flow: noise = randn (decoupled from cond), cond is
+        # prepended in seq-dim at every nnet call. textVAE / KLD / contrastive
+        # are unused because cond enters via concat rather than as flow start.
+        if self.flow_cond_mode == "token_concat":
+            B_, L_, _ = x_start.shape
+            noise = torch.randn_like(x_start)
+            x_start_local = x_start.clone()
+            null_indicator = torch.zeros(
+                B_, dtype=torch.bool, device=x_start.device
+            )
+            x_noisy = self.psi(t, x=noise, x1=x_start_local)
+            inp = torch.cat([cond, x_noisy], dim=1)         # [B, 2L, C]
+            pred_full = nnet(inp, t=t, null_indicator=null_indicator)[0]
+            prediction = pred_full[:, L_:, :]               # supervise radar half
+            if self.flow_prediction_target == "radar_tokens":
+                fm_target = x_start_local
+            else:
+                fm_target = self.Dt_psi(t, x=noise, x1=x_start_local)
+            if valid_mask is not None:
+                err = (prediction - fm_target).pow(2).mean(dim=-1)  # [B, L]
+                loss_diff = (err * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+            else:
+                loss_diff = self.mos(prediction - fm_target)
+            zero = x_start.new_zeros([])
+            return loss_diff, {
+                'diff_loss': loss_diff,
+                'contrastive_loss': zero,
+                'kld_loss': zero,
+            }
 
         if use_text_vae_encoder:
             x0, mu, log_var = nnet(cond, text_encoder=True)
@@ -385,14 +421,29 @@ class ODEEulerFlowMatchingSolver(Solver):
 
         x0_start = x_T.clone()           # fixed flow start; needed for x1->v reparam
         prediction_target = getattr(self, "prediction_target", "velocity")
+        flow_cond_mode = getattr(self, "flow_cond_mode", "none")
+        cond_tokens = getattr(self, "cond_tokens", None)
+        if flow_cond_mode == "token_concat":
+            assert cond_tokens is not None, "token_concat requires cond_tokens"
+            L_ = x_T.shape[1]
         for i in range(self.num_time_steps):
             t_i = discrete_time_steps_to_eval_model_at[i]
-            model_out = self.get_model_output_flowtok(
-                x_T,
-                has_null_indicator = has_null_indicator,
-                t_continuous = t_i.repeat(x_T.shape[0]),
-                unconditional_guidance_scale = unconditional_guidance_scale,
-            )
+            if flow_cond_mode == "token_concat":
+                inp = torch.cat([cond_tokens, x_T], dim=1)
+                null_ind = torch.zeros(
+                    x_T.shape[0], dtype=torch.bool, device=x_T.device
+                )
+                out_full = self.model(
+                    inp, t=t_i.repeat(x_T.shape[0]), null_indicator=null_ind
+                )[-1]
+                model_out = out_full[:, L_:, :]
+            else:
+                model_out = self.get_model_output_flowtok(
+                    x_T,
+                    has_null_indicator = has_null_indicator,
+                    t_continuous = t_i.repeat(x_T.shape[0]),
+                    unconditional_guidance_scale = unconditional_guidance_scale,
+                )
             if prediction_target == "radar_tokens":
                 velocity = (sigma_min / sigma_max - 1.0) * x0_start + model_out
             else:
@@ -431,6 +482,8 @@ class ODEEulerFlowMatchingSolver(Solver):
         self.num_time_steps = kwargs.get("sample_steps")
         self.x_T_uncon = kwargs.get("x_T_uncon")
         self.prediction_target = kwargs.get("prediction_target", "velocity")
+        self.flow_cond_mode = kwargs.get("flow_cond_mode", "none")
+        self.cond_tokens = kwargs.get("cond_tokens", None)
 
         samples, intermediates = super().sample(
             *args,
