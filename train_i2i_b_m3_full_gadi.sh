@@ -36,4 +36,8 @@ if [ "$STEP" -ge "$TARGET" ]; then echo "already done at $STEP"; exit 0; fi
 accelerate launch --num_processes 1 scripts/train_sat2radar_v2v.py --config="$CFG" > "$JOBLOG" 2>&1
 NEW=$(ls -t "$WD"/ckpts/*.ckpt 2>/dev/null | head -1 | grep -oP '[0-9]+(?=\.ckpt)'); NEW=${NEW:-0}
 echo "[$(date '+%F %T')] m3 full: after run step=$NEW"
-if [ "$NEW" -lt "$TARGET" ]; then cd $FT && qsub train_i2i_b_m3_full_gadi.sh; fi
+if [ "$NEW" -lt "$TARGET" ]; then
+  cd $FT && qsub train_i2i_b_m3_full_gadi.sh
+else
+  cd $FT && qsub holdout_test_i2i_b_m3_gadi.sh && echo "[$(date '+%F %T')] m3 hit target, queued holdout test"
+fi
