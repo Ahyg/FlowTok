@@ -30,6 +30,7 @@ QUEUE=(
   radar_s1_p06   s10_s1_p06
   radar_s1_kl05  s10_s1_kl05
   s10_b0_b8
+  radar_b0_p8  s10_b0_p8
 )
 
 mkdir -p "${EXP_ROOT}"
