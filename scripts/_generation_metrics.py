@@ -83,6 +83,9 @@ class I3DFeatures(nn.Module):
         self.net = net
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # torchmetrics FID/KID does a CPU dummy-tensor shape probe during __init__
+        # even when the wrapped network is already on CUDA. Coerce to model device.
+        x = x.to(next(self.parameters()).device)
         if x.dim() == 4:
             x = x.unsqueeze(1)  # [B, 1, 3, H, W]
         if x.dim() != 5:
