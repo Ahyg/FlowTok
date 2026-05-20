@@ -59,8 +59,10 @@ while (( idx < total )) || (( ${#RUN_PID[@]} > 0 )); do
     if ! kill -0 "${RUN_PID[$c]}" 2>/dev/null; then
       fin=$(grep -c 'Finishing training' "${EXP_ROOT}/$c/training.log" 2>/dev/null || echo 0)
       log "FINISHED ${c} (gpu ${RUN_GPU[$c]}, pid ${RUN_PID[$c]}, finish-marker=${fin})"
-      unset 'GPU_BUSY[${RUN_GPU[$c]}]'
-      unset 'RUN_GPU[$c]' 'RUN_PID[$c]'
+      gpu_idx="${RUN_GPU[$c]}"
+      unset "GPU_BUSY[$gpu_idx]"
+      unset "RUN_GPU[$c]"
+      unset "RUN_PID[$c]"
     fi
   done
 
