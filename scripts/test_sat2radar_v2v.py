@@ -737,6 +737,7 @@ def main():
                 schedule=_dcfg.get("schedule", "linear"),
                 target=_dcfg.get("target", "pred_x0"),
                 gamma=_dcfg.get("gamma", "ddim"),
+                cond_mode=_dcfg.get("cond_mode", "chn_concat"),
             ).to(sat_tokens.device)
             z = _td.ddim_sample(
                 nnet_ema, cond=sat_tokens,

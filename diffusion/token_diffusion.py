@@ -17,13 +17,19 @@ import torch.nn as nn
 
 class TokenDiffusion(nn.Module):
     def __init__(self, train_timesteps: int = 1000, schedule: str = "linear",
-                 target: str = "pred_x0", gamma: str = "ddim"):
+                 target: str = "pred_x0", gamma: str = "ddim",
+                 cond_mode: str = "chn_concat"):
         super().__init__()
         assert schedule in ("linear", "cosine")
         assert target in ("pred_x0", "pred_eps")
         assert gamma in ("ddim", "ddpm")
+        # cond_mode == "chn_concat" (M3): inp = cat([z_t, cond], dim=-1) -> [B,L,2C]
+        # cond_mode == "token_concat" (M5): inp = cat([cond, z_t], dim=1)  -> [B,2L,C],
+        # output's radar half (last L tokens) is supervised.
+        assert cond_mode in ("chn_concat", "token_concat")
         self.T = int(train_timesteps)
         self.schedule, self.target, self.gamma = schedule, target, gamma
+        self.cond_mode = cond_mode
 
         if schedule == "linear":
             beta = torch.linspace(1e-4, 2e-2, self.T + 1)
@@ -51,15 +57,20 @@ class TokenDiffusion(nn.Module):
 
     def loss(self, nnet, z1, cond):
         """z1: clean radar tokens [B,L,C]; cond: sat tokens [B,L,C]."""
-        b = z1.shape[0]
+        b, L, _ = z1.shape
         dev = z1.device
         t_idx = torch.randint(1, self.T + 1, (b,), device=dev)
         eps = torch.randn_like(z1)
         z_t = self.q_sample(z1, t_idx, eps)
-        inp = torch.cat([z_t, cond], dim=-1)                # [B,L,2C]
         t_cont = t_idx.float() / self.T                     # fractional t in (0,1]
         null_ind = torch.zeros(b, dtype=torch.bool, device=dev)
-        pred = nnet(inp, t=t_cont, null_indicator=null_ind)[0]
+        if self.cond_mode == "chn_concat":
+            inp = torch.cat([z_t, cond], dim=-1)            # [B,L,2C]
+            pred = nnet(inp, t=t_cont, null_indicator=null_ind)[0]
+        else:  # token_concat
+            inp = torch.cat([cond, z_t], dim=1)             # [B,2L,C], sat first
+            pred_full = nnet(inp, t=t_cont, null_indicator=null_ind)[0]
+            pred = pred_full[:, L:, :]                      # supervise radar half only
         target = z1 if self.target == "pred_x0" else eps
         ld = (0.5 * (pred - target).pow(2).flatten(1).mean(dim=-1)).mean()
         zero = z1.new_zeros([])
@@ -75,8 +86,13 @@ class TokenDiffusion(nn.Module):
                                 device=dev).round().long()
         for ts, te in zip(subseq[:-1], subseq[1:]):
             ts_b = ts.repeat(b)
-            out = nnet(torch.cat([z, cond], dim=-1),
-                       t=ts_b.float() / self.T, null_indicator=null_ind)[0]
+            if self.cond_mode == "chn_concat":
+                out = nnet(torch.cat([z, cond], dim=-1),
+                           t=ts_b.float() / self.T, null_indicator=null_ind)[0]
+            else:  # token_concat: [sat | radar_t] -> take radar half of output
+                out_full = nnet(torch.cat([cond, z], dim=1),
+                                t=ts_b.float() / self.T, null_indicator=null_ind)[0]
+                out = out_full[:, L:, :]
             if self.target == "pred_x0":
                 pred_x0 = out
                 pred_eps = (z - self._a(ts_b) * pred_x0) / self._s(ts_b).clamp(min=1e-6)

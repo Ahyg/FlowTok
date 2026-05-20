@@ -584,12 +584,13 @@ def train(config):
             schedule=_dcfg.get("schedule", "linear"),
             target=_dcfg.get("target", "pred_x0"),
             gamma=_dcfg.get("gamma", "ddim"),
+            cond_mode=_dcfg.get("cond_mode", "chn_concat"),
         ).to(device)
         logging.info(
             "generation_algorithm=diffusion: TokenDiffusion(schedule=%s target=%s "
-            "T=%s sample_steps=%s)", _dcfg.get("schedule", "linear"),
+            "T=%s sample_steps=%s cond_mode=%s)", _dcfg.get("schedule", "linear"),
             _dcfg.get("target", "pred_x0"), _dcfg.get("train_timesteps", 1000),
-            _dcfg.get("sample_steps", 500))
+            _dcfg.get("sample_steps", 500), _dcfg.get("cond_mode", "chn_concat"))
 
     num_latent_tokens = config.vq_model.num_latent_tokens
 
