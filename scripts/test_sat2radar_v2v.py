@@ -464,6 +464,10 @@ def main():
     parser.add_argument("--skip_tc", action="store_true", help="v2v: skip Temporal Consistency (RAFT)")
     parser.add_argument("--kid_subsets", type=int, default=50,
                         help="KID/KVD number of subsets for unbiased estimator")
+    parser.add_argument(
+        "--diffusion_sample_steps", type=int, default=None,
+        help="Override config.diffusion.sample_steps (only used when generation_algorithm=diffusion).",
+    )
     parser.add_argument("--kid_subset_size", type=int, default=100,
                         help="KID/KVD subset size (must be <= total samples per call)")
     args = parser.parse_args()
@@ -475,6 +479,11 @@ def main():
     if args.filelist_path:
         config.dataset.filelist_path = args.filelist_path
         print(f"[INFO] Override filelist_path: {args.filelist_path}")
+    if args.diffusion_sample_steps is not None and getattr(
+        config, "generation_algorithm", "flow_matching"
+    ) == "diffusion":
+        config.diffusion.sample_steps = int(args.diffusion_sample_steps)
+        print(f"[INFO] Override diffusion.sample_steps: {args.diffusion_sample_steps}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

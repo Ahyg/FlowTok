@@ -39,5 +39,8 @@ echo "[$(date '+%F %T')] m5 full: after run step=$NEW"
 if [ "$NEW" -lt "$TARGET" ]; then
   cd $FT && qsub train_i2i_b_m5_full_gadi.sh
 else
-  cd $FT && qsub holdout_test_i2i_b_m5_gadi.sh && echo "[$(date '+%F %T')] m5 hit target, queued holdout test"
+  cd $FT && qsub holdout_test_i2i_b_m5_gadi.sh \
+    && qsub holdout_test_i2i_b_m5_nfe100_gadi.sh \
+    && qsub holdout_test_i2i_b_m5_nfe20_gadi.sh \
+    && echo "[$(date '+%F %T')] m5 hit target, queued holdout tests (nfe 500/100/20)"
 fi
