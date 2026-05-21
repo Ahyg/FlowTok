@@ -1,0 +1,95 @@
+experiment:
+  # Diagnostic cell: per_channel perceptual but with lightning (ch10) weight=0.
+  # Isolates whether s10_s1_pc's degradation is driven by the sparse lightning
+  # channel (OOD for ImageNet LPIPS) or by per-channel texture synthesis on the
+  # IR bands. Compare at matched batch=8:
+  #   s10_b0_b8 (no per_channel)        = 0.001529
+  #   s10_s1_pc (per_channel, all 11ch) = 0.001902  (+24.4%)
+  #   s10_s1_pc_nolgt (this, lgt wt=0)  = ?
+  #     -> close to b8  => lightning was the main culprit
+  #     -> still high   => IR-band texture synthesis is the culprit
+  project: ae_recipe_sweep_20260520
+  name: s10_s1_pc_nolgt
+  output_dir: /mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/s10_s1_pc_nolgt
+  max_train_examples: 250000
+  save_every: 5000
+  eval_every: 2000
+  generate_every: 5000
+  log_every: 200
+  log_grad_norm_every: 1000
+  resume: true
+  logging_dir: /mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/s10_s1_pc_nolgt/logs
+model:
+  vq_model:
+    quantize_mode: vae
+    token_size: 16
+    vit_enc_model_size: tiny
+    vit_dec_model_size: small
+    vit_enc_patch_size: 16
+    vit_dec_patch_size: 16
+    num_latent_tokens: 128
+    in_channels: 11
+    out_channels: 11
+    finetune_decoder: false
+    is_legacy: false
+losses:
+  discriminator_start: 9999999
+  quantizer_weight: 1.0
+  discriminator_factor: 1.0
+  discriminator_weight: 0.1
+  perceptual_loss: lpips-convnext_s-1.0-0.1
+  perceptual_weight: 1.1
+  reconstruction_loss: l2
+  reconstruction_weight: 1.0
+  lecam_regularization_weight: 0.001
+  kl_weight: 6.02e-07
+  logvar_init: 0.0
+  perceptual_per_channel: true
+  # 10 IR bands weighted 1, lightning (ch10) weighted 0 → perceptual averages
+  # over IR bands only, lightning channel gets no perceptual gradient.
+  perceptual_per_channel_weights: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]
+dataset:
+  params:
+    filelist_path: /mnt/ssd_1/yghu/Data/71_3m/filelists/dataset_filelist_i2i_train21_val24w1.pkl
+    filelist_split: train
+    mode: satellite
+    use_lightning: true
+    num_workers: 4
+  preprocessing:
+    resize_shorter_edge: 128
+    crop_size: 128
+    random_crop: true
+    random_flip: true
+    res_ratio_filtering: true
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 0.0001
+    discriminator_learning_rate: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0001
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 4000
+    end_lr: 1.0e-05
+finetune:
+  enabled: false
+  text_guidance_from_filename: true
+training:
+  gradient_accumulation_steps: 1
+  # batch=8: per_channel=True x 11ch still runs LPIPS on all channels (lgt
+  # forward computed then x0), so same memory ceiling as s10_s1_pc → batch=8.
+  per_gpu_batch_size: 8
+  mixed_precision: 'no'
+  enable_tf32: true
+  enable_wandb: false
+  use_ema: true
+  seed: 42
+  max_train_steps: 40000
+  num_generated_images: 1
+  max_grad_norm: 1.0
+  nan_check: false
+  nan_skip: true
