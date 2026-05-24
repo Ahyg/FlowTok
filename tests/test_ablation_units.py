@@ -219,6 +219,49 @@ def test_solver_interleaved_feeds_2TL_and_returns_clean_radar():
     assert tuple(z.shape) == (B, T * L, C), z.shape
 
 
+def test_modality_pos_emb_partition_and_alignment():
+    import torch, numpy as np
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok
+    L_tok, T, D = 77, 4, 768
+    cfg = SimpleNamespace(
+        channels=16, clip_dim=16, num_clip_token=L_tok, cfg_indicator=0.0,
+        noising_type="none", noising_scale=0.1, use_modality_pos_emb=True,
+        textVAE=SimpleNamespace(num_blocks=1, hidden_dim=32, num_attention_heads=2,
+                                dropout_prob=0.0, clip_loss_weight=0.0),
+    )
+    m = FlowTok(cfg, num_latent_tokens=L_tok, hidden_size=D, depth=1, num_heads=8)
+    assert m.use_modality_pos_emb is True
+    seq = 2 * T * L_tok
+    pe = m._build_pos_embed(seq, torch.device("cpu"), torch.float32)
+    assert pe.shape == (1, seq, D)
+    half = seq // 2
+    d_sp, d_tp = D // 2, D // 4
+    for i in range(T):
+        for j in (0, 40, 76):
+            sat = i * L_tok + j
+            rad = half + i * L_tok + j
+            assert torch.allclose(pe[0, sat, :d_sp], pe[0, rad, :d_sp])
+            assert torch.allclose(pe[0, sat, d_sp:d_sp + d_tp], pe[0, rad, d_sp:d_sp + d_tp])
+            assert not torch.allclose(pe[0, sat, d_sp + d_tp:], pe[0, rad, d_sp + d_tp:])
+
+
+def test_modality_flag_defaults_off():
+    import torch
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok
+    cfg = SimpleNamespace(
+        channels=16, clip_dim=16, num_clip_token=77, cfg_indicator=0.0,
+        noising_type="none", noising_scale=0.1,
+        textVAE=SimpleNamespace(num_blocks=1, hidden_dim=32, num_attention_heads=2,
+                                dropout_prob=0.0, clip_loss_weight=0.0),
+    )
+    m = FlowTok(cfg, num_latent_tokens=77, hidden_size=768, depth=1, num_heads=8)
+    assert m.use_modality_pos_emb is False
+    pe = m._build_pos_embed(2 * 77, torch.device("cpu"), torch.float32)
+    assert pe.shape == (1, 2 * 77, 768)
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

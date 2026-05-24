@@ -177,6 +177,10 @@ class FlowTok(nn.Module):
         # so spatial_pos distinguishes modalities inside each fat frame.
         self.pos_n_per_frame = num_latent_tokens
 
+        # Arm 6: opt-in 3-axis pos-emb (spatial D/2 + temporal D/4 + modality D/4).
+        # Default False == legacy 2-axis (spatial+temporal). No new params either way.
+        self.use_modality_pos_emb = getattr(config, "use_modality_pos_emb", False)
+
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
@@ -264,6 +268,25 @@ class FlowTok(nn.Module):
         So the model gets a clear "which frame" signal for temporal modeling.
         For I2I (L=77), temporal is all 0; for V2V (L=T*77), temporal distinguishes frames.
         """
+        if getattr(self, "use_modality_pos_emb", False):
+            L = seq_len
+            Ltok = self.num_latent_tokens
+            half = L // 2
+            assert half % Ltok == 0, "seq_len//2 must be divisible by num_latent_tokens"
+            idx = np.arange(L, dtype=np.float32)
+            spatial_pos = idx % Ltok
+            temporal_pos = (idx % half) // Ltok
+            modality_pos = idx // half
+            D = self.hidden_size
+            d_sp = (D // 2) - ((D // 2) % 2)
+            d_tp = (D // 4) - ((D // 4) % 2)
+            d_mod = D - d_sp - d_tp
+            assert d_mod % 2 == 0, f"modality dim {d_mod} must be even"
+            sp = get_1d_sincos_pos_embed_from_grid(d_sp, spatial_pos)
+            tp = get_1d_sincos_pos_embed_from_grid(d_tp, temporal_pos)
+            md = get_1d_sincos_pos_embed_from_grid(d_mod, modality_pos)
+            pos = np.concatenate([sp, tp, md], axis=-1)
+            return torch.from_numpy(pos).to(device=device, dtype=dtype).unsqueeze(0)
         L = seq_len
         n_per_frame = getattr(self, "pos_n_per_frame", self.num_latent_tokens)
         # Within-frame spatial position: 0,1,...,n_per_frame-1 repeated each frame.
