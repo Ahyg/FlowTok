@@ -142,6 +142,83 @@ def test_token_diffusion_loss_runs():
     assert torch.isfinite(loss) and "diff_loss" in d
 
 
+# ── Task 5: token_concat_interleaved (aligned sat/radar per-frame layout) ────
+def test_interleave_layout_and_roundtrip():
+    from diffusion.flow_matching import _interleave_cond_target, _deinterleave_target
+    B, T, L, C = 2, 3, 4, 5
+    cond = torch.randn(B, T * L, C)
+    x = torch.randn(B, T * L, C)
+    inter = _interleave_cond_target(cond, x, L)
+    assert tuple(inter.shape) == (B, T * 2 * L, C), inter.shape
+    # fat frame 0 = [cond_f0 (L) | x_f0 (L)]
+    assert torch.equal(inter[:, :L], cond[:, :L])
+    assert torch.equal(inter[:, L:2 * L], x[:, :L])
+    # fat frame 1's first half is cond frame 1 (proves per-frame interleave, not block)
+    assert torch.equal(inter[:, 2 * L:3 * L], cond[:, L:2 * L])
+    # de-interleave recovers exactly the target (radar) half, in original order
+    assert torch.equal(_deinterleave_target(inter, L), x)
+
+
+def test_flowmatching_accepts_interleaved_mode():
+    from diffusion.flow_matching import FlowMatching
+    fm = FlowMatching(noising_type="none", flow_prediction_target="radar_tokens",
+                      flow_cond_mode="token_concat_interleaved")
+    assert fm.flow_cond_mode == "token_concat_interleaved"
+
+
+def _fm_cfg(L):
+    return SimpleNamespace(
+        losses=SimpleNamespace(contrastive_loss_weight=0.0, kld_loss_weight=0.0),
+        nnet=SimpleNamespace(model_args=SimpleNamespace(cfg_indicator=0.0)),
+        use_text_vae_encoder=False,
+        vq_model=SimpleNamespace(num_latent_tokens=L),
+    )
+
+
+def test_flowmatching_interleaved_equals_block_under_identity_nnet():
+    # A position-insensitive (identity) nnet supervises the same target tokens
+    # regardless of block vs interleaved ordering, so the loss must be identical.
+    # A wrong interleave/de-interleave (extracting cond, or misframing) would
+    # change which tokens are supervised and break the equality.
+    from diffusion.flow_matching import FlowMatching
+    B, T, L, C = 2, 3, 4, 16
+    cond = torch.randn(B, T * L, C)
+    x1 = torch.randn(B, T * L, C)
+    cfg = _fm_cfg(L)
+    nnet = lambda inp, t=None, null_indicator=None: [inp]  # identity
+    fm_block = FlowMatching(noising_type="none", flow_prediction_target="radar_tokens",
+                            flow_cond_mode="token_concat")
+    fm_inter = FlowMatching(noising_type="none", flow_prediction_target="radar_tokens",
+                            flow_cond_mode="token_concat_interleaved")
+    torch.manual_seed(123)
+    lb, _ = fm_block(x=x1.clone(), nnet=nnet, cond=cond.clone(), all_config=cfg)
+    torch.manual_seed(123)
+    li, _ = fm_inter(x=x1.clone(), nnet=nnet, cond=cond.clone(), all_config=cfg)
+    assert torch.allclose(lb, li, atol=1e-6), (lb.item(), li.item())
+
+
+def test_solver_interleaved_feeds_2TL_and_returns_clean_radar():
+    from diffusion.flow_matching import ODEEulerFlowMatchingSolver
+    B, T, L, C = 2, 3, 4, 16
+    cond = torch.randn(B, T * L, C)
+    xT = torch.randn(B, T * L, C)
+    seen = {}
+
+    def nnet(inp, t=None, null_indicator=None):
+        seen["n"] = inp.shape[1]            # must be 2*T*L if interleave happened
+        return [None, inp]                  # identity at index -1
+
+    sv = ODEEulerFlowMatchingSolver(nnet, step_size_type="step_in_dsigma",
+                                    guidance_scale=1.0)
+    z, _ = sv.sample(x_T=xT.clone(), batch_size=B, sample_steps=5,
+                     unconditional_guidance_scale=1.0, has_null_indicator=False,
+                     prediction_target="velocity",
+                     flow_cond_mode="token_concat_interleaved",
+                     cond_tokens=cond.clone(), cond_num_latent_tokens=L)
+    assert seen.get("n") == 2 * T * L, seen
+    assert tuple(z.shape) == (B, T * L, C), z.shape
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

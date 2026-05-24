@@ -153,6 +153,37 @@ class UniformTimeSampler(TimeStepSampler):
         return torch.rand(x_start.shape[0], device=x_start.device)
 
 
+def _interleave_cond_target(cond, target, num_latent_tokens):
+    """Per-frame interleave: each fat frame becomes [cond_ti(L) | target_ti(L)].
+
+    cond, target: [B, T*L, C] (frame-major). Returns [B, T*2L, C] laid out as
+    [cond_t0, target_t0, cond_t1, target_t1, ...]. With pos_n_per_frame=2L the DiT
+    sees T frames where spatial 0..L-1 = cond, L..2L-1 = target, and cond_ti /
+    target_ti share the same temporal (frame) position — the aligned counterpart
+    to the block 'token_concat' layout.
+    """
+    B, TL, C = cond.shape
+    L = num_latent_tokens
+    T = TL // L
+    cond_f = cond.reshape(B, T, L, C)
+    target_f = target.reshape(B, T, L, C)
+    fat = torch.cat([cond_f, target_f], dim=2)        # [B, T, 2L, C]
+    return fat.reshape(B, T * 2 * L, C)
+
+
+def _deinterleave_target(seq, num_latent_tokens):
+    """Inverse for the target half of _interleave_cond_target.
+
+    seq: [B, T*2L, C] -> the target (second) half of each fat frame, [B, T*L, C]
+    in the original frame-major target order.
+    """
+    B, two_TL, C = seq.shape
+    L = num_latent_tokens
+    T = two_TL // (2 * L)
+    fat = seq.reshape(B, T, 2 * L, C)
+    return fat[:, :, L:, :].reshape(B, T * L, C)
+
+
 class FlowMatching(nn.Module):
     def __init__(
         self,
@@ -180,7 +211,7 @@ class FlowMatching(nn.Module):
         # "none" (legacy): cond enters as flow x0 (sat tokens are the noise).
         # "token_concat": noise=randn, cond prepended in seq-dim at every nnet
         # call; output's last L tokens are supervised. Default keeps old runs.
-        assert flow_cond_mode in ("none", "token_concat")
+        assert flow_cond_mode in ("none", "token_concat", "token_concat_interleaved")
         self.flow_cond_mode = flow_cond_mode
 
         self.clip_loss = ClipLoss()
@@ -247,7 +278,7 @@ class FlowMatching(nn.Module):
         # token_concat flow: noise = randn (decoupled from cond), cond is
         # prepended in seq-dim at every nnet call. textVAE / KLD / contrastive
         # are unused because cond enters via concat rather than as flow start.
-        if self.flow_cond_mode == "token_concat":
+        if self.flow_cond_mode in ("token_concat", "token_concat_interleaved"):
             B_, L_, _ = x_start.shape
             noise = torch.randn_like(x_start)
             x_start_local = x_start.clone()
@@ -255,9 +286,16 @@ class FlowMatching(nn.Module):
                 B_, dtype=torch.bool, device=x_start.device
             )
             x_noisy = self.psi(t, x=noise, x1=x_start_local)
-            inp = torch.cat([cond, x_noisy], dim=1)         # [B, 2L, C]
-            pred_full = nnet(inp, t=t, null_indicator=null_indicator)[0]
-            prediction = pred_full[:, L_:, :]               # supervise radar half
+            if self.flow_cond_mode == "token_concat_interleaved":
+                # Aligned layout: per-frame [sat_ti | radar_ti]; supervise radar half.
+                L_tok = int(all_config.vq_model.num_latent_tokens)
+                inp = _interleave_cond_target(cond, x_noisy, L_tok)   # [B, T*2L, C]
+                pred_full = nnet(inp, t=t, null_indicator=null_indicator)[0]
+                prediction = _deinterleave_target(pred_full, L_tok)   # [B, T*L, C]
+            else:
+                inp = torch.cat([cond, x_noisy], dim=1)         # [B, 2L, C]
+                pred_full = nnet(inp, t=t, null_indicator=null_indicator)[0]
+                prediction = pred_full[:, L_:, :]               # supervise radar half
             if self.flow_prediction_target == "radar_tokens":
                 fm_target = x_start_local
             else:
@@ -423,20 +461,32 @@ class ODEEulerFlowMatchingSolver(Solver):
         prediction_target = getattr(self, "prediction_target", "velocity")
         flow_cond_mode = getattr(self, "flow_cond_mode", "none")
         cond_tokens = getattr(self, "cond_tokens", None)
-        if flow_cond_mode == "token_concat":
+        cond_L = getattr(self, "cond_num_latent_tokens", None)
+        is_token_concat = flow_cond_mode in ("token_concat", "token_concat_interleaved")
+        if is_token_concat:
             assert cond_tokens is not None, "token_concat requires cond_tokens"
             L_ = x_T.shape[1]
+            if flow_cond_mode == "token_concat_interleaved":
+                assert cond_L is not None, \
+                    "token_concat_interleaved requires cond_num_latent_tokens"
         for i in range(self.num_time_steps):
             t_i = discrete_time_steps_to_eval_model_at[i]
-            if flow_cond_mode == "token_concat":
-                inp = torch.cat([cond_tokens, x_T], dim=1)
+            if is_token_concat:
                 null_ind = torch.zeros(
                     x_T.shape[0], dtype=torch.bool, device=x_T.device
                 )
-                out_full = self.model(
-                    inp, t=t_i.repeat(x_T.shape[0]), null_indicator=null_ind
-                )[-1]
-                model_out = out_full[:, L_:, :]
+                if flow_cond_mode == "token_concat_interleaved":
+                    inp = _interleave_cond_target(cond_tokens, x_T, cond_L)
+                    out_full = self.model(
+                        inp, t=t_i.repeat(x_T.shape[0]), null_indicator=null_ind
+                    )[-1]
+                    model_out = _deinterleave_target(out_full, cond_L)
+                else:
+                    inp = torch.cat([cond_tokens, x_T], dim=1)
+                    out_full = self.model(
+                        inp, t=t_i.repeat(x_T.shape[0]), null_indicator=null_ind
+                    )[-1]
+                    model_out = out_full[:, L_:, :]
             else:
                 model_out = self.get_model_output_flowtok(
                     x_T,
@@ -484,6 +534,7 @@ class ODEEulerFlowMatchingSolver(Solver):
         self.prediction_target = kwargs.get("prediction_target", "velocity")
         self.flow_cond_mode = kwargs.get("flow_cond_mode", "none")
         self.cond_tokens = kwargs.get("cond_tokens", None)
+        self.cond_num_latent_tokens = kwargs.get("cond_num_latent_tokens", None)
 
         samples, intermediates = super().sample(
             *args,

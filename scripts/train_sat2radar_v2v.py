@@ -313,8 +313,16 @@ def train(config):
     # In seqconcat mode each fat frame holds 2*L tokens ([sat|lgt]); tell the
     # DiT pos embed so spatial_pos spans 0..2L-1 (first L=sat, next L=lgt) and
     # temporal_pos is aligned between sat_t_i and lgt_t_i.
-    if (getattr(config, "cond_use_sat_lightning_tokens", False)
-            and getattr(config, "cond_token_fusion", "mean") == "seqconcat"):
+    # 2L tokens-per-frame is needed both for seqconcat ([sat|lgt] per frame) and
+    # for token_concat_interleaved ([sat|radar] per frame): in both layouts each
+    # "fat frame" carries 2L tokens, and we want temporal_pos aligned across the
+    # two halves with modality encoded by spatial_pos (first L vs second L).
+    _need_2L_pos_per_frame = (
+        (getattr(config, "cond_use_sat_lightning_tokens", False)
+         and getattr(config, "cond_token_fusion", "mean") == "seqconcat")
+        or getattr(config, "flow_cond_mode", "none") == "token_concat_interleaved"
+    )
+    if _need_2L_pos_per_frame:
         _pos_override = 2 * int(config.vq_model.num_latent_tokens)
         train_state.nnet.pos_n_per_frame = _pos_override
         train_state.nnet_ema.pos_n_per_frame = _pos_override
@@ -1250,7 +1258,8 @@ def train(config):
                 )
             else:
                 _flow_cond_mode = getattr(config, "flow_cond_mode", "none")
-                if _flow_cond_mode == "token_concat":
+                _is_tc = _flow_cond_mode in ("token_concat", "token_concat_interleaved")
+                if _is_tc:
                     x_T_init = torch.randn_like(sat_tokens)
                 else:
                     x_T_init = x0
@@ -1267,7 +1276,11 @@ def train(config):
                     has_null_indicator=has_null_indicator,
                     prediction_target=getattr(config, "flow_prediction_target", "velocity"),
                     flow_cond_mode=_flow_cond_mode,
-                    cond_tokens=sat_tokens if _flow_cond_mode == "token_concat" else None,
+                    cond_tokens=sat_tokens if _is_tc else None,
+                    cond_num_latent_tokens=(
+                        int(config.vq_model.num_latent_tokens)
+                        if _flow_cond_mode == "token_concat_interleaved" else None
+                    ),
                 )
             # seqconcat: each fat frame holds [radar(L) | lgt(L)]; extract the
             # radar half per frame before decoding.
