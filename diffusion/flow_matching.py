@@ -312,6 +312,29 @@ class FlowMatching(nn.Module):
                 'kld_loss': zero,
             }
 
+        if self.flow_cond_mode == "cross_attention":
+            B_, L_, _ = x_start.shape
+            noise = torch.randn_like(x_start)
+            x_start_local = x_start.clone()
+            null_indicator = torch.zeros(B_, dtype=torch.bool, device=x_start.device)
+            x_noisy = self.psi(t, x=noise, x1=x_start_local)
+            prediction = nnet(x_noisy, t=t, null_indicator=null_indicator, context=cond)[0]
+            if self.flow_prediction_target == "radar_tokens":
+                fm_target = x_start_local
+            else:
+                fm_target = self.Dt_psi(t, x=noise, x1=x_start_local)
+            if valid_mask is not None:
+                err = (prediction - fm_target).pow(2).mean(dim=-1)
+                loss_diff = (err * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+            else:
+                loss_diff = self.mos(prediction - fm_target)
+            zero = x_start.new_zeros([])
+            return loss_diff, {
+                'diff_loss': loss_diff,
+                'contrastive_loss': zero,
+                'kld_loss': zero,
+            }
+
         if use_text_vae_encoder:
             x0, mu, log_var = nnet(cond, text_encoder=True)
         else:
@@ -469,6 +492,9 @@ class ODEEulerFlowMatchingSolver(Solver):
             if flow_cond_mode == "token_concat_interleaved":
                 assert cond_L is not None, \
                     "token_concat_interleaved requires cond_num_latent_tokens"
+        is_cross_attn = flow_cond_mode == "cross_attention"
+        if is_cross_attn:
+            assert cond_tokens is not None, "cross_attention requires cond_tokens"
         for i in range(self.num_time_steps):
             t_i = discrete_time_steps_to_eval_model_at[i]
             if is_token_concat:
@@ -487,6 +513,11 @@ class ODEEulerFlowMatchingSolver(Solver):
                         inp, t=t_i.repeat(x_T.shape[0]), null_indicator=null_ind
                     )[-1]
                     model_out = out_full[:, L_:, :]
+            elif is_cross_attn:
+                null_ind = torch.zeros(x_T.shape[0], dtype=torch.bool, device=x_T.device)
+                model_out = self.model(
+                    x_T, t=t_i.repeat(x_T.shape[0]), null_indicator=null_ind, context=cond_tokens
+                )[-1]
             else:
                 model_out = self.get_model_output_flowtok(
                     x_T,

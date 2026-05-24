@@ -332,6 +332,32 @@ def test_flowtok_cross_attention_forward_and_compat():
     assert out0.shape == (2, 2 * 77, 16)
 
 
+def test_cross_attention_training_branch():
+    import torch
+    from types import SimpleNamespace
+    from diffusion.flow_matching import FlowMatching
+    B, T, Lt, C = 2, 2, 77, 16
+    fm = FlowMatching(flow_cond_mode="cross_attention", flow_prediction_target="radar_tokens")
+    x_start = torch.randn(B, T * Lt, C)
+    cond = torch.randn(B, T * Lt, C)
+    t = torch.rand(B)
+    seen = {}
+    class CtxNnet:
+        def __call__(self, inp, t=None, null_indicator=None, context=None):
+            seen["ctx_is_cond"] = context is not None and context.shape == cond.shape
+            seen["inp_len"] = inp.shape[1]
+            return [inp]
+    all_cfg = SimpleNamespace(
+        losses=SimpleNamespace(contrastive_loss_weight=0.0, kld_loss_weight=0.0),
+        vq_model=SimpleNamespace(num_latent_tokens=Lt),
+        nnet=SimpleNamespace(model_args=SimpleNamespace(cfg_indicator=0.0)),
+    )
+    loss, logs = fm.p_losses_textVAE_flowtok(x_start, cond, t, CtxNnet(), all_cfg)
+    assert seen["inp_len"] == T * Lt
+    assert seen["ctx_is_cond"] is True
+    assert torch.isfinite(loss).all()
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
