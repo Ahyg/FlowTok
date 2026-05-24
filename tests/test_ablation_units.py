@@ -262,6 +262,34 @@ def test_modality_flag_defaults_off():
     assert pe.shape == (1, 2 * 77, 768)
 
 
+def test_flowmatching_accepts_token_concat_modality():
+    from diffusion.flow_matching import FlowMatching
+    fm = FlowMatching(flow_cond_mode="token_concat_modality",
+                      flow_prediction_target="radar_tokens")
+    assert fm.flow_cond_mode == "token_concat_modality"
+
+def test_modality_training_branch_supervises_radar_half():
+    import torch
+    from types import SimpleNamespace
+    from diffusion.flow_matching import FlowMatching
+    B, T, Lt, C = 2, 2, 77, 16
+    fm = FlowMatching(flow_cond_mode="token_concat_modality",
+                      flow_prediction_target="radar_tokens")
+    x_start = torch.randn(B, T * Lt, C)
+    cond = torch.randn(B, T * Lt, C)
+    t = torch.rand(B)
+    class IdNnet:
+        def __call__(self, inp, t=None, null_indicator=None, context=None):
+            return [inp]
+    all_cfg = SimpleNamespace(
+        losses=SimpleNamespace(contrastive_loss_weight=0.0, kld_loss_weight=0.0),
+        vq_model=SimpleNamespace(num_latent_tokens=Lt),
+        nnet=SimpleNamespace(model_args=SimpleNamespace(cfg_indicator=0.0)),
+    )
+    loss, logs = fm.p_losses_textVAE_flowtok(x_start, cond, t, IdNnet(), all_cfg)
+    assert "diff_loss" in logs and torch.isfinite(loss).all()
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

@@ -211,7 +211,7 @@ class FlowMatching(nn.Module):
         # "none" (legacy): cond enters as flow x0 (sat tokens are the noise).
         # "token_concat": noise=randn, cond prepended in seq-dim at every nnet
         # call; output's last L tokens are supervised. Default keeps old runs.
-        assert flow_cond_mode in ("none", "token_concat", "token_concat_interleaved")
+        assert flow_cond_mode in ("none", "token_concat", "token_concat_interleaved", "token_concat_modality", "cross_attention")
         self.flow_cond_mode = flow_cond_mode
 
         self.clip_loss = ClipLoss()
@@ -278,7 +278,7 @@ class FlowMatching(nn.Module):
         # token_concat flow: noise = randn (decoupled from cond), cond is
         # prepended in seq-dim at every nnet call. textVAE / KLD / contrastive
         # are unused because cond enters via concat rather than as flow start.
-        if self.flow_cond_mode in ("token_concat", "token_concat_interleaved"):
+        if self.flow_cond_mode in ("token_concat", "token_concat_interleaved", "token_concat_modality"):
             B_, L_, _ = x_start.shape
             noise = torch.randn_like(x_start)
             x_start_local = x_start.clone()
@@ -462,7 +462,7 @@ class ODEEulerFlowMatchingSolver(Solver):
         flow_cond_mode = getattr(self, "flow_cond_mode", "none")
         cond_tokens = getattr(self, "cond_tokens", None)
         cond_L = getattr(self, "cond_num_latent_tokens", None)
-        is_token_concat = flow_cond_mode in ("token_concat", "token_concat_interleaved")
+        is_token_concat = flow_cond_mode in ("token_concat", "token_concat_interleaved", "token_concat_modality")
         if is_token_concat:
             assert cond_tokens is not None, "token_concat requires cond_tokens"
             L_ = x_T.shape[1]
