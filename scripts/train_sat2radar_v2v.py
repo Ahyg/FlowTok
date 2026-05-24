@@ -1258,7 +1258,7 @@ def train(config):
                 )
             else:
                 _flow_cond_mode = getattr(config, "flow_cond_mode", "none")
-                _is_tc = _flow_cond_mode in ("token_concat", "token_concat_interleaved")
+                _is_tc = _flow_cond_mode in ("token_concat", "token_concat_interleaved", "token_concat_modality", "cross_attention")
                 if _is_tc:
                     x_T_init = torch.randn_like(sat_tokens)
                 else:
