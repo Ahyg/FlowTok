@@ -290,6 +290,48 @@ def test_modality_training_branch_supervises_radar_half():
     assert "diff_loss" in logs and torch.isfinite(loss).all()
 
 
+def test_crossattention_shape():
+    import torch
+    from libs.model.flowtok_t2i import CrossAttention
+    ca = CrossAttention(64, num_heads=8)
+    x = torch.randn(2, 30, 64); ctx = torch.randn(2, 50, 64)
+    out = ca(x, ctx)
+    assert out.shape == (2, 30, 64)
+
+def test_cross_attn_block_zero_init_identity():
+    import torch
+    from libs.model.flowtok_t2i import DiTBlock
+    blk = DiTBlock(64, num_heads=8, use_cross_attn=True)
+    blk.train(False)
+    for p in blk.adaLN_modulation[-1].parameters():
+        torch.nn.init.zeros_(p)
+    x = torch.randn(2, 10, 64); c = torch.randn(2, 64); ctx = torch.randn(2, 12, 64)
+    out = blk._forward(x, c, ctx)
+    assert torch.allclose(out, x, atol=1e-5)
+
+def test_flowtok_cross_attention_forward_and_compat():
+    import torch
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok
+    base = dict(channels=16, clip_dim=16, num_clip_token=77, cfg_indicator=0.0,
+                noising_type="none", noising_scale=0.1,
+                textVAE=SimpleNamespace(num_blocks=1, hidden_dim=32, num_attention_heads=2,
+                                        dropout_prob=0.0, clip_loss_weight=0.0))
+    cfg = SimpleNamespace(use_cross_attention=True, **base)
+    m = FlowTok(cfg, num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    assert hasattr(m, "context_embedder")
+    x = torch.randn(2, 2 * 77, 16); ctx = torch.randn(2, 2 * 77, 16); t = torch.rand(2)
+    nullind = torch.zeros(2, dtype=torch.bool)
+    out = m(x, t=t, null_indicator=nullind, context=ctx)[0]
+    assert out.shape == (2, 2 * 77, 16)
+    cfg0 = SimpleNamespace(**base)
+    m0 = FlowTok(cfg0, num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    assert not hasattr(m0, "context_embedder")
+    assert m0.use_cross_attention is False
+    out0 = m0(x, t=t, null_indicator=nullind)[0]
+    assert out0.shape == (2, 2 * 77, 16)
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

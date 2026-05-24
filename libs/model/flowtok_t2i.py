@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 from timm.models.vision_transformer import Attention, Mlp
@@ -81,31 +82,65 @@ class LabelEmbedder(nn.Module):
 #                                 Core DiT Model                                #
 #################################################################################
 
+class CrossAttention(nn.Module):
+    """Multi-head cross-attention: queries from x, keys/values from context."""
+    def __init__(self, hidden_size, num_heads, qkv_bias=True):
+        super().__init__()
+        assert hidden_size % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.q = nn.Linear(hidden_size, hidden_size, bias=qkv_bias)
+        self.kv = nn.Linear(hidden_size, hidden_size * 2, bias=qkv_bias)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x, context):
+        B, Nq, C = x.shape
+        Nk = context.shape[1]
+        q = self.q(x).reshape(B, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        kv = self.kv(context).reshape(B, Nk, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(B, Nq, C)
+        return self.proj(out)
+
+
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_cross_attn=False, **block_kwargs):
         super().__init__()
+        self.use_cross_attn = use_cross_attn
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        n_mod = 9 if use_cross_attn else 6
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.Linear(hidden_size, n_mod * hidden_size, bias=True)
         )
+        if use_cross_attn:
+            self.norm_ca = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.cross_attn = CrossAttention(hidden_size, num_heads)
 
-    def forward(self, x, c):
-        return torch.utils.checkpoint.checkpoint(self._forward, x, c, use_reentrant=False)
-        # return self._forward(x, c)
-    
-    def _forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+    def forward(self, x, c, context=None):
+        return torch.utils.checkpoint.checkpoint(self._forward, x, c, context, use_reentrant=False)
+
+    def _forward(self, x, c, context=None):
+        if self.use_cross_attn:
+            (shift_msa, scale_msa, gate_msa,
+             shift_ca, scale_ca, gate_ca,
+             shift_mlp, scale_mlp, gate_mlp) = self.adaLN_modulation(c).chunk(9, dim=1)
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_ca.unsqueeze(1) * self.cross_attn(modulate(self.norm_ca(x), shift_ca, scale_ca), context)
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -181,10 +216,17 @@ class FlowTok(nn.Module):
         # Default False == legacy 2-axis (spatial+temporal). No new params either way.
         self.use_modality_pos_emb = getattr(config, "use_modality_pos_emb", False)
 
+        # Arm 7: opt-in cross-attention conditioning on satellite tokens.
+        # Default False == legacy self-attn-only blocks; no new params when off.
+        self.use_cross_attention = getattr(config, "use_cross_attention", False)
+
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_cross_attn=self.use_cross_attention)
+            for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
+        if self.use_cross_attention:
+            self.context_embedder = nn.Linear(config.channels, hidden_size, bias=True)
         self.initialize_weights()
 
         self.context_encoder = FlowEncoder(d_model=config.clip_dim, N=config.textVAE.num_blocks,
@@ -303,11 +345,12 @@ class FlowTok(nn.Module):
         pos_embed = torch.from_numpy(np.concatenate([spatial_embed, temporal_embed], axis=-1)).to(device=device, dtype=dtype).unsqueeze(0)  # [1, L, D]
         return pos_embed
 
-    def _forward(self, x, t, null_indicator):
+    def _forward(self, x, t, null_indicator, context=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
+        context: (N, L_ctx, C_in) optional satellite token context for cross-attention (Arm 7)
         """
         # x: [B, L, C_in]; L = 77 (I2I) or T*77 (V2V)
         B, L, _ = x.shape
@@ -317,11 +360,16 @@ class FlowTok(nn.Module):
         pos_embed = self._build_pos_embed(seq_len=L, device=x.device, dtype=x.dtype)
         x = x + pos_embed  # (N, L, D)
 
+        ctx = None
+        if self.use_cross_attention and context is not None:
+            ctx = self.context_embedder(context)
+            ctx = ctx + self._build_pos_embed(seq_len=ctx.shape[1], device=ctx.device, dtype=ctx.dtype)
+
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(null_indicator)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+            x = block(x, c, ctx) if self.use_cross_attention else block(x, c)
         x = self.final_layer(x, c)                # (N, T, out_channels)
         return [x]
     
@@ -348,15 +396,15 @@ class FlowTok(nn.Module):
 
         return image_latent, self.open_clip.logit_scale
     
-    def forward(self, x, t = None, text_encoder=False, text_projector=False, image_clip=False, null_indicator=None):
+    def forward(self, x, t = None, text_encoder=False, text_projector=False, image_clip=False, null_indicator=None, context=None):
         if text_encoder:
             return self._text_encoder(condition_context = x)
         elif text_projector:
             return self._text_projector(condition_context = x)
         elif image_clip:
-            return self._img_clip(image_input = x) 
+            return self._img_clip(image_input = x)
         else:
-            return self._forward(x = x, t = t, null_indicator=null_indicator)
+            return self._forward(x=x, t=t, null_indicator=null_indicator, context=context)
 
 
 #################################################################################
