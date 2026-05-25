@@ -33,5 +33,5 @@ JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_htest_v2v_direct.log
 cd $FT
 if [ ! -e "$CKPT" ]; then echo "missing $CKPT, abort"; exit 1; fi
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-python3 -u scripts/test_sat2radar_v2v.py   --config "$CFG"   --ckpt "$CKPT"   --out_dir "$OUT"   --split test   --mode v2v   --filelist_path "$TEST_PKL"   --max_batches_metrics -1   --max_batches_images 6   --batch_size 8   --skip_gen_metrics   --metrics_json "$OUT/metrics.json"   --gpu "$CUDA_VISIBLE_DEVICES"   > "$JOBLOG" 2>&1
+python3 -u scripts/test_sat2radar_v2v.py   --config "$CFG"   --ckpt "$CKPT"   --out_dir "$OUT"   --split test   --mode v2v   --filelist_path "$TEST_PKL"   --max_batches_metrics -1   --max_batches_images 6   --batch_size 8   --metrics_json "$OUT/metrics.json"   --gpu "$CUDA_VISIBLE_DEVICES"   > "$JOBLOG" 2>&1
 echo "[$(date '+%F %T')] direct v2v holdout test done: $OUT/metrics.json"
