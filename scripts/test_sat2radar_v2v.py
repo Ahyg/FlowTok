@@ -754,7 +754,16 @@ def main():
             )  # [B, L, C_tok]
         else:
             _flow_cond_mode = getattr(config, "flow_cond_mode", "none")
-            if _flow_cond_mode == "token_concat":
+            # All sat-conditioning flow modes start from radar-only noise and pass
+            # the sat tokens as the condition; the solver does the concat/interleave/
+            # cross-attn internally and returns the radar-only token sequence.
+            _tc_family = (
+                "token_concat",
+                "token_concat_interleaved",
+                "token_concat_modality",
+            )
+            _uses_cond = _flow_cond_mode in _tc_family or _flow_cond_mode == "cross_attention"
+            if _uses_cond:
                 x_T_init = torch.randn_like(sat_tokens)
             else:
                 x_T_init = x0
@@ -763,7 +772,7 @@ def main():
                 step_size_type="step_in_dsigma",
                 guidance_scale=guidance_scale,
             )
-            z, _ = ode_solver.sample(
+            _sample_kwargs = dict(
                 x_T=x_T_init,
                 batch_size=B,
                 sample_steps=config.sample.sample_steps,
@@ -771,8 +780,11 @@ def main():
                 has_null_indicator=guidance_scale > 1.0,
                 prediction_target=getattr(config, "flow_prediction_target", "velocity"),
                 flow_cond_mode=_flow_cond_mode,
-                cond_tokens=sat_tokens if _flow_cond_mode == "token_concat" else None,
-            )  # [B, L, C_tok]
+                cond_tokens=sat_tokens if _uses_cond else None,
+            )
+            if _flow_cond_mode == "token_concat_interleaved":
+                _sample_kwargs["cond_num_latent_tokens"] = num_latent_tokens
+            z, _ = ode_solver.sample(**_sample_kwargs)  # [B, L, C_tok]
 
         # Reshape tokens back to [B, T_eff, C_tok, 1, L_frame] and decode.
         L = z.shape[1]
