@@ -26,7 +26,7 @@ FT=/scratch/kl02/$USER/Projv2v/FlowTok
 CFG=$FT/configs/Sat2Radar-v2v-cmp-m8align-B-2021summer_gadi.py
 WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_v2v_cmp_m8align_B
 CKPT=$WD/ckpts/60000.ckpt
-OUT=$WD/test_holdout_60000
+OUT=$WD/test_holdout_60000_posfix
 TEST_PKL=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_test_202407_202507.pkl
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs "$OUT"
 JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_htest_v2v_m8align.log

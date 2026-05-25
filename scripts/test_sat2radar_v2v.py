@@ -497,6 +497,23 @@ def main():
     nnet_ema = train_state.nnet_ema.to(device)
     nnet_ema.eval()
 
+    # pos_n_per_frame is an instance attribute (NOT in state_dict), so loading a
+    # ckpt leaves it at the default num_latent_tokens. For layouts whose "fat
+    # frame" carries 2L tokens — seqconcat ([sat|lgt]) and token_concat_interleaved
+    # ([sat|radar]) — training set pos_n_per_frame=2L (see train_sat2radar_v2v.py).
+    # We MUST replicate that here, else the interleaved pos-embed is wrong at
+    # inference (spatial modality signal lost) and conditioning collapses.
+    _need_2L_pos_per_frame = (
+        (getattr(config, "cond_use_sat_lightning_tokens", False)
+         and getattr(config, "cond_token_fusion", "mean") == "seqconcat")
+        or getattr(config, "flow_cond_mode", "none") == "token_concat_interleaved"
+    )
+    if _need_2L_pos_per_frame:
+        _pos_override = 2 * int(config.vq_model.num_latent_tokens)
+        nnet.pos_n_per_frame = _pos_override
+        nnet_ema.pos_n_per_frame = _pos_override
+        print(f"[POS] interleaved/seqconcat layout: set pos_n_per_frame={_pos_override}")
+
     # Optional adapters: loaded from ckpt directory if present.
     adapter_in_satellite = None
     adapter_out = None
