@@ -412,6 +412,27 @@ def test_satenc_off_state_dict_matches_arm7():
     assert set(m_off.state_dict().keys()) == set(m_arm7.state_dict().keys())
 
 
+def test_satenc_encoder_transforms_and_has_grad():
+    import torch
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok
+    base = dict(channels=16, clip_dim=16, num_clip_token=77, cfg_indicator=0.0,
+                noising_type="none", noising_scale=0.1,
+                textVAE=SimpleNamespace(num_blocks=1, hidden_dim=32, num_attention_heads=2,
+                                        dropout_prob=0.0, clip_loss_weight=0.0))
+    cfg = SimpleNamespace(use_cross_attention=True, sat_context_encoder_layers=6, **base)
+    m = FlowTok(cfg, num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    enc = m.sat_context_encoder
+    ctx_in = torch.randn(2, 77, 128)
+    out = enc(ctx_in)
+    assert out.shape == ctx_in.shape
+    # encoder must actually transform its input (not identity / not constant)
+    assert not torch.allclose(out, ctx_in, atol=1e-3)
+    # gradients must flow to encoder params
+    out.sum().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in enc.parameters())
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

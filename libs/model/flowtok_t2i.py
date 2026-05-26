@@ -113,9 +113,10 @@ class SatEncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True)
         self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size,
                        hidden_features=int(hidden_size * mlp_ratio),
-                       act_layer=lambda: nn.GELU(approximate="tanh"), drop=0)
+                       act_layer=approx_gelu, drop=0)
 
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
@@ -262,11 +263,11 @@ class FlowTok(nn.Module):
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         if self.use_cross_attention:
             self.context_embedder = nn.Linear(config.channels, hidden_size, bias=True)
-            self.sat_ctx_layers = getattr(config, "sat_context_encoder_layers", 0)
-            self.use_sat_context_encoder = self.sat_ctx_layers > 0
+            _sat_ctx_layers = getattr(config, "sat_context_encoder_layers", 0)
+            self.use_sat_context_encoder = _sat_ctx_layers > 0
             if self.use_sat_context_encoder:
                 self.sat_context_encoder = SatContextEncoder(
-                    hidden_size, num_heads, depth=self.sat_ctx_layers, mlp_ratio=mlp_ratio)
+                    hidden_size, num_heads, depth=_sat_ctx_layers, mlp_ratio=mlp_ratio)
         self.initialize_weights()
 
         self.context_encoder = FlowEncoder(d_model=config.clip_dim, N=config.textVAE.num_blocks,
