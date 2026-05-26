@@ -83,6 +83,9 @@ class I3DFeatures(nn.Module):
         self.net = net
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # torchmetrics' FID does not move inputs to the feature module's device,
+        # so align here (the net was .to(device)'d in make_v2v_metrics).
+        x = x.to(next(self.net.parameters()).device)
         if x.dim() == 4:
             x = x.unsqueeze(1)  # [B, 1, 3, H, W]
         if x.dim() != 5:
