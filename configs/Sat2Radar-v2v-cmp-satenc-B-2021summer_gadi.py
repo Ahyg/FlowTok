@@ -1,12 +1,15 @@
-"""7-arm v2v comparison — Arm 7 (xattn): cross-attention conditioning.
+"""Arm 8 (satenc): arm7 cross-attention + satellite self-attention context encoder.
 
-Arm 7 = sat tokens injected as cross-attention keys/values in each DiT block.
-Same as m8block except flow_cond_mode = cross_attention and use_cross_attention=True.
+Arm 8 = arm7 (sat tokens as cross-attention K/V) PLUS a deterministic,
+timestep-independent self-attention encoder (sat_context_encoder_layers) that
+refines the sat tokens before they become K/V. Identical to xattn-B except the
+added flag.
 
   - generation_algorithm = flow_matching
   - flow_prediction_target = radar_tokens  (predict x1 directly)
   - flow_cond_mode = cross_attention       (sat tokens as KV in cross-attn layers)
   - use_cross_attention = True
+  - sat_context_encoder_layers = 6         (Arm 8: N=6 sat self-attn encoder @ hidden_size)
   - model size = flowtok-b (B, not XL)
   - dataset = 2021summer small set (1445 train clips)
   - 60k steps

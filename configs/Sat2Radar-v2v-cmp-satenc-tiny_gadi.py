@@ -1,12 +1,13 @@
-"""7-arm v2v comparison — Arm 7 TINY (xattn): 32-clip overfit, 12k steps.
+"""Arm 8 TINY (satenc): 32-clip overfit gate, 12k steps.
 
-Tiny version of xattn-B for fast sanity-check / overfit gate before full run.
-Same settings as xattn-B except: 32-clip dataset, 12k steps, faster eval/save.
+Tiny version of satenc-B for fast sanity-check / overfit gate before full run.
+Same settings as satenc-B except: 32-clip dataset, 12k steps, faster eval/save.
 
   - flow_cond_mode = cross_attention
   - use_cross_attention = True
+  - sat_context_encoder_layers = 6 (Arm 8: N=6 sat self-attn encoder)
   - n_steps = 12_000 (overfit gate)
-  - dataset = 32-clip overfit pkl
+  - dataset = 32-clip overfit pkl (reuses xattn_tiny set)
 """
 import ml_collections
 from dataclasses import dataclass
