@@ -505,6 +505,18 @@ def test_factorized_reshape_roundtrip_and_grouping():
             assert abs(tp[0, tt * L + ll, 0].item() - (T - 1) / 2) < 1e-5
 
 
+def test_factorized_requires_cross_attention():
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok
+    raised = False
+    try:
+        FlowTok(SimpleNamespace(use_factorized_attn=True, **_arm9_base()),
+                num_latent_tokens=77, hidden_size=128, depth=1, num_heads=8)
+    except AssertionError:
+        raised = True
+    assert raised, "use_factorized_attn without use_cross_attention should raise AssertionError"
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]

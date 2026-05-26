@@ -202,6 +202,7 @@ class FactorizedDiTBlock(nn.Module):
             nn.SiLU(), nn.Linear(hidden_size, 12 * hidden_size, bias=True))
 
     def forward(self, x, c, context=None):
+        assert x.shape[1] % self.n_per_frame == 0, "seq_len must be divisible by n_per_frame"
         return torch.utils.checkpoint.checkpoint(self._forward, x, c, context, use_reentrant=False)
 
     def _frame_local(self, attn, x):
@@ -217,7 +218,6 @@ class FactorizedDiTBlock(nn.Module):
         return x.reshape(B, L, T, D).transpose(1, 2).reshape(B, S, D)
 
     def _forward(self, x, c, context=None):
-        assert x.shape[1] % self.n_per_frame == 0, "seq_len must be divisible by n_per_frame"
         (sh_sp, sc_sp, g_sp,
          sh_tp, sc_tp, g_tp,
          sh_ca, sc_ca, g_ca,
@@ -306,6 +306,12 @@ class FlowTok(nn.Module):
         self.use_cross_attention = getattr(config, "use_cross_attention", False)
 
         if getattr(config, "use_factorized_attn", False):
+            assert self.use_cross_attention, (
+                "use_factorized_attn=True requires use_cross_attention=True "
+                "(FactorizedDiTBlock always uses cross-attention)")
+            # n_per_frame is fixed at construction = num_latent_tokens. Arm9 is
+            # cross_attention mode (radar-only sequence); it is NOT compatible with
+            # seqconcat/interleaved modes that dynamically set pos_n_per_frame=2L.
             self.blocks = nn.ModuleList([
                 FactorizedDiTBlock(hidden_size, num_heads,
                                    n_per_frame=num_latent_tokens, mlp_ratio=mlp_ratio)
