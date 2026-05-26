@@ -104,6 +104,41 @@ class CrossAttention(nn.Module):
         return self.proj(out)
 
 
+class SatEncoderLayer(nn.Module):
+    """One pre-norm self-attention + MLP block for the satellite context encoder.
+    No adaLN, no timestep conditioning, no cross-attn — the satellite condition is
+    clean input, independent of the diffusion timestep (Arm 8)."""
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.mlp = Mlp(in_features=hidden_size,
+                       hidden_features=int(hidden_size * mlp_ratio),
+                       act_layer=lambda: nn.GELU(approximate="tanh"), drop=0)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class SatContextEncoder(nn.Module):
+    """Timestep-independent self-attention encoder that refines satellite K/V
+    tokens before per-block cross-attention (Arm 8). Full self-attention over the
+    whole sat sequence (T*L tokens) => spatiotemporal, not axial."""
+    def __init__(self, hidden_size, num_heads, depth=6, mlp_ratio=4.0):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [SatEncoderLayer(hidden_size, num_heads, mlp_ratio) for _ in range(depth)])
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
+
+
 class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
@@ -227,6 +262,11 @@ class FlowTok(nn.Module):
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         if self.use_cross_attention:
             self.context_embedder = nn.Linear(config.channels, hidden_size, bias=True)
+            self.sat_ctx_layers = getattr(config, "sat_context_encoder_layers", 0)
+            self.use_sat_context_encoder = self.sat_ctx_layers > 0
+            if self.use_sat_context_encoder:
+                self.sat_context_encoder = SatContextEncoder(
+                    hidden_size, num_heads, depth=self.sat_ctx_layers, mlp_ratio=mlp_ratio)
         self.initialize_weights()
 
         self.context_encoder = FlowEncoder(d_model=config.clip_dim, N=config.textVAE.num_blocks,
@@ -364,6 +404,8 @@ class FlowTok(nn.Module):
         if self.use_cross_attention and context is not None:
             ctx = self.context_embedder(context)
             ctx = ctx + self._build_pos_embed(seq_len=ctx.shape[1], device=ctx.device, dtype=ctx.dtype)
+            if getattr(self, "use_sat_context_encoder", False):
+                ctx = self.sat_context_encoder(ctx)
 
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(null_indicator)    # (N, D)

@@ -358,6 +358,60 @@ def test_cross_attention_training_branch():
     assert torch.isfinite(loss).all()
 
 
+def test_satenc_defaults_off():
+    import torch
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok
+    base = dict(channels=16, clip_dim=16, num_clip_token=77, cfg_indicator=0.0,
+                noising_type="none", noising_scale=0.1,
+                textVAE=SimpleNamespace(num_blocks=1, hidden_dim=32, num_attention_heads=2,
+                                        dropout_prob=0.0, clip_loss_weight=0.0))
+    cfg = SimpleNamespace(use_cross_attention=True, **base)  # no sat_context_encoder_layers
+    m = FlowTok(cfg, num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    assert getattr(m, "use_sat_context_encoder", False) is False
+    assert not hasattr(m, "sat_context_encoder")
+
+
+def test_satenc_construction_and_forward():
+    import torch
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok, SatContextEncoder
+    base = dict(channels=16, clip_dim=16, num_clip_token=77, cfg_indicator=0.0,
+                noising_type="none", noising_scale=0.1,
+                textVAE=SimpleNamespace(num_blocks=1, hidden_dim=32, num_attention_heads=2,
+                                        dropout_prob=0.0, clip_loss_weight=0.0))
+    cfg = SimpleNamespace(use_cross_attention=True, sat_context_encoder_layers=6, **base)
+    m = FlowTok(cfg, num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    assert m.use_sat_context_encoder is True
+    assert isinstance(m.sat_context_encoder, SatContextEncoder)
+    assert len(m.sat_context_encoder.layers) == 6
+    x = torch.randn(2, 2 * 77, 16); ctx = torch.randn(2, 2 * 77, 16); t = torch.rand(2)
+    nullind = torch.zeros(2, dtype=torch.bool)
+    out = m(x, t=t, null_indicator=nullind, context=ctx)[0]
+    assert out.shape == (2, 2 * 77, 16)
+    assert torch.isfinite(out).all()
+    # i2i length too (L = 77)
+    xi = torch.randn(2, 77, 16); ci = torch.randn(2, 77, 16); ti = torch.rand(2)
+    ni = torch.zeros(2, dtype=torch.bool)
+    oi = m(xi, t=ti, null_indicator=ni, context=ci)[0]
+    assert oi.shape == (2, 77, 16) and torch.isfinite(oi).all()
+
+
+def test_satenc_off_state_dict_matches_arm7():
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok
+    base = dict(channels=16, clip_dim=16, num_clip_token=77, cfg_indicator=0.0,
+                noising_type="none", noising_scale=0.1,
+                textVAE=SimpleNamespace(num_blocks=1, hidden_dim=32, num_attention_heads=2,
+                                        dropout_prob=0.0, clip_loss_weight=0.0))
+    m_arm7 = FlowTok(SimpleNamespace(use_cross_attention=True, **base),
+                     num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    m_off = FlowTok(SimpleNamespace(use_cross_attention=True, sat_context_encoder_layers=0, **base),
+                    num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    assert not hasattr(m_off, "sat_context_encoder")
+    assert set(m_off.state_dict().keys()) == set(m_arm7.state_dict().keys())
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
