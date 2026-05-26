@@ -180,6 +180,55 @@ class DiTBlock(nn.Module):
         return x
 
 
+class FactorizedDiTBlock(nn.Module):
+    """Arm 9: factorized divided space-time attention with adaLN-Zero.
+    Replaces DiTBlock's single full self-attention with frame-local spatial SA +
+    axial temporal SA; keeps arm7's cross-attention (sat K/V) + MLP. 4 sub-layers,
+    adaLN chunk(12). DiTBlock is left untouched."""
+    def __init__(self, hidden_size, num_heads, n_per_frame, mlp_ratio=4.0):
+        super().__init__()
+        self.n_per_frame = n_per_frame
+        self.norm_sp = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn_sp = Attention(hidden_size, num_heads=num_heads, qkv_bias=True)
+        self.norm_tp = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn_tp = Attention(hidden_size, num_heads=num_heads, qkv_bias=True)
+        self.norm_ca = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.cross_attn = CrossAttention(hidden_size, num_heads)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio),
+                       act_layer=approx_gelu, drop=0)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 12 * hidden_size, bias=True))
+
+    def forward(self, x, c, context=None):
+        return torch.utils.checkpoint.checkpoint(self._forward, x, c, context, use_reentrant=False)
+
+    def _frame_local(self, attn, x):
+        B, S, D = x.shape; L = self.n_per_frame; T = S // L
+        x = x.reshape(B * T, L, D)
+        x = attn(x)
+        return x.reshape(B, S, D)
+
+    def _axial_temporal(self, attn, x):
+        B, S, D = x.shape; L = self.n_per_frame; T = S // L
+        x = x.reshape(B, T, L, D).transpose(1, 2).reshape(B * L, T, D)
+        x = attn(x)
+        return x.reshape(B, L, T, D).transpose(1, 2).reshape(B, S, D)
+
+    def _forward(self, x, c, context=None):
+        assert x.shape[1] % self.n_per_frame == 0, "seq_len must be divisible by n_per_frame"
+        (sh_sp, sc_sp, g_sp,
+         sh_tp, sc_tp, g_tp,
+         sh_ca, sc_ca, g_ca,
+         sh_mlp, sc_mlp, g_mlp) = self.adaLN_modulation(c).chunk(12, dim=1)
+        x = x + g_sp.unsqueeze(1) * self._frame_local(self.attn_sp, modulate(self.norm_sp(x), sh_sp, sc_sp))
+        x = x + g_tp.unsqueeze(1) * self._axial_temporal(self.attn_tp, modulate(self.norm_tp(x), sh_tp, sc_tp))
+        x = x + g_ca.unsqueeze(1) * self.cross_attn(modulate(self.norm_ca(x), sh_ca, sc_ca), context)
+        x = x + g_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), sh_mlp, sc_mlp))
+        return x
+
+
 class FinalLayer(nn.Module):
     """
     The final layer of DiT.
@@ -256,10 +305,17 @@ class FlowTok(nn.Module):
         # Default False == legacy self-attn-only blocks; no new params when off.
         self.use_cross_attention = getattr(config, "use_cross_attention", False)
 
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_cross_attn=self.use_cross_attention)
-            for _ in range(depth)
-        ])
+        if getattr(config, "use_factorized_attn", False):
+            self.blocks = nn.ModuleList([
+                FactorizedDiTBlock(hidden_size, num_heads,
+                                   n_per_frame=num_latent_tokens, mlp_ratio=mlp_ratio)
+                for _ in range(depth)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_cross_attn=self.use_cross_attention)
+                for _ in range(depth)
+            ])
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         if self.use_cross_attention:
             self.context_embedder = nn.Linear(config.channels, hidden_size, bias=True)

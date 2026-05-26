@@ -433,6 +433,78 @@ def test_satenc_encoder_transforms_and_has_grad():
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in enc.parameters())
 
 
+def _arm9_base():
+    from types import SimpleNamespace
+    return dict(channels=16, clip_dim=16, num_clip_token=77, cfg_indicator=0.0,
+                noising_type="none", noising_scale=0.1,
+                textVAE=SimpleNamespace(num_blocks=1, hidden_dim=32, num_attention_heads=2,
+                                        dropout_prob=0.0, clip_loss_weight=0.0))
+
+
+def test_factorized_defaults_off():
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok, DiTBlock
+    m = FlowTok(SimpleNamespace(use_cross_attention=True, **_arm9_base()),
+                num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    assert all(isinstance(b, DiTBlock) for b in m.blocks)
+
+
+def test_factorized_off_state_dict_matches_arm7():
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok
+    m_arm7 = FlowTok(SimpleNamespace(use_cross_attention=True, **_arm9_base()),
+                     num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    m_off = FlowTok(SimpleNamespace(use_cross_attention=True, use_factorized_attn=False, **_arm9_base()),
+                    num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    assert set(m_off.state_dict().keys()) == set(m_arm7.state_dict().keys())
+
+
+def test_factorized_construction_and_forward():
+    import torch
+    from types import SimpleNamespace
+    from libs.model.flowtok_t2i import FlowTok, FactorizedDiTBlock
+    cfg = SimpleNamespace(use_cross_attention=True, use_factorized_attn=True, **_arm9_base())
+    m = FlowTok(cfg, num_latent_tokens=77, hidden_size=128, depth=2, num_heads=8)
+    assert all(isinstance(b, FactorizedDiTBlock) for b in m.blocks)
+    assert len(m.blocks) == 2
+    b = m.blocks[0]
+    assert hasattr(b, "attn_sp") and hasattr(b, "attn_tp") and hasattr(b, "cross_attn")
+    assert b.adaLN_modulation[-1].out_features == 12 * 128
+    x = torch.randn(2, 2 * 77, 16); ctx = torch.randn(2, 2 * 77, 16)
+    ni = torch.zeros(2, dtype=torch.bool)
+    out = m(x, t=torch.rand(2), null_indicator=ni, context=ctx)[0]
+    assert out.shape == (2, 2 * 77, 16) and torch.isfinite(out).all()
+    xi = torch.randn(2, 77, 16); ci = torch.randn(2, 77, 16)
+    oi = m(xi, t=torch.rand(2), null_indicator=ni, context=ci)[0]
+    assert oi.shape == (2, 77, 16) and torch.isfinite(oi).all()
+
+
+def test_factorized_reshape_roundtrip_and_grouping():
+    import torch
+    from libs.model.flowtok_t2i import FactorizedDiTBlock
+    blk = FactorizedDiTBlock(hidden_size=8, num_heads=2, n_per_frame=4)
+    B, T, L, D = 1, 3, 4, 8
+    x = torch.randn(B, T * L, D)
+    ident = lambda z: z
+    assert torch.allclose(blk._frame_local(ident, x), x, atol=1e-6)
+    assert torch.allclose(blk._axial_temporal(ident, x), x, atol=1e-6)
+    g = torch.zeros(B, T * L, D)
+    for tt in range(T):
+        for ll in range(L):
+            g[0, tt * L + ll, 0] = tt
+            g[0, tt * L + ll, 1] = ll
+    meanpool = lambda z: z.mean(dim=1, keepdim=True).expand_as(z)
+    fl = blk._frame_local(meanpool, g)
+    for tt in range(T):
+        assert torch.allclose(fl[0, tt * L:(tt + 1) * L, 0], torch.full((L,), float(tt)), atol=1e-5)
+        assert torch.allclose(fl[0, tt * L:(tt + 1) * L, 1], torch.full((L,), (L - 1) / 2), atol=1e-5)
+    tp = blk._axial_temporal(meanpool, g)
+    for tt in range(T):
+        for ll in range(L):
+            assert abs(tp[0, tt * L + ll, 1].item() - ll) < 1e-5
+            assert abs(tp[0, tt * L + ll, 0].item() - (T - 1) / 2) < 1e-5
+
+
 def _main():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
