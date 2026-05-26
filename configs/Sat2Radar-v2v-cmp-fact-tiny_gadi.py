@@ -129,6 +129,8 @@ def get_config():
     config.cond_token_fusion = "mean"   # unused under token_concat.
 
     # V2V dataset: 16 frames at 128x128, all 10 IR bands + lightning (= reference).
+    # NOTE: intentionally reuses the arm7 xattn-tiny 32-clip overfit pkl — the overfit
+    # set is architecture-agnostic, so do NOT "fix" this path to fact_tiny.
     config.dataset = d(
         filelist_path=(
             "/scratch/kl02/yh0308/Projv2v/Experiments/"
