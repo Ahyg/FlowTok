@@ -25,7 +25,7 @@ export PYTHONUNBUFFERED=1
 FT=/scratch/kl02/$USER/Projv2v/FlowTok
 CFG=$FT/configs/Sat2Radar-v2v-cmp-fact-B-2021summer_gadi.py
 WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_v2v_cmp_fact_B
-TARGET=60000
+TARGET=200000
 WALL_SEC=$((47*3600))
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs "$WD/ckpts"
 JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_v2v_cmp_fact_full.log

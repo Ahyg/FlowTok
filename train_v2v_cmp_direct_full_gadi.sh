@@ -25,7 +25,7 @@ export PYTHONUNBUFFERED=1
 FT=/scratch/kl02/$USER/Projv2v/FlowTok
 CFG=$FT/configs/Sat2Radar-v2v-cmp-direct-B-2021summer_gadi.py
 WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_v2v_cmp_direct_B
-TARGET=60000
+TARGET=200000
 WALL_SEC=$((47*3600))
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs "$WD/ckpts"
 JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_v2v_cmp_direct_full.log
@@ -47,6 +47,7 @@ echo "[$(date '+%F %T')] v2v cmp direct full: after run rc=$RC step=$NEW (124=ti
 if [ "$NEW" -ge "$TARGET" ]; then
   echo "[$(date '+%F %T')] v2v cmp direct full: TARGET reached at $NEW. Done."
   rm -f "$WD/RESUBMIT_STALLED"
+  cd $FT && qsub holdout_test_v2v_cmp_direct_gadi.sh
 elif [ "$RC" = "124" ] || [ "$NEW" -gt "$STEP" ]; then
   echo "[$(date '+%F %T')] v2v cmp direct full: progress $STEP->$NEW (rc=$RC), re-qsub"
   rm -f "$WD/RESUBMIT_STALLED"

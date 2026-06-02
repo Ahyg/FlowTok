@@ -68,11 +68,11 @@ def get_config():
     )
 
     config.train = d(
-        n_steps=60_000,
+        n_steps=200_000,
         batch_size=8,
         log_interval=100,
         eval_interval=2_000,
-        save_interval=20_000,
+        save_interval=50_000,
         n_samples_eval=4,
         val_max_batches=64,
     )
