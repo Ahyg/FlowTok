@@ -1,0 +1,100 @@
+# run4B sat10ch AE — variant B (perceptual_per_channel=true) per lab2 sweep.
+# Selected over variant A because downstream is FlowTok flow-matching, where rFID/CSI
+# structure dominates over raw pixel MSE.
+# Deltas vs run1_continue_gadi:
+#   vit_enc/dec_patch_size: 16 -> 8        (lab2: fss_xlgt 0.76->0.84, rfid 114->107)
+#   num_latent_tokens:       77 -> 128     (lab2 token sweep elbow; 128 ≈ 256 ≫ 77)
+#   kl_weight:           1.0e-6 -> 6.02e-8 (lab2 ÷10 winner; sat mse_xlgt -6.4%)
+#   perceptual_weight:      1.1 -> 1.1     (lab2 doc: "1.1 or 1.6" — keep 1.1 for stability; can bump if final rfid disappoints)
+#   perceptual_per_channel: false -> true  (lab2: rfid_xlgt 173->54, lpips 0.28->0.11, fss_xlgt 0.76->0.83, ch10_ssim 0.9951->0.9992)
+#   per_gpu_batch_size:     64 -> 32       (per_channel × 11ch on lab2 24GB needed bs=8; GADI H200 141GB can take ≥32; tiny-gate doubles as memory smoke)
+# All other run1 knobs preserved.
+experiment:
+  project: sat10ch_flowtitok_ae_bl128_vae_scratch
+  name: sat10ch_flowtitok_ae_bl128_vae_scratch_run4B_gadi
+  output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/sat10ch_flowtitok_ae_bl128_vae_scratch_run4B_gadi
+  max_train_examples: 250000
+  save_every: 50000
+  eval_every: 10000
+  generate_every: 5000
+  log_every: 1000
+  log_grad_norm_every: 1000
+  resume: true
+  logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/sat10ch_flowtitok_ae_bl128_vae_scratch_run4B_gadi/logs
+
+model:
+  vq_model:
+    quantize_mode: vae
+    token_size: 16
+    vit_enc_model_size: base
+    vit_dec_model_size: large
+    vit_enc_patch_size: 8
+    vit_dec_patch_size: 8
+    num_latent_tokens: 128
+    in_channels: 11
+    out_channels: 11
+    finetune_decoder: false
+    is_legacy: false
+
+losses:
+  discriminator_start: 400000
+  quantizer_weight: 1.0
+  discriminator_factor: 1.0
+  discriminator_weight: 0.1
+  perceptual_loss: lpips-convnext_s-1.0-0.1
+  perceptual_weight: 1.1
+  perceptual_per_channel: true
+  perceptual_per_channel_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  reconstruction_loss: l2
+  reconstruction_weight: 1.0
+  lecam_regularization_weight: 0.001
+  kl_weight: 6.02e-08
+  logvar_init: 0.0
+
+dataset:
+  params:
+    filelist_path: /g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202312_ct005.pkl
+    filelist_split: train
+    mode: satellite
+    use_lightning: true
+    num_workers: 4
+  preprocessing:
+    resize_shorter_edge: 128
+    crop_size: 128
+    random_crop: true
+    random_flip: true
+    res_ratio_filtering: true
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 0.0001
+    discriminator_learning_rate: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0001
+
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 10000
+    end_lr: 1.0e-05
+
+finetune:
+  enabled: false
+  text_guidance_from_filename: true
+
+training:
+  gradient_accumulation_steps: 1
+  per_gpu_batch_size: 32
+  mixed_precision: "no"
+  enable_tf32: true
+  enable_wandb: false
+  use_ema: true
+  seed: 42
+  max_train_steps: 200000
+  num_generated_images: 1
+  max_grad_norm: 1.0
+  nan_check: false
+  nan_skip: true
