@@ -1,11 +1,33 @@
 import glob
 import os
 import pickle
+import time
 from typing import Iterable
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+def _robust_np_load(path, retries=6, delays=(2, 5, 10, 20, 30, 60)):
+    """np.load with retries on transient filesystem errors.
+
+    NCI /g/data (Lustre) occasionally throws ``OSError: [Errno 5] Input/output
+    error`` during a brief storage-server hiccup. Un-handled, a single blip in a
+    DataLoader worker kills a multi-hour training job (lost run4 ~28h at step
+    121k on 2026-06-02). Retrying with backoff turns a transient blip (total
+    wait up to ~127s) into a non-event; a genuinely bad/missing file still
+    raises after the final attempt, same as before.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return np.load(path)
+        except OSError as err:
+            last_err = err
+            if attempt < retries - 1:
+                time.sleep(delays[min(attempt, len(delays) - 1)])
+    raise last_err
 
 
 def collate_sat2radar_v2v(batch):
@@ -181,7 +203,7 @@ class SatelliteRadarNpyDataset(Dataset):
 
     def _load_sat_image(self, path: str):
         """Load and scale one satellite(+lightning) frame as (C, H, W)."""
-        arr = np.load(path)  # (12, H, W)
+        arr = _robust_np_load(path)  # (12, H, W)
         ir = arr[self.ir_band_indices]
         lgt = arr[-2] if self.use_lightning else None
         ir_scaled, lgt_scaled = self.scale_sat_lgt_img(ir, lgt)
@@ -193,7 +215,7 @@ class SatelliteRadarNpyDataset(Dataset):
 
     def _load_radar_image(self, path: str):
         """Load and scale one radar frame as (1, H, W)."""
-        arr = np.load(path)  # (12, H, W)
+        arr = _robust_np_load(path)  # (12, H, W)
         radar = self.scale_radar_img(arr[-1])
         img = radar[None, ...]
         return img
@@ -311,7 +333,7 @@ class SatelliteRadarNpyDataset(Dataset):
 
         # Case 2: unpaired, original single-frame npy list.
         path = item
-        arr = np.load(path)  # (12, H, W)
+        arr = _robust_np_load(path)  # (12, H, W)
 
         if self.mode == "satellite":
             ir = arr[self.ir_band_indices]
