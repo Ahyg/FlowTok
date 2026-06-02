@@ -27,7 +27,7 @@ CFG=$FT/configs/Sat2Radar-v2v-cmp-xattn-XL-2021summer_gadi.py
 WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_v2v_cmp_xattn_XL
 CKPT=$WD/ckpts/60000.ckpt
 OUT=$WD/test_holdout_60000
-TEST_PKL=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_test_202407_202507.pkl
+TEST_PKL=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_test_202407_nofilter.pkl
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs "$OUT"
 JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_htest_v2v_xattn_XL.log
 cd $FT

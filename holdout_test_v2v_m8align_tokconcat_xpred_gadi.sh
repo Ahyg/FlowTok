@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -P kl02
 #PBS -q gpuhopper
-#PBS -l walltime=10:00:00
+#PBS -l walltime=20:00:00
 #PBS -l storage=gdata/kl02+scratch/kl02
 #PBS -l ncpus=12
 #PBS -l ngpus=1
@@ -10,7 +10,11 @@
 #PBS -l wd
 #PBS -M auhuyg@gmail.com
 #PBS -m abe
-#PBS -N htest_v2v_xattn_H
+#PBS -N htest_v2v_m8alitcxp
+# Holdout test for the 6-year full FlowTiTok-XL run m8align_tokconcat_xpred
+# (interleaved fat-frame M8, flow_cond_mode=token_concat_interleaved).
+# Same test pkl / seed / NFE=20 / metric code as the cmp arms -> directly comparable.
+# STEP defaults to 200000; results go to a per-step dir so re-runs don't clobber.
 set -uo pipefail
 export HF_HOME="/scratch/kl02/$USER/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME"
@@ -23,15 +27,16 @@ source /scratch/kl02/$USER/miniconda3/etc/profile.d/conda.sh
 conda activate flowtok
 export PYTHONUNBUFFERED=1
 FT=/scratch/kl02/$USER/Projv2v/FlowTok
-CFG=$FT/configs/Sat2Radar-v2v-cmp-xattn-H-2021summer_gadi.py
-WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_v2v_cmp_xattn_H
-CKPT=$WD/ckpts/60000.ckpt
-OUT=$WD/test_holdout_60000
-TEST_PKL=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_test_202407_nofilter.pkl
+CFG=$FT/configs/Sat2Radar-v2v-m8align-tokconcat-xpred-FlowTiTok-XL_gadi.py
+WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_v2v_m8align_tokconcat_xpred_full
+STEP="${STEP:-200000}"
+CKPT=$WD/ckpts/${STEP}.ckpt
+OUT=$WD/test_holdout_${STEP}
+TEST_PKL=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_test_202407_202507.pkl
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs "$OUT"
-JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_htest_v2v_xattn_H.log
+JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_htest_v2v_m8alitcxp.log
 cd $FT
 if [ ! -e "$CKPT" ]; then echo "missing $CKPT, abort"; exit 1; fi
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 python3 -u scripts/test_sat2radar_v2v.py   --config "$CFG"   --ckpt "$CKPT"   --out_dir "$OUT"   --split test   --mode v2v   --filelist_path "$TEST_PKL"   --max_batches_metrics -1   --max_batches_images 6   --batch_size 8   --metrics_json "$OUT/metrics.json"   --gpu "$CUDA_VISIBLE_DEVICES"   > "$JOBLOG" 2>&1
-echo "[$(date '+%F %T')] xattn H v2v holdout test done: $OUT/metrics.json"
+echo "[$(date '+%F %T')] m8align_tokconcat_xpred v2v holdout test done: $OUT/metrics.json"
