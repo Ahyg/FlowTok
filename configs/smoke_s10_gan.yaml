@@ -1,0 +1,93 @@
+experiment:
+  project: ae_gan_sat_sweep_20260604
+  name: smoke_s10_gan
+  output_dir: /mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/gan_sat/smoke_s10_gan
+  max_train_examples: 250000
+  save_every: 30
+  eval_every: 30
+  generate_every: 30
+  log_every: 10
+  log_grad_norm_every: 1000
+  resume: true
+  logging_dir: /mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/gan_sat/smoke_s10_gan/logs
+model:
+  vq_model:
+    quantize_mode: vae
+    token_size: 16
+    vit_enc_model_size: tiny
+    vit_dec_model_size: small
+    vit_enc_patch_size: 8
+    vit_dec_patch_size: 8
+    num_latent_tokens: 128
+    in_channels: 11
+    out_channels: 11
+    finetune_decoder: false
+    is_legacy: false
+losses:
+  discriminator_start: 20
+  quantizer_weight: 1.0
+  discriminator_factor: 1.0
+  discriminator_weight: 1.0
+  perceptual_loss: lpips-convnext_s-1.0-0.1
+  perceptual_weight: 1.1
+  reconstruction_loss: l2
+  reconstruction_weight: 1.0
+  lecam_regularization_weight: 0.001
+  kl_weight: 6.02e-08
+  logvar_init: 0.0
+  perceptual_per_channel: true
+  perceptual_per_channel_weights:
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+  - 1
+dataset:
+  params:
+    filelist_path: /mnt/ssd_1/yghu/Data/71_3m/filelists/dataset_filelist_i2i_train21_val24w1.pkl
+    filelist_split: train
+    mode: satellite
+    use_lightning: true
+    num_workers: 4
+  preprocessing:
+    resize_shorter_edge: 128
+    crop_size: 128
+    random_crop: true
+    random_flip: true
+    res_ratio_filtering: true
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 0.0001
+    discriminator_learning_rate: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0001
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 10
+    end_lr: 1.0e-05
+finetune:
+  enabled: false
+  text_guidance_from_filename: true
+training:
+  gradient_accumulation_steps: 1
+  per_gpu_batch_size: 8
+  mixed_precision: 'no'
+  enable_tf32: true
+  enable_wandb: false
+  use_ema: true
+  seed: 42
+  max_train_steps: 60
+  num_generated_images: 1
+  max_grad_norm: 1.0
+  nan_check: false
+  nan_skip: true
