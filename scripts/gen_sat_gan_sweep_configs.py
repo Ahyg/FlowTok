@@ -32,12 +32,14 @@ EXP_ROOT = "/mnt/ssd_2/yghu/Experiments/ae_recipe_sweep/gan_sat"
 PROJECT = "ae_gan_sat_sweep_20260604"
 
 # Gadi (NCI) overrides — same recipe + GAN axis, only the data/output paths
-# change. Data + val handling are copied from the user's working Gadi sat AE
-# config (sat10ch_flowtitok_ae_bl77_vae_scratch_run3_gadi.yaml). conda env on
-# Gadi for scripts/train_flowtitok_ae.py is `1d-tokenizer` (see PBS scripts).
+# change. conda env on Gadi for scripts/train_flowtitok_ae.py is `1d-tokenizer`
+# (see PBS scripts). DATASET: the user's small20 index (saved 2026-06-03) — a
+# single pkl carrying train/val/test as a 3-tuple, so this one path feeds both
+# the train split and the in-training "val" eval (create_dataloader hardcodes
+# split="val"). "use the small dataset for this experiment" (user, 2026-06-04).
 GADI_EXP_ROOT = "/scratch/kl02/yh0308/Projv2v/Experiments/ae_recipe_sweep/gan_sat"
 GADI_TRAIN_PKL = ("/g/data/kl02/yh0308/Data/71/filelists/"
-                  "dataset_filelist_i2i_train_201906_202312_ct005.pkl")
+                  "dataset_filelist_i2i_train_201906_202406_cond1_clip16_p015_seed42_small20.pkl")
 
 CONFIRM_STEPS = 100000
 WARMUP = 10000            # 10% of horizon
