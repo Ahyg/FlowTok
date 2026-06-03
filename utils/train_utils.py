@@ -2143,7 +2143,23 @@ def load_checkpoint(checkpoint_path: Path, accelerator, logger, strict=True):
 
     # The model weights are saved under unwrapped_model/, while accelerator
     # state is saved by accelerator.save_state(). Load via accelerator state.
-    accelerator.load_state(checkpoint_path, strict=strict)
+    # NOTE: this accelerate version's load_state() does not accept `strict`;
+    # passing it raises TypeError. Architecture is identical on resume, so a
+    # plain load is correct. `strict` kept in the signature for compatibility.
+    #
+    # torch 2.6 flipped torch.load's default to weights_only=True, which rejects
+    # the numpy RNG global in accelerate's random_states_*.pkl. The checkpoint is
+    # produced locally by this same code (trusted), so force weights_only=False
+    # for the duration of the load, then restore the original torch.load.
+    _orig_torch_load = torch.load
+    def _trusted_load(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _orig_torch_load(*args, **kwargs)
+    torch.load = _trusted_load
+    try:
+        accelerator.load_state(checkpoint_path)
+    finally:
+        torch.load = _orig_torch_load
     
     with open(metadata_file, "r") as f:
         global_step = int(json.load(f)["global_step"])
