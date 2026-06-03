@@ -38,7 +38,9 @@ conda activate 1d-tokenizer
 
 FLOWTOK_ROOT="/scratch/kl02/$USER/Projv2v/FlowTok"
 EXP_ROOT="/scratch/kl02/$USER/Projv2v/Experiments"
-TEST_FILELIST="/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_test_202407_202507_nofilter.pkl"
+# Default = new cond1-regime nofilter test (clip16). Override with `-v TEST_FILELIST=...`.
+# (old per-frame nofilter.pkl was archived to _archive_filelists_20260603/ on 2026-06-03)
+TEST_FILELIST="${TEST_FILELIST:-/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_test_202407_202507_nofilter_clip16.pkl}"
 
 FSS_THRESHOLDS="0,5,10,15,20,25,30,35,40,45,50,55,60"
 FSS_SCALES="1,2,3,4,5,6,7,8,9,10"
@@ -62,7 +64,7 @@ if [[ -z "${KNAME:-}" ]]; then
 fi
 
 CKPT="${EXP_ROOT}/${EXP}/checkpoint-${STEP}/ema_model/pytorch_model.bin"
-OUT_DIR="${EXP_ROOT}/${EXP}/test_${KNAME}_ema"
+OUT_DIR="${EXP_ROOT}/${EXP}/test_${KNAME}_ema${OUTTAG:+_${OUTTAG}}"
 METRICS="${OUT_DIR}/metrics.json"
 
 if [[ ! -f "$CKPT" ]]; then

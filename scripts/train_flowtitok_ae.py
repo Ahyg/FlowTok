@@ -135,6 +135,26 @@ def main():
         config, logger, accelerator, ema_model, num_update_steps_per_epoch,
         strict=True)
 
+    # --- LR-floor-on-resume override (continue-finetunes) ---
+    # accelerator.load_state restores the *checkpoint* optimizer's initial_lr and the
+    # scheduler's base_lrs, clobbering the (lower) learning_rate set in this run's config.
+    # When force_lr_floor_on_resume is true, pin the live optimizer param_groups AND the
+    # scheduler base_lrs to config learning_rate so a resumed run trains at a genuine
+    # constant floor instead of the checkpoint's full base LR. Gated on an explicit flag
+    # so ordinary crash-resume of a from-scratch run keeps its cosine schedule untouched.
+    if global_step > 0 and bool(config.optimizer.params.get("force_lr_floor_on_resume", False)):
+        floor_lr = float(config.optimizer.params.learning_rate)
+        for pg in optimizer.param_groups:
+            pg["lr"] = floor_lr
+            pg["initial_lr"] = floor_lr
+        for _sched in (lr_scheduler, getattr(lr_scheduler, "scheduler", None)):
+            if _sched is not None and hasattr(_sched, "base_lrs"):
+                _sched.base_lrs = [floor_lr for _ in _sched.base_lrs]
+        logger.info(
+            f"[RANK 0] force_lr_floor_on_resume=True: pinned optimizer param_groups + "
+            f"scheduler base_lrs to constant floor LR {floor_lr:.2e} (was checkpoint base LR)"
+        )
+
     for current_epoch in range(first_epoch, num_train_epochs):
         accelerator.print(f"Epoch {current_epoch}/{num_train_epochs-1} started.")
         global_step = train_one_epoch(config, logger, accelerator,
