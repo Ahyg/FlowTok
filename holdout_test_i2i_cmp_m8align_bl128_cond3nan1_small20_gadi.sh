@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -P kl02
+#PBS -q gpuhopper
+#PBS -l walltime=12:00:00
+#PBS -l storage=gdata/kl02+scratch/kl02
+#PBS -l ncpus=12
+#PBS -l ngpus=1
+#PBS -l mem=90GB
+#PBS -l jobfs=90GB
+#PBS -l wd
+#PBS -M auhuyg@gmail.com
+#PBS -m abe
+#PBS -N htest_i2i_m8a_s20
+set -uo pipefail
+export HF_HOME="/scratch/kl02/$USER/hf_cache"
+export TRANSFORMERS_CACHE="$HF_HOME"
+export TORCH_HOME="$HF_HOME"
+export XDG_CACHE_HOME="$HF_HOME"
+export HF_HUB_OFFLINE=1
+export WANDB_MODE=disabled
+export OPENCLIP_LOCAL_CKPT="$HF_HOME/hub/models--timm--vit_large_patch14_clip_336.openai/snapshots/81e38efc4637de5023b10e75a7f9bd1c6fa6b010/open_clip_pytorch_model.bin"
+source /scratch/kl02/$USER/miniconda3/etc/profile.d/conda.sh
+conda activate flowtok
+export PYTHONUNBUFFERED=1
+FT=/scratch/kl02/$USER/Projv2v/FlowTok
+CFG=$FT/configs/Sat2Radar-i2i-cmp-m8align-B-bl128-cond3nan1-small20_gadi.py
+WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_i2i_cmp_m8align_B_bl128_cond3nan1_small20
+STEP="${STEP:-100000}"
+CKPT=$WD/ckpts/${STEP}.ckpt
+TEST_PKL_CT=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_test_202407_202507_cond3nan1_clip16_p005_seed42_small20.pkl
+TEST_PKL_NF=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_test_202407_202507_nofilter_nan1_clip16_small20.pkl
+mkdir -p /scratch/kl02/$USER/Projv2v/job_logs
+JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_htest_i2i_m8align_s20.log
+cd $FT
+if [ ! -e "$CKPT" ]; then echo "missing $CKPT, abort"; exit 1; fi
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
+run_test () {
+  local TAG="$1"
+  local PKL="$2"
+  local OUT="$WD/test_holdout_${STEP}_${TAG}"
+  mkdir -p "$OUT"
+  echo "[$(date '+%F %T')] i2i m8align s20 $TAG -> $OUT" >> "$JOBLOG"
+  python3 -u scripts/test_sat2radar_v2v.py \
+    --config "$CFG" --ckpt "$CKPT" --out_dir "$OUT" \
+    --split test --mode i2i --filelist_path "$PKL" \
+    --max_batches_metrics -1 --max_batches_images 6 \
+    --batch_size 16 --metrics_json "$OUT/metrics.json" \
+    --gpu "$CUDA_VISIBLE_DEVICES" >> "$JOBLOG" 2>&1
+  echo "[$(date '+%F %T')] DONE $TAG" >> "$JOBLOG"
+}
+
+run_test "ct"     "$TEST_PKL_CT"
+run_test "nofilt" "$TEST_PKL_NF"
+echo "[$(date '+%F %T')] i2i m8align s20 holdouts done."
