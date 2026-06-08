@@ -264,6 +264,10 @@ class FlowTok(nn.Module):
         num_classes=2, # for cfg indicator
     ):
         super().__init__()
+        # Allow override via model_args.num_latent_tokens (e.g. bl128 tokenizer →
+        # 128 tokens/frame instead of bl77's 77). Legacy configs that don't set
+        # this field keep the 77 kwarg default.
+        num_latent_tokens = getattr(config, "num_latent_tokens", num_latent_tokens)
         # cond_concat_channels: M3 token-diffusion channel-concats sat tokens
         # with the noisy radar tokens, doubling DiT input width. Default False =
         # legacy (in == out == config.channels); old ckpts/configs unaffected.
