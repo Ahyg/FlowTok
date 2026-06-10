@@ -51,8 +51,17 @@ def main():
     if config.training.enable_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
+    # Reproducibility: deterministic cuDNN + use_deterministic_algorithms.
+    # warn_only=True lets ops without a deterministic impl fall back to a
+    # non-deterministic kernel instead of crashing — the warning surfaces any
+    # remaining non-determinism for follow-up review. The training seed itself
+    # is set per-rank below via accelerate.set_seed(seed, device_specific=True).
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
 
     output_dir = config.experiment.output_dir
     os.makedirs(output_dir, exist_ok=True)

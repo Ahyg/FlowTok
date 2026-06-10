@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random as _py_random
 import sys
 
 import numpy as np
@@ -8,6 +9,32 @@ import torch
 from omegaconf import OmegaConf
 from skimage.metrics import structural_similarity as ssim
 from torch.utils.data import DataLoader
+
+
+def _seed_all(seed: int, deterministic: bool = True) -> None:
+    """Seed torch (cpu+cuda), numpy and python random, and enable deterministic
+    CUDA kernels. Call at script entry BEFORE the model / dataloader is built so
+    weight load order, dataloader RNG and the VAE reparameterization sampling
+    (libs/flowtitok.py: mean + std * torch.randn) are reproducible."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    _py_random.seed(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+
+
+def _seed_worker(worker_id: int) -> None:
+    base = torch.initial_seed() % (2**32)
+    np.random.seed(base)
+    _py_random.seed(base)
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -180,10 +207,18 @@ def main():
                         help="Comma-separated thresholds (dBZ for radar; auto-scaled for sat/lgt)")
     parser.add_argument("--fss_scales", default="1,2,3,4,5,6,7,8,9,10",
                         help="Comma-separated window sizes")
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Global seed; each batch is re-seeded with seed+batch_idx so the "
+             "VAE reparameterization sampling is reproducible.",
+    )
     args = parser.parse_args()
 
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
+    os.environ["FLOWTOK_SEED"] = str(args.seed)
+    _seed_all(args.seed, deterministic=True)
 
     config = OmegaConf.load(args.config)
 
@@ -204,6 +239,8 @@ def main():
         filelist_split=filelist_split,
     )
 
+    _g = torch.Generator()
+    _g.manual_seed(int(os.environ.get("FLOWTOK_SEED", 42)))
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=config.training.per_gpu_batch_size,
@@ -211,6 +248,8 @@ def main():
         num_workers=ds_cfg.get("num_workers", 4),
         pin_memory=True,
         drop_last=False,
+        worker_init_fn=_seed_worker,
+        generator=_g,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -277,6 +316,13 @@ def main():
         do_images = args.max_batches_images < 0 or b_idx < args.max_batches_images
         if not do_metrics and not do_images:
             break
+        # Reseed before each batch so the VAE reparameterization noise
+        # (libs/flowtitok.py: mean + std * torch.randn, via posteriors.sample())
+        # is reproducible regardless of any upstream RNG consumption.
+        _batch_seed = args.seed + b_idx
+        torch.manual_seed(_batch_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_batch_seed)
         images = batch["image"].to(device)
         paths = batch.get("path", [f"sample_{b_idx}_{i}" for i in range(images.shape[0])])
 

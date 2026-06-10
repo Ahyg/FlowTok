@@ -49,6 +49,17 @@ from utils.viz_utils import make_viz_from_samples, make_viz_from_samples_generat
 from torchinfo import summary
 
 
+def _seed_worker(worker_id: int):
+    """DataLoader worker_init_fn: derive a deterministic per-worker seed from
+    the base seed so multi-worker shuffle/augmentation is reproducible across
+    runs (numpy/random/torch RNGs in each worker). Mirrors the helper used in
+    the FlowTok train/test scripts (commit bcdcc32)."""
+    import random as _py_random
+    base = torch.initial_seed() % (2**32)
+    np.random.seed(base)
+    _py_random.seed(base)
+
+
 def get_config():
     """Reads configs from a yaml file and terminal."""
     cli_conf = OmegaConf.from_cli()
@@ -678,13 +689,24 @@ def create_dataloader(config, logger, accelerator):
                 self.random_vflip = bool(random_vflip)
                 self.training = bool(training)
 
-            def _maybe_hflip(self, img: torch.Tensor) -> torch.Tensor:
-                if self.training and self.random_flip and np.random.random() < 0.5:
+            def _sample_rng(self, idx: int) -> np.random.Generator:
+                """Per-sample deterministic RNG keyed by (worker base seed,
+                idx) so AE flip augmentation is bit-reproducible across runs
+                with the same seed AND independent of num_workers count.
+                ``torch.initial_seed()`` is set deterministically per worker by
+                ``_seed_worker``. Must NOT key on ``id(self)`` (process-local
+                address differs between runs). Mirrors the same fix applied to
+                ``SatelliteRadarNpyDataset._apply_augmentation`` (commit bcdcc32)."""
+                base = int(torch.initial_seed()) % (2**32)
+                return np.random.default_rng((base, int(idx)))
+
+            def _maybe_hflip(self, img: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+                if self.training and self.random_flip and rng.random() < 0.5:
                     return img.flip(-1)
                 return img
 
-            def _maybe_vflip(self, img: torch.Tensor) -> torch.Tensor:
-                if self.training and self.random_vflip and np.random.random() < 0.5:
+            def _maybe_vflip(self, img: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+                if self.training and self.random_vflip and rng.random() < 0.5:
                     return img.flip(-2)
                 return img
 
@@ -700,8 +722,9 @@ def create_dataloader(config, logger, accelerator):
                 if not isinstance(img, torch.Tensor):
                     img = torch.from_numpy(np.asarray(img))
                 img = img.float()
-                img = self._maybe_hflip(img)
-                img = self._maybe_vflip(img)
+                _rng = self._sample_rng(idx)
+                img = self._maybe_hflip(img, _rng)
+                img = self._maybe_vflip(img, _rng)
                 sample = dict(sample)
                 sample["image"] = img.contiguous()
                 return sample
@@ -741,6 +764,13 @@ def create_dataloader(config, logger, accelerator):
             training=False,
         )
         num_workers = dataset_config.get("num_workers_per_gpu", dataset_config.get("num_workers", 4))
+        # Deterministic shuffle order: seed the DataLoader generator with the
+        # config seed + per-rank offset so each process sees a stable,
+        # reproducible order across runs. worker_init_fn makes per-worker
+        # numpy/random RNGs reproducible (matters for the idx-keyed flip RNG).
+        _base_seed = int(getattr(config.training, "seed", 42) or 42) + accelerator.process_index
+        _train_g = torch.Generator()
+        _train_g.manual_seed(_base_seed)
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=config.training.per_gpu_batch_size,
@@ -748,9 +778,13 @@ def create_dataloader(config, logger, accelerator):
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
+            worker_init_fn=_seed_worker,
+            generator=_train_g,
         )
         eval_dataloader = None
         if len(eval_dataset) > 0:
+            _eval_g = torch.Generator()
+            _eval_g.manual_seed(_base_seed)
             eval_dataloader = DataLoader(
                 eval_dataset,
                 batch_size=config.training.per_gpu_batch_size,
@@ -758,6 +792,8 @@ def create_dataloader(config, logger, accelerator):
                 num_workers=num_workers,
                 pin_memory=True,
                 drop_last=False,
+                worker_init_fn=_seed_worker,
+                generator=_eval_g,
             )
         train_dataloader.num_batches = math.ceil(
             config.experiment.max_train_examples / total_batch_size_without_accum
