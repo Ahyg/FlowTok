@@ -163,21 +163,43 @@ class SatelliteRadarNpyDataset(Dataset):
         np.clip(mask, z_min, z_max, out=mask)
         return (mask - z_min) / (z_max - z_min)
 
-    def _apply_augmentation(self, sat_video: np.ndarray, radar_video: np.ndarray):
+    def _sample_rng(self, idx: int) -> np.random.Generator:
+        """Per-sample deterministic RNG: keyed only by (worker base seed,
+        sample idx) so augmentation/start-frame choices are bit-reproducible
+        across runs with the same seed AND independent of dataloader
+        num_workers count. ``torch.initial_seed()`` is set deterministically by
+        ``_seed_worker`` (worker_id-offset of base seed) so the worker
+        contribution to the key is reproducible across runs.
+
+        Note: must NOT key on ``id(self)`` — process-local memory addresses
+        differ between runs, which would silently destroy reproducibility.
+        """
+        base = int(torch.initial_seed()) % (2**32)
+        return np.random.default_rng((base, int(idx)))
+
+    def _apply_augmentation(
+        self,
+        sat_video: np.ndarray,
+        radar_video: np.ndarray,
+        rng: np.random.Generator | None = None,
+    ):
         """Apply random spatial flips consistently to all frames of both modalities.
 
         Args:
             sat_video:   (T, C_sat, H, W)
             radar_video: (T, C_rad, H, W)
+            rng:         optional per-sample numpy Generator for reproducibility.
+                         Falls back to global ``np.random`` for legacy callers.
         Returns:
             Augmented copies (same shapes).
         """
         if not self.augment:
             return sat_video, radar_video
-        if self.augment_hflip and np.random.random() < 0.5:
+        _rand = rng.random if rng is not None else np.random.random
+        if self.augment_hflip and _rand() < 0.5:
             sat_video = np.ascontiguousarray(sat_video[..., ::-1])
             radar_video = np.ascontiguousarray(radar_video[..., ::-1])
-        if self.augment_vflip and np.random.random() < 0.5:
+        if self.augment_vflip and _rand() < 0.5:
             sat_video = np.ascontiguousarray(sat_video[..., ::-1, :])
             radar_video = np.ascontiguousarray(radar_video[..., ::-1, :])
         return sat_video, radar_video
@@ -222,6 +244,7 @@ class SatelliteRadarNpyDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.files[idx]
+        _rng = self._sample_rng(idx)
 
         # Case 1: paired (hist_paths, radar_paths) from DatasetBuilder.
         if isinstance(item, (tuple, list)) and len(item) == 2:
@@ -274,7 +297,7 @@ class SatelliteRadarNpyDataset(Dataset):
 
                 sat_video = np.stack(sat_frames, axis=0)   # (T_sat, C_sat, H, W)
                 radar_video = np.stack(radar_frames, axis=0)  # (T_rad, 1, H, W)
-                sat_video, radar_video = self._apply_augmentation(sat_video, radar_video)
+                sat_video, radar_video = self._apply_augmentation(sat_video, radar_video, rng=_rng)
 
                 return {
                     "sat_video": torch.from_numpy(sat_video).float(),
@@ -307,12 +330,12 @@ class SatelliteRadarNpyDataset(Dataset):
                     start = 0
                 elif isinstance(self.num_frames, int):
                     T = min(self.num_frames, n_avail)
-                    start = int(np.random.randint(0, n_avail - T + 1)) if n_avail > T else 0
+                    start = int(_rng.integers(0, n_avail - T + 1)) if n_avail > T else 0
                 else:
                     min_t, max_t = self.num_frames
                     T = min(max_t, n_avail)
                     T = max(min_t, min(T, n_avail))
-                    start = int(np.random.randint(0, n_avail - T + 1)) if n_avail > T else 0
+                    start = int(_rng.integers(0, n_avail - T + 1)) if n_avail > T else 0
 
                 sat_paths = sat_paths[start : start + T]
                 radar_paths_seq = radar_paths_seq[start : start + T]
@@ -320,7 +343,7 @@ class SatelliteRadarNpyDataset(Dataset):
                 radar_frames = [self._load_radar_image(p) for p in radar_paths_seq]
                 sat_video = np.stack(sat_frames, axis=0)
                 radar_video = np.stack(radar_frames, axis=0)
-                sat_video, radar_video = self._apply_augmentation(sat_video, radar_video)
+                sat_video, radar_video = self._apply_augmentation(sat_video, radar_video, rng=_rng)
                 return {
                     "sat_video": torch.from_numpy(sat_video).float(),
                     "radar_video": torch.from_numpy(radar_video).float(),

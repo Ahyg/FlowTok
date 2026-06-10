@@ -2,12 +2,38 @@ import argparse
 import itertools
 import json
 import os
+import random as _py_random
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+
+def _seed_all(seed: int, deterministic: bool = True) -> None:
+    """Seed torch (cpu+cuda), numpy and python random, and enable deterministic
+    CUDA kernels. Call this at script entry BEFORE any model / dataloader is
+    constructed, so weight init and shuffle/aug orders are reproducible."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    _py_random.seed(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+
+
+def _seed_worker(worker_id: int) -> None:
+    base = torch.initial_seed() % (2**32)
+    np.random.seed(base)
+    _py_random.seed(base)
 from skimage.metrics import structural_similarity as ssim
 from sklearn.metrics import r2_score as sk_r2
 from torch.utils.data import DataLoader
@@ -376,6 +402,10 @@ def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
         ir_band_indices=ir_band_indices,
         use_lightning=use_lightning,
     )
+    # Deterministic per-worker RNGs even though shuffle=False; matters for any
+    # dataset-side np.random use during __getitem__.
+    _g = torch.Generator()
+    _g.manual_seed(int(os.environ.get("FLOWTOK_SEED", 42)))
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -384,6 +414,8 @@ def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
         pin_memory=True,
         drop_last=False,
         collate_fn=collate_sat2radar_v2v,
+        worker_init_fn=_seed_worker,
+        generator=_g,
     )
     
     # Log dataset info
@@ -470,10 +502,19 @@ def main():
     )
     parser.add_argument("--kid_subset_size", type=int, default=100,
                         help="KID/KVD subset size (must be <= total samples per call)")
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Global seed for reproducibility. Each batch is additionally "
+             "re-seeded with seed+batch_idx so flow-matching initial noise "
+             "is deterministic regardless of upstream RNG consumption.",
+    )
     args = parser.parse_args()
 
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
+    os.environ["FLOWTOK_SEED"] = str(args.seed)
+    _seed_all(args.seed, deterministic=True)
 
     config = load_py_config(args.config)
     if args.filelist_path:
@@ -1041,6 +1082,13 @@ def main():
         do_images = args.max_batches_images < 0 or b_idx < args.max_batches_images
         if not do_metrics and not do_images:
             break
+        # Reseed before each batch so flow-matching initial noise (torch.randn_like
+        # at line ~784 / noise injection at line ~755) is reproducible regardless
+        # of any upstream RNG consumption (e.g. extra autograd hooks).
+        _batch_seed = args.seed + b_idx
+        torch.manual_seed(_batch_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(_batch_seed)
         infer_batch(batch, b_idx)
         if mse_count > 0:
             pbar.set_postfix(mse=f"{mse_total / mse_count:.4f}", refresh=False)

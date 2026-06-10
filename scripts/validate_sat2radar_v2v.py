@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import random as _py_random
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,6 +10,28 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+
+def _seed_all(seed: int, deterministic: bool = True) -> None:
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    _py_random.seed(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+
+
+def _seed_worker(worker_id: int) -> None:
+    base = torch.initial_seed() % (2**32)
+    np.random.seed(base)
+    _py_random.seed(base)
 from torchvision.utils import save_image
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
@@ -244,6 +267,8 @@ def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
         ir_band_indices=ir_band_indices,
         use_lightning=use_lightning,
     )
+    _g = torch.Generator()
+    _g.manual_seed(int(os.environ.get("FLOWTOK_SEED", 42)))
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -252,6 +277,8 @@ def build_eval_dataloader(config, split: str, batch_size: int, mode: str):
         pin_memory=True,
         drop_last=False,
         collate_fn=collate_sat2radar_v2v,
+        worker_init_fn=_seed_worker,
+        generator=_g,
     )
     
     # Log dataset info
@@ -346,10 +373,18 @@ def main():
         default="1,2,3,4,5,6,7,8,9,10",
         help="Comma-separated FSS scales (pixels).",
     )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Global seed; each batch is re-seeded with seed+batch_idx for "
+             "reproducible flow-matching initial noise.",
+    )
     args = parser.parse_args()
 
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+
+    os.environ["FLOWTOK_SEED"] = str(args.seed)
+    _seed_all(args.seed, deterministic=True)
 
     if args.max_batches_metrics is None:
         args.max_batches_metrics = args.max_batches
@@ -808,6 +843,10 @@ def main():
             )
             if not do_metrics and not do_images:
                 break
+            _batch_seed = args.seed + b_idx
+            torch.manual_seed(_batch_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(_batch_seed)
             infer_and_save(batch, b_idx, do_metrics=do_metrics, do_images=do_images)
 
         mse_mean = (mse_sum / mse_cnt) if mse_cnt > 0 else None

@@ -35,6 +35,16 @@ from data.dataset import SatelliteRadarNpyDataset, collate_sat2radar_v2v
 from torch.utils.data import DataLoader
 
 
+def _seed_worker(worker_id: int):
+    """DataLoader worker_init_fn: derive a deterministic per-worker seed from
+    the base seed so multi-worker shuffle/augmentation is reproducible across
+    runs (numpy/random/torch RNGs in each worker)."""
+    import random as _py_random
+    base = torch.initial_seed() % (2**32)
+    np.random.seed(base)
+    _py_random.seed(base)
+
+
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file(
     "config",
@@ -229,6 +239,14 @@ def build_dataloader(config, mode: str, accelerator: accelerate.Accelerator):
         )
         collate_fn = None
 
+    # Deterministic shuffle order: seed the DataLoader generator with the
+    # config seed + per-rank offset so each process sees a stable, reproducible
+    # order across runs. Test/val (shuffle=False) does not depend on the
+    # generator, but we still pass worker_init_fn so per-worker numpy/random
+    # RNGs are reproducible (matters for any dataset-level np.random use).
+    _base_seed = int(getattr(config, "seed", 42)) + accelerator.process_index
+    _g = torch.Generator()
+    _g.manual_seed(_base_seed)
     dataloader = DataLoader(
         dataset,
         batch_size=config.train.batch_size // accelerator.num_processes,
@@ -237,6 +255,8 @@ def build_dataloader(config, mode: str, accelerator: accelerate.Accelerator):
         pin_memory=True,
         drop_last=True if mode == "train" else False,
         collate_fn=collate_fn,
+        worker_init_fn=_seed_worker,
+        generator=_g,
     )
     
     # Log dataset info
@@ -274,8 +294,16 @@ def train(config):
     torch.autograd.set_detect_anomaly(False)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
+    # Reproducibility: deterministic cuDNN + use_deterministic_algorithms.
+    # warn_only=True lets ops without a deterministic impl fall back to a
+    # non-deterministic kernel instead of crashing — the warning will surface
+    # any remaining non-determinism for follow-up review.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
 
     accelerator = accelerate.Accelerator(split_batches=False)
     device = accelerator.device
