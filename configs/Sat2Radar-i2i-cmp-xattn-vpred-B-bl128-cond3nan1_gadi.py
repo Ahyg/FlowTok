@@ -1,4 +1,10 @@
-"""i2i cmp — Arm xattn (cross-attention conditioning).
+"""i2i cmp — Arm xattn-vpred (cross-attention conditioning, VELOCITY prediction).
+
+Identical to Sat2Radar-i2i-cmp-xattn-B-bl128-cond3nan1_gadi.py EXCEPT
+flow_prediction_target = "velocity" (the baseline xattn arm predicts "radar_tokens").
+This isolates the prediction-target variable: cross-attn + Gaussian-noise x0, but the
+nnet regresses the flow velocity dψ/dt directly instead of x1 (radar tokens).
+Velocity prediction is NOT affected by the radar_tokens fixed_x0 time-averaging issue.
 
 bl128 tokenizer (run4Bftgan / run4ftgan @ 300k, cond1 train) + FULL cond3nan1.
   - model size = flowtok-b
@@ -62,7 +68,7 @@ def get_config():
     )
 
     config.train = d(
-        n_steps=600_000,
+        n_steps=200_000,
         batch_size=64,
         log_interval=100,
         eval_interval=2_000,
@@ -116,7 +122,7 @@ def get_config():
     config.loss_coeffs = []
 
     config.generation_algorithm = "flow_matching"
-    config.flow_prediction_target = "radar_tokens"
+    config.flow_prediction_target = "velocity"
     config.flow_cond_mode = "cross_attention"
 
     config.use_text_vae_encoder = False
@@ -145,7 +151,7 @@ def get_config():
 
     config.workdir = (
         "/scratch/kl02/yh0308/Projv2v/Experiments/"
-        "sat2radar_flowtok_i2i_cmp_xattn_B_bl128_cond3nan1"
+        "sat2radar_flowtok_i2i_cmp_xattn_vpred_B_bl128_cond3nan1"
     )
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"

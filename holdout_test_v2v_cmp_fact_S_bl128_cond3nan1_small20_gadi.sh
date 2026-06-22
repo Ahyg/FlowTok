@@ -10,7 +10,7 @@
 #PBS -l wd
 #PBS -M auhuyg@gmail.com
 #PBS -m abe
-#PBS -N htest_i2i_xa_full
+#PBS -N ht_v2v_ftS_s20
 set -uo pipefail
 export HF_HOME="/scratch/kl02/$USER/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME"
@@ -23,14 +23,14 @@ source /scratch/kl02/$USER/miniconda3/etc/profile.d/conda.sh
 conda activate flowtok
 export PYTHONUNBUFFERED=1
 FT=/scratch/kl02/$USER/Projv2v/FlowTok
-CFG=$FT/configs/Sat2Radar-i2i-cmp-xattn-B-bl128-cond3nan1_gadi.py
-WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_i2i_cmp_xattn_B_bl128_cond3nan1
-STEP="${STEP:-600000}"
+CFG=$FT/configs/Sat2Radar-v2v-cmp-fact-S-bl128-cond3nan1-small20_gadi.py
+WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_v2v_cmp_fact_S_bl128_cond3nan1_small20
+STEP="${STEP:-200000}"
 CKPT=$WD/ckpts/${STEP}.ckpt
-TEST_PKL_CT=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_test_202407_202507_cond3nan1_clip16_p005_seed42.pkl
-TEST_PKL_NF=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_test_202407_202507_nofilter_nan1_clip16.pkl
+TEST_PKL_CT=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_test_202407_202507_cond3nan1_clip16_p005_seed42_small20.pkl
+TEST_PKL_NF=/g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_v2v_test_202407_202507_nofilter_nan1_clip16_small20.pkl
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs
-JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_htest_i2i_xattn_full.log
+JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_htest_v2v_fact_S_s20.log
 cd $FT
 if [ ! -e "$CKPT" ]; then echo "missing $CKPT, abort"; exit 1; fi
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
@@ -40,16 +40,16 @@ run_test () {
   local PKL="$2"
   local OUT="$WD/test_holdout_${STEP}_${TAG}"
   mkdir -p "$OUT"
-  echo "[$(date '+%F %T')] i2i xattn full $TAG -> $OUT" >> "$JOBLOG"
+  echo "[$(date '+%F %T')] v2v fact s20 $TAG -> $OUT" >> "$JOBLOG"
   python3 -u scripts/test_sat2radar_v2v.py \
     --config "$CFG" --ckpt "$CKPT" --out_dir "$OUT" \
-    --split test --mode i2i --filelist_path "$PKL" \
+    --split test --mode v2v --filelist_path "$PKL" \
     --max_batches_metrics -1 --max_batches_images 6 \
-    --batch_size 16 --metrics_json "$OUT/metrics.json" \
+    --batch_size 8 --metrics_json "$OUT/metrics.json" \
     --gpu "$CUDA_VISIBLE_DEVICES" >> "$JOBLOG" 2>&1
   echo "[$(date '+%F %T')] DONE $TAG" >> "$JOBLOG"
 }
 
 run_test "ct"     "$TEST_PKL_CT"
 run_test "nofilt" "$TEST_PKL_NF"
-echo "[$(date '+%F %T')] i2i xattn full holdouts done."
+echo "[$(date '+%F %T')] v2v fact s20 holdouts done."

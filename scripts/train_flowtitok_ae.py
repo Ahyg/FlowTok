@@ -163,6 +163,25 @@ def main():
             f"[RANK 0] force_lr_floor_on_resume=True: pinned optimizer param_groups + "
             f"scheduler base_lrs to constant floor LR {floor_lr:.2e} (was checkpoint base LR)"
         )
+        # Also pin the DISCRIMINATOR to this run's configured discriminator_learning_rate.
+        # load_state restores both the disc optimizer param_groups AND the LambdaLR base_lrs
+        # from the checkpoint, which would clobber a changed disc LR (e.g. lowering 1e-4->3e-5
+        # as an anti-drift guardrail). Mirrors the generator pin above; base==end keeps the
+        # scheduler multiplier flat at 1.0 so the constant LR holds regardless of last_epoch.
+        # No-op for runs that keep the same disc LR. Only meaningful when GAN is engaged.
+        if discriminator_optimizer is not None:
+            disc_lr = float(config.optimizer.params.discriminator_learning_rate)
+            for pg in discriminator_optimizer.param_groups:
+                pg["lr"] = disc_lr
+                pg["initial_lr"] = disc_lr
+            for _sched in (discriminator_lr_scheduler,
+                           getattr(discriminator_lr_scheduler, "scheduler", None)):
+                if _sched is not None and hasattr(_sched, "base_lrs"):
+                    _sched.base_lrs = [disc_lr for _ in _sched.base_lrs]
+            logger.info(
+                f"[RANK 0] force_lr_floor_on_resume=True: also pinned discriminator LR to "
+                f"{disc_lr:.2e} (was checkpoint disc LR)"
+            )
 
     for current_epoch in range(first_epoch, num_train_epochs):
         accelerator.print(f"Epoch {current_epoch}/{num_train_epochs-1} started.")

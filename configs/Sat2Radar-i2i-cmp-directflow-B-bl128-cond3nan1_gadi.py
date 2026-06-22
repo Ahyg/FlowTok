@@ -1,4 +1,18 @@
-"""i2i cmp — Arm xattn (cross-attention conditioning).
+"""i2i cmp — Arm directflow (sat-tokens-as-x0 direct flow, VELOCITY prediction).
+
+Direct (CrossFlow-style) flow: the satellite tokens ARE the flow source x0 (instead of
+Gaussian noise); the model learns the velocity field carrying sat tokens (t~1) -> radar
+tokens (t~0). No separate conditioning signal (no cross-attention, no token-concat).
+Based on the direct recipe in Sat2Radar-v2v-cmp-direct-B-2021summer_gadi.py
+(flow_cond_mode="none", use_text_vae_encoder=False, cfg_indicator=0.0,
+use_cross_attention=False) but on the bl128 cond3nan1 i2i setup so it is directly
+comparable to the xattn / xattn-vpred arms (same tokenizers, dataset, model).
+NOTE: noising_type="none" here (the v2v reference used "constant"=0.1) → PURE
+deterministic direct flow: sat tokens are x0 with no added Gaussian noise, so the
+sat->radar map is fully deterministic (no source-noise stochasticity).
+
+Inference (verified): test_sat2radar_v2v.py starts the ODE from the sat tokens (x_T=x0)
+for flow_cond_mode="none" — train/inference start-state logic is consistent.
 
 bl128 tokenizer (run4Bftgan / run4ftgan @ 300k, cond1 train) + FULL cond3nan1.
   - model size = flowtok-b
@@ -24,10 +38,10 @@ model = Args(
     num_clip_token=128,
     num_latent_tokens=128,
     gradient_checking=False,
-    cfg_indicator=0.0,
-    noising_type="none",
-    noising_scale=0.1,
-    use_cross_attention=True,
+    cfg_indicator=0.0,          # CFG OFF — sat tokens are the only signal.
+    noising_type="none",        # pure deterministic direct flow: sat tokens are x0 with NO added noise.
+    noising_scale=0.1,          # unused while noising_type="none".
+    use_cross_attention=False,  # "none" mode: pure self-attention DiT, no context.
     textVAE=Args(
         num_blocks=6,
         hidden_dim=256,
@@ -62,7 +76,7 @@ def get_config():
     )
 
     config.train = d(
-        n_steps=600_000,
+        n_steps=200_000,
         batch_size=64,
         log_interval=100,
         eval_interval=2_000,
@@ -115,13 +129,14 @@ def get_config():
     )
     config.loss_coeffs = []
 
+    # ===== Direct method: sat tokens as flow x0 (matches direct reference) =====
     config.generation_algorithm = "flow_matching"
-    config.flow_prediction_target = "radar_tokens"
-    config.flow_cond_mode = "cross_attention"
+    config.flow_prediction_target = "velocity"       # velocity target
+    config.flow_cond_mode = "none"                   # sat tokens ARE the flow start x0
 
-    config.use_text_vae_encoder = False
+    config.use_text_vae_encoder = False              # use sat tokens directly as x0 (no textVAE)
     config.cond_use_sat_lightning_tokens = False
-    config.cond_token_fusion = "mean"
+    config.cond_token_fusion = "mean"                # unused under none mode
 
     config.dataset = d(
         filelist_path=(
@@ -145,7 +160,7 @@ def get_config():
 
     config.workdir = (
         "/scratch/kl02/yh0308/Projv2v/Experiments/"
-        "sat2radar_flowtok_i2i_cmp_xattn_B_bl128_cond3nan1"
+        "sat2radar_flowtok_i2i_cmp_directflow_B_bl128_cond3nan1"
     )
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"

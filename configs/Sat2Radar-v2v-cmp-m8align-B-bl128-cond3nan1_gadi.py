@@ -1,9 +1,8 @@
-"""i2i cmp — Arm xattn (cross-attention conditioning).
+"""v2v cmp — Arm m8align (token_concat_interleaved + radar_tokens flow).
 
-bl128 tokenizer (run4Bftgan / run4ftgan @ 300k, cond1 train) + FULL cond3nan1.
+bl128 tokenizer (run4Bftgan / run4ftgan @ 300k, cond1 train) + cond3nan1 FULL 4440 clips, 300k.
   - model size = flowtok-b
-  - 200k steps, bs=64, num_frames=1
-  - train pool = 71040 frames (5x of small20)
+  - 200k steps, bs=8
 """
 import ml_collections
 from dataclasses import dataclass
@@ -27,7 +26,6 @@ model = Args(
     cfg_indicator=0.0,
     noising_type="none",
     noising_scale=0.1,
-    use_cross_attention=True,
     textVAE=Args(
         num_blocks=6,
         hidden_dim=256,
@@ -50,6 +48,7 @@ def get_config():
     config = ml_collections.ConfigDict()
     config.seed = 1234
 
+    # bl128 ftgan @ 300k (Stage-3 GAN-finetuned, cond1 train).
     config.sat_tokenizer_checkpoint = (
         "/scratch/kl02/yh0308/Projv2v/Experiments/"
         "sat10ch_flowtitok_ae_bl128_vae_scratch_run4Bftgan_cond1_gadi/"
@@ -62,11 +61,11 @@ def get_config():
     )
 
     config.train = d(
-        n_steps=600_000,
-        batch_size=64,
+        n_steps=800_000,
+        batch_size=8,
         log_interval=100,
         eval_interval=2_000,
-        save_interval=25_000,
+        save_interval=50_000,
         n_samples_eval=4,
         val_max_batches=64,
     )
@@ -117,7 +116,7 @@ def get_config():
 
     config.generation_algorithm = "flow_matching"
     config.flow_prediction_target = "radar_tokens"
-    config.flow_cond_mode = "cross_attention"
+    config.flow_cond_mode = "token_concat_interleaved"
 
     config.use_text_vae_encoder = False
     config.cond_use_sat_lightning_tokens = False
@@ -126,11 +125,11 @@ def get_config():
     config.dataset = d(
         filelist_path=(
             "/g/data/kl02/yh0308/Data/71/filelists/"
-            "dataset_filelist_i2i_train_201906_202406_cond3nan1_clip16_p005_seed42.pkl"
+            "dataset_filelist_v2v_train_201906_202406_cond3nan1_clip16_p005_seed42.pkl"
         ),
         filelist_split="train",
         v2v=True,
-        num_frames=1,
+        num_frames=16,
         frame_stride=1,
         num_workers_per_gpu=4,
         crop_size=128,
@@ -145,7 +144,7 @@ def get_config():
 
     config.workdir = (
         "/scratch/kl02/yh0308/Projv2v/Experiments/"
-        "sat2radar_flowtok_i2i_cmp_xattn_B_bl128_cond3nan1"
+        "sat2radar_flowtok_v2v_cmp_m8align_B_bl128_cond3nan1"
     )
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"

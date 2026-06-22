@@ -567,6 +567,23 @@ def main():
         all_fss_vals.extend(lgt_fss_vals)
     avg_fss = float(np.nanmean(all_fss_vals)) if all_fss_vals else 0.0
 
+    # ── Per-threshold FSS (mean over spatial scales) for threshold-resolved compare ──
+    # The values lists are thr-major (see _build_pysteps_fss_objects: `for thr: for scale`),
+    # so reshape to (n_thr, n_scale) and average over the scale axis. Each entry aligns
+    # index-wise to fss_thresholds (thrs_dbz) below. Additive only — avg_fss is unchanged.
+    _n_scale = max(len(scales), 1)
+    def _per_thr(vals):
+        if not vals:
+            return None
+        arr = np.asarray(vals, dtype=float)
+        if arr.size % _n_scale != 0:
+            return None
+        with np.errstate(invalid="ignore"):
+            return np.nanmean(arr.reshape(-1, _n_scale), axis=1).tolist()
+    fss_per_threshold = _per_thr(all_fss_vals) if pysteps_fss_objects else None
+    fss_per_threshold_ir = _per_thr(ir_fss_vals)
+    fss_per_threshold_lgt = _per_thr(lgt_fss_vals)
+
     # ── Per-channel + excl_lgt breakdown (satellite modes with lightning) ──
     has_lgt = (fss_mode != "radar") and bool(ds_cfg.get("use_lightning", True))
     per_channel_mse_avg = []
@@ -643,6 +660,9 @@ def main():
         "lpips_net": args.lpips_net if use_lpips else None,
         "fss_thresholds": thrs_dbz,
         "fss_scales": scales,
+        "fss_per_threshold": fss_per_threshold,
+        "fss_per_threshold_ir": fss_per_threshold_ir,
+        "fss_per_threshold_lgt": fss_per_threshold_lgt,
         "fss_method": "pysteps_accumulated" if (pysteps_fss_objects or pysteps_fss_ir or pysteps_fss_lightning) else "none",
     }
 

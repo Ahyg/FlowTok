@@ -1,0 +1,101 @@
+# run4ftGAN2-cond3nan1 radar AE — CONTINUE the GAN finetune 300k->350k on the NEW
+#   6-year "71full" dataset (cond3nan1 full i2i train, 71,040 frames).
+#   Resumes from run4ftgan_cond1/checkpoint-300000 (symlinked into this dir); auto_resume
+#   picks it (global_step=300000). discriminator_start=300000 => GAN stays engaged
+#   immediately at resume (discriminator state is restored from the 300k checkpoint).
+#   Generator LR held at FLOOR 1e-5 (force_lr_floor_on_resume); discriminator trains at 1e-4.
+#   GAN hyperparams unchanged = lab2 radar sweep winner: discriminator_weight=0.001,
+#   disc_factor=1.0, lecam=1e-3, disc_lr=1e-4.
+#   *** DATASET SWITCH: 0-300k trained on cond1 (78,192 fr); 300k->350k uses the new/current
+#       cond3nan1 full set (caf0.5%/saf5% convective filter + NaN<=1%, p005). Same .npy frames,
+#       radar reads ch11. val/test slots empty -> eval auto-skipped (same as cond1 runs). ***
+experiment:
+  project: radar_flowtitok_ae_bl128_vae_scratch
+  name: radar_flowtitok_ae_bl128_vae_scratch_run4ftgan2_cond3nan1_gadi
+  output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl128_vae_scratch_run4ftgan2_cond3nan1_gadi
+  max_train_examples: 350000
+  save_every: 50000          # saves checkpoint-350000 (and a final save at end of training)
+  eval_every: 10000
+  generate_every: 5000
+  log_every: 1000
+  log_grad_norm_every: 1000
+  resume: true
+  logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl128_vae_scratch_run4ftgan2_cond3nan1_gadi/logs
+
+model:
+  vq_model:
+    quantize_mode: vae
+    token_size: 16
+    vit_enc_model_size: base
+    vit_dec_model_size: large
+    vit_enc_patch_size: 8
+    vit_dec_patch_size: 8
+    num_latent_tokens: 128
+    in_channels: 1
+    out_channels: 1
+    finetune_decoder: false
+    is_legacy: false
+
+losses:
+  discriminator_start: 300000
+  quantizer_weight: 1.0
+  discriminator_factor: 1.0
+  discriminator_weight: 0.001
+  perceptual_loss: lpips-convnext_s-1.0-0.1
+  perceptual_weight: 0.6
+  reconstruction_loss: l2
+  reconstruction_weight: 1.0
+  lecam_regularization_weight: 0.001
+  kl_weight: 6.02e-08
+  logvar_init: 0.0
+
+dataset:
+  params:
+    filelist_path: /g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202406_cond3nan1_clip16_p005_seed42.pkl
+    filelist_split: train
+    mode: radar
+    use_lightning: false
+    num_workers: 4
+  preprocessing:
+    resize_shorter_edge: 128
+    crop_size: 128
+    random_crop: true
+    random_flip: true
+    res_ratio_filtering: true
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 1.0e-05
+    discriminator_learning_rate: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0001
+    # Generator LR floor on resume (load_state would otherwise restore the checkpoint base
+    # LR). Pins ONLY the generator optimizer+scheduler to 1e-5; discriminator keeps 1e-4.
+    force_lr_floor_on_resume: true
+
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 10000
+    end_lr: 1.0e-05
+
+finetune:
+  enabled: false
+  text_guidance_from_filename: true
+
+training:
+  gradient_accumulation_steps: 1
+  per_gpu_batch_size: 64
+  mixed_precision: "no"
+  enable_tf32: true
+  enable_wandb: false
+  use_ema: true
+  seed: 42
+  max_train_steps: 350000
+  num_generated_images: 1
+  max_grad_norm: 1.0
+  nan_check: false
+  nan_skip: true

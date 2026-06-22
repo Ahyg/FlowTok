@@ -10,7 +10,7 @@
 #PBS -l wd
 #PBS -M auhuyg@gmail.com
 #PBS -m abe
-#PBS -N i2i_cmp_m8a_full
+#PBS -N v2v_xat_full
 set -uo pipefail
 export HF_HOME="/scratch/kl02/$USER/hf_cache"
 export TRANSFORMERS_CACHE="$HF_HOME"
@@ -23,38 +23,38 @@ source /scratch/kl02/$USER/miniconda3/etc/profile.d/conda.sh
 conda activate flowtok
 export PYTHONUNBUFFERED=1
 FT=/scratch/kl02/$USER/Projv2v/FlowTok
-CFG=$FT/configs/Sat2Radar-i2i-cmp-m8align-B-bl128-cond3nan1_gadi.py
-WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_i2i_cmp_m8align_B_bl128_cond3nan1
-TARGET=600000
+CFG=$FT/configs/Sat2Radar-v2v-cmp-xattn-B-bl128-cond3nan1_gadi.py
+WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_v2v_cmp_xattn_B_bl128_cond3nan1
+TARGET=800000
 WALL_SEC=$((23*3600))
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs "$WD/ckpts"
-JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_i2i_cmp_m8align_full.log
+JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_v2v_cmp_xattn_full.log
 cd $FT
 
 latest_step() {
   ls -d "$WD"/ckpts/*.ckpt 2>/dev/null | grep -oP '[0-9]+(?=\.ckpt)' | sort -n | tail -1
 }
 STEP=$(latest_step); STEP=${STEP:-0}
-echo "[$(date '+%F %T')] i2i_cmp_m8align_full: start step=$STEP target=$TARGET"
+echo "[$(date '+%F %T')] v2v_cmp_xattn_full: start step=$STEP target=$TARGET"
 if [ "$STEP" -ge "$TARGET" ]; then echo "already done at $STEP"; exit 0; fi
 
 timeout -s TERM --kill-after=180 "$WALL_SEC" \
   accelerate launch --num_processes 1 scripts/train_sat2radar_v2v.py --config="$CFG" > "$JOBLOG" 2>&1
 RC=$?
 NEW=$(latest_step); NEW=${NEW:-0}
-echo "[$(date '+%F %T')] i2i_cmp_m8align_full: after run rc=$RC step=$NEW"
+echo "[$(date '+%F %T')] v2v_cmp_xattn_full: after run rc=$RC step=$NEW"
 
 if [ "$NEW" -ge "$TARGET" ]; then
   echo "TARGET reached at $NEW"
   rm -f "$WD/RESUBMIT_STALLED"
   if [ ! -e "$WD/.holdout_queued" ]; then
     touch "$WD/.holdout_queued"
-    cd $FT && qsub holdout_test_i2i_cmp_m8align_bl128_cond3nan1_gadi.sh && echo "queued holdout"
+    cd $FT && qsub holdout_test_v2v_cmp_xattn_bl128_cond3nan1_full_gadi.sh && echo "queued holdout"
   fi
 elif [ "$RC" = "124" ] || [ "$NEW" -gt "$STEP" ]; then
   echo "progress $STEP->$NEW (rc=$RC), re-qsub"
   rm -f "$WD/RESUBMIT_STALLED"
-  cd $FT && qsub train_i2i_cmp_m8align_bl128_cond3nan1_gadi.sh
+  cd $FT && qsub train_v2v_cmp_xattn_bl128_cond3nan1_full_gadi.sh
 else
   echo "NO progress (rc=$RC, step stuck at $NEW) -> NOT resubmitting"
   echo "$(date '+%F %T') stuck_step=$NEW rc=$RC jobid=$PBS_JOBID see=$JOBLOG" > "$WD/RESUBMIT_STALLED"

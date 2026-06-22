@@ -1,0 +1,117 @@
+# run4hilGAN-cond3nan1 radar AE — restart the GAN finetune 300k->350k from the HEALTHY
+#   300k checkpoint, replacing the recon objective with a HILBURN precipitation-weighted MSE
+#   so reconstruction explicitly prioritizes high-dBZ pixels (the convective cores the
+#   previous run4ftgan2 GAN-overshoot smoothed away: 60 dBZ FSS 0.376->0.196).
+#
+#   Resumes from run4ftgan_cond1/checkpoint-300000 (symlinked into this dir); auto_resume
+#   picks it (global_step=300000). discriminator_start=300000 => GAN stays engaged at resume.
+#
+#   Changes vs run4ftgan2 (the failed continuation):
+#     1. losses.reconstruction_loss: l2 -> hilburn  (weight=exp(b*y^c)*0.5*err^2, b=5/c=3).
+#        reconstruction_weight stays 1.0 (the cubic-exp self-rebalances: rare high-dBZ pixels
+#        get up to e^5~=148x). NaN-safe: data pipeline fills radar NaN->0 before loss.
+#     2. discriminator_learning_rate: 1e-4 -> 3e-5  (ANTI-DRIFT GUARDRAIL). A weaker disc
+#        learns slower, stays near the 300k equilibrium, can't run away (the failed run's
+#        disc progressively won: gan_loss 0.13->2.0, lecam 4e-4->7.5e-3, logits_fake->-2.0,
+#        inflection at 320k). force_lr_floor_on_resume now ALSO pins the disc LR (otherwise
+#        load_state restores the checkpoint's 1e-4 and silently defeats this).
+#     3. Dataset FIXED = cond3nan1 (71full) for the whole run (no mid-run switch; the
+#        cond1->cond3nan1 switch was a drift contributor last time).
+#     4. save_every=50000 => only the final checkpoint-350000 is saved (user choice: save at
+#        end only). No pre-collapse fallback ckpt; the disc-LR guardrail + Hilburn carry the
+#        anti-drift safety, and the good 300k is always retained in run4ftgan_cond1.
+#   Generator LR held at FLOOR 1e-5 (force_lr_floor_on_resume). GAN: disc_weight=0.001,
+#   disc_factor=1.0, lecam=1e-3 (sweep winners, unchanged). val/test slots empty -> eval skipped.
+experiment:
+  project: radar_flowtitok_ae_bl128_vae_scratch
+  name: radar_flowtitok_ae_bl128_vae_scratch_run4hilgan_cond3nan1_gadi
+  output_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl128_vae_scratch_run4hilgan_cond3nan1_gadi
+  max_train_examples: 350000
+  save_every: 50000          # only saves checkpoint-350000 (final). No intermediate saves.
+  eval_every: 10000
+  generate_every: 5000
+  log_every: 1000
+  log_grad_norm_every: 1000
+  resume: true
+  logging_dir: /scratch/kl02/yh0308/Projv2v/Experiments/radar_flowtitok_ae_bl128_vae_scratch_run4hilgan_cond3nan1_gadi/logs
+
+model:
+  vq_model:
+    quantize_mode: vae
+    token_size: 16
+    vit_enc_model_size: base
+    vit_dec_model_size: large
+    vit_enc_patch_size: 8
+    vit_dec_patch_size: 8
+    num_latent_tokens: 128
+    in_channels: 1
+    out_channels: 1
+    finetune_decoder: false
+    is_legacy: false
+
+losses:
+  discriminator_start: 300000
+  quantizer_weight: 1.0
+  discriminator_factor: 1.0
+  discriminator_weight: 0.001
+  perceptual_loss: lpips-convnext_s-1.0-0.1
+  perceptual_weight: 0.6
+  reconstruction_loss: hilburn
+  hilburn_b: 5.0
+  hilburn_c: 3.0
+  reconstruction_weight: 1.0
+  lecam_regularization_weight: 0.001
+  kl_weight: 6.02e-08
+  logvar_init: 0.0
+
+dataset:
+  params:
+    filelist_path: /g/data/kl02/yh0308/Data/71/filelists/dataset_filelist_i2i_train_201906_202406_cond3nan1_clip16_p005_seed42.pkl
+    filelist_split: train
+    mode: radar
+    use_lightning: false
+    num_workers: 4
+  preprocessing:
+    resize_shorter_edge: 128
+    crop_size: 128
+    random_crop: true
+    random_flip: true
+    res_ratio_filtering: true
+
+optimizer:
+  name: adamw
+  params:
+    learning_rate: 1.0e-05
+    discriminator_learning_rate: 3.0e-05
+    beta1: 0.9
+    beta2: 0.999
+    weight_decay: 0.0001
+    # Pins BOTH the generator (->learning_rate 1e-5) AND the discriminator
+    # (->discriminator_learning_rate 3e-5) on resume, overriding the LRs load_state would
+    # restore from the 300k checkpoint. The disc pin is the anti-drift guardrail.
+    force_lr_floor_on_resume: true
+
+lr_scheduler:
+  scheduler: cosine
+  params:
+    learning_rate: ${optimizer.params.learning_rate}
+    warmup_steps: 10000
+    end_lr: 1.0e-05
+
+finetune:
+  enabled: false
+  text_guidance_from_filename: true
+
+training:
+  gradient_accumulation_steps: 1
+  per_gpu_batch_size: 64
+  mixed_precision: "no"
+  enable_tf32: true
+  enable_wandb: false
+  use_ema: true
+  seed: 42
+  max_train_steps: 350000
+  num_generated_images: 1
+  max_grad_norm: 1.0
+  nan_check: false
+  nan_skip: true

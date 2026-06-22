@@ -1,9 +1,14 @@
-"""i2i cmp — Arm xattn (cross-attention conditioning).
+"""i2i cmp — Arm xattn (cross-attention conditioning). SAT TOKENIZER @350k variant.
 
-bl128 tokenizer (run4Bftgan / run4ftgan @ 300k, cond1 train) + FULL cond3nan1.
-  - model size = flowtok-b
-  - 200k steps, bs=64, num_frames=1
-  - train pool = 71040 frames (5x of small20)
+Identical to Sat2Radar-i2i-cmp-xattn-B-bl128-cond3nan1-small20_gadi.py EXCEPT:
+  - sat tokenizer: run4Bftgan_cond1 @300k  ->  run4Bftgan2_cond3nan1 @350k
+      (350k = disc_start 300k -> 50k of GAN finetune; only 350k sat ckpt available is cond3nan1 domain)
+  - radar tokenizer: UNCHANGED (run4ftgan_cond1 @300k, same as all prior cmp runs)
+  - workdir suffix _sat350 (separate dir, does not touch the baseline run)
+
+Architecture of the new sat tokenizer matches config.vq_model exactly:
+  token_size 16 / enc base / dec large / patch 8 / 128 tokens / in_out 11ch.
+  - model size = flowtok-b, 150k steps, bs=64, num_frames=1
 """
 import ml_collections
 from dataclasses import dataclass
@@ -25,9 +30,9 @@ model = Args(
     num_latent_tokens=128,
     gradient_checking=False,
     cfg_indicator=0.0,
+    use_cross_attention=True,
     noising_type="none",
     noising_scale=0.1,
-    use_cross_attention=True,
     textVAE=Args(
         num_blocks=6,
         hidden_dim=256,
@@ -50,11 +55,13 @@ def get_config():
     config = ml_collections.ConfigDict()
     config.seed = 1234
 
+    # CHANGED: sat tokenizer -> run4Bftgan2_cond3nan1 @350k (was run4Bftgan_cond1 @300k)
     config.sat_tokenizer_checkpoint = (
         "/scratch/kl02/yh0308/Projv2v/Experiments/"
-        "sat10ch_flowtitok_ae_bl128_vae_scratch_run4Bftgan_cond1_gadi/"
-        "checkpoint-300000/ema_model/pytorch_model.bin"
+        "sat10ch_flowtitok_ae_bl128_vae_scratch_run4Bftgan2_cond3nan1_gadi/"
+        "checkpoint-350000/ema_model/pytorch_model.bin"
     )
+    # UNCHANGED: radar tokenizer (run4ftgan_cond1 @300k, same as baseline)
     config.radar_tokenizer_checkpoint = (
         "/scratch/kl02/yh0308/Projv2v/Experiments/"
         "radar_flowtitok_ae_bl128_vae_scratch_run4ftgan_cond1_gadi/"
@@ -62,7 +69,7 @@ def get_config():
     )
 
     config.train = d(
-        n_steps=600_000,
+        n_steps=150_000,
         batch_size=64,
         log_interval=100,
         eval_interval=2_000,
@@ -126,7 +133,7 @@ def get_config():
     config.dataset = d(
         filelist_path=(
             "/g/data/kl02/yh0308/Data/71/filelists/"
-            "dataset_filelist_i2i_train_201906_202406_cond3nan1_clip16_p005_seed42.pkl"
+            "dataset_filelist_i2i_train_201906_202406_cond3nan1_clip16_p005_seed42_small20.pkl"
         ),
         filelist_split="train",
         v2v=True,
@@ -145,7 +152,7 @@ def get_config():
 
     config.workdir = (
         "/scratch/kl02/yh0308/Projv2v/Experiments/"
-        "sat2radar_flowtok_i2i_cmp_xattn_B_bl128_cond3nan1"
+        "sat2radar_flowtok_i2i_cmp_xattn_B_bl128_cond3nan1_small20_sat350"
     )
     config.ckpt_root = config.workdir + "/ckpts"
     config.sample_dir = config.workdir + "/samples"

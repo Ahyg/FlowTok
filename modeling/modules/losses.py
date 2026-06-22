@@ -126,6 +126,10 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
 
         self.reconstruction_loss = loss_config.reconstruction_loss
         self.reconstruction_weight = loss_config.reconstruction_weight
+        # Hilburn precipitation-weighted MSE params (only used when
+        # reconstruction_loss == "hilburn"). Defaults match Diffi2i's Hilburn_Loss.
+        self.hilburn_b = float(loss_config.get("hilburn_b", 5.0))
+        self.hilburn_c = float(loss_config.get("hilburn_c", 3.0))
         # Optional per-channel reconstruction loss override:
         #   recon_loss_per_channel: list[str] of length C, e.g. ["l2"]*10 + ["l1"]
         #   recon_loss_per_channel_weights: list[float] of length C
@@ -205,6 +209,15 @@ class ReconstructionLoss_Stage2(torch.nn.Module):
                 rl = F.l1_loss(inputs, reconstructions, reduction="mean")
             elif self.reconstruction_loss == "l2":
                 rl = F.mse_loss(inputs, reconstructions, reduction="mean")
+            elif self.reconstruction_loss == "hilburn":
+                # Diffi2i-style precipitation-weighted MSE: emphasize high-value
+                # (high-dBZ) pixels. weight = exp(b * y_true^c); element-wise
+                # loss = mean(weight * 0.5 * (pred - true)^2). inputs (y_true) is the
+                # normalized radar target in [0,1]; NaN is already filled to 0.0 in the
+                # data pipeline (data/dataset.py scale_radar_img), so exp(b*0^c)=1 keeps
+                # filled/background pixels at unit weight while real cores get up to e^b.
+                weight = torch.exp(self.hilburn_b * (inputs ** self.hilburn_c))
+                rl = (weight * 0.5 * (reconstructions - inputs) ** 2).mean()
             else:
                 raise ValueError(
                     f"Unsupported reconstruction_loss {self.reconstruction_loss}")

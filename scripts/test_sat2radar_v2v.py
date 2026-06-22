@@ -485,6 +485,12 @@ def main():
                         help="Save per-frame dBZ arrays gt_dbz.npy / pred_dbz.npy under <out_dir>/arrays")
     parser.add_argument("--arrays_dir", default=None,
                         help="Override directory for --dump_arrays output")
+    parser.add_argument("--dump_pred_only", action="store_true",
+                        help="With --dump_arrays: save ONLY pred_dbz.npy (fp32), skip gt (gt is seed-invariant).")
+    parser.add_argument("--defer_fss", action="store_true",
+                        help="Skip the slow per-frame pysteps FSS (computed offline from dumped arrays). "
+                             "ALL other metrics (scalar/cat/refl_hist/grad_sobel/gen) still computed; "
+                             "fss_per_thr_scale/avg_fss/weighted_fss merged in later by the offline FSS script.")
     # ── Generation-quality metrics (i2i: FID/sFID/KID, v2v: FVD/KVD/TC) ─────
     parser.add_argument("--skip_gen_metrics", action="store_true",
                         help="Disable all generation-quality metrics (FID/sFID/KID for i2i; FVD/KVD/TC for v2v)")
@@ -499,6 +505,22 @@ def main():
     parser.add_argument(
         "--diffusion_sample_steps", type=int, default=None,
         help="Override config.diffusion.sample_steps (only used when generation_algorithm=diffusion).",
+    )
+    parser.add_argument(
+        "--flow_sample_steps", type=int, default=None,
+        help="Override config.sample.sample_steps (flow-matching ODE NFE). NFE sweep.",
+    )
+    parser.add_argument(
+        "--x1_sampler", default="fixed_x0", choices=["fixed_x0", "canonical"],
+        help="radar_tokens(x1)-pred sampler: 'fixed_x0' (legacy=time-AVERAGE of preds, over-smooths) "
+             "| 'canonical' (FM data-prediction step v=(x1-x_t)/(1-t), converges to sharp x1_hat(t~1)).",
+    )
+    parser.add_argument(
+        "--x1_snap_t", type=float, default=-1.0,
+        help="EXPERIMENT (radar_tokens only): if >=0, OUTPUT the model's predicted clean radar x1_hat "
+             "at the first eval node with t>=x1_snap_t (one-shot readout), replacing the rest of the "
+             "Euler integration. Avoids the fixed_x0 time-averaging over-smooth. <0 (default)=disabled. "
+             "~0.99 = snap at the last step; smaller = snap earlier (near-last-step readout).",
     )
     parser.add_argument("--kid_subset_size", type=int, default=100,
                         help="KID/KVD subset size (must be <= total samples per call)")
@@ -525,6 +547,9 @@ def main():
     ) == "diffusion":
         config.diffusion.sample_steps = int(args.diffusion_sample_steps)
         print(f"[INFO] Override diffusion.sample_steps: {args.diffusion_sample_steps}")
+    if args.flow_sample_steps is not None:
+        config.sample.sample_steps = int(args.flow_sample_steps)
+        print(f"[INFO] Override flow sample.sample_steps (NFE): {args.flow_sample_steps}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -829,6 +854,8 @@ def main():
                 nnet_ema,
                 step_size_type="step_in_dsigma",
                 guidance_scale=guidance_scale,
+                x1_sampler=args.x1_sampler,
+                x1_snap_t=args.x1_snap_t,
             )
             _sample_kwargs = dict(
                 x_T=x_T_init,
@@ -956,7 +983,7 @@ def main():
                     all_gt_dbz.append(g_dbz)
                     all_pred_dbz.append(p_dbz)
 
-                    if PYSTEPS_AVAILABLE:
+                    if PYSTEPS_AVAILABLE and not args.defer_fss:
                         for thr in thrs:
                             for scale in scales:
                                 key = (thr, scale)
@@ -1138,7 +1165,7 @@ def main():
 
         # FSS (accumulated) — avg + weighted
         fss_per = {}
-        if PYSTEPS_AVAILABLE and pysteps_fss_objects:
+        if PYSTEPS_AVAILABLE and pysteps_fss_objects and not args.defer_fss:
             for (thr, scale), fss_obj in pysteps_fss_objects.items():
                 fv = fss_compute(fss_obj)
                 fss_per[(float(thr), int(scale))] = float(fv) if np.isfinite(fv) else float("nan")
@@ -1274,7 +1301,7 @@ def main():
                 print("  " + " | ".join(label_line))
 
         # Per (thr, scale) FSS breakdown
-        if PYSTEPS_AVAILABLE and pysteps_fss_objects:
+        if PYSTEPS_AVAILABLE and pysteps_fss_objects and not args.defer_fss:
             print("\nPer threshold-scale FSS breakdown (accumulated):")
             print(f"{'Threshold':<12} {'Scale':<8} {'FSS':<15}")
             print("-" * 40)
@@ -1296,10 +1323,13 @@ def main():
     if args.dump_arrays and n_frames > 0:
         arrays_dir = args.arrays_dir or os.path.join(args.out_dir, "arrays")
         os.makedirs(arrays_dir, exist_ok=True)
-        gt_path = os.path.join(arrays_dir, "gt_dbz.npy")
         pred_path = os.path.join(arrays_dir, "pred_dbz.npy")
-        np.save(gt_path, all_gt.astype(np.float32))
-        np.save(pred_path, all_pred.astype(np.float32))
+        if args.dump_pred_only:
+            np.save(pred_path, all_pred.astype(np.float32))  # gt is seed-invariant; save pred only (fp32)
+            print(f"[DUMP] pred only (fp32) -> {pred_path}  shape={all_pred.shape}")
+        else:
+            np.save(os.path.join(arrays_dir, "gt_dbz.npy"), all_gt.astype(np.float32))
+            np.save(pred_path, all_pred.astype(np.float32))
         print(f"[ARRAYS] dumped {gt_path}, {pred_path} "
               f"(shape {all_gt.shape}, ~{all_gt.nbytes / 1e9:.2f} GB each)")
 

@@ -25,7 +25,7 @@ export PYTHONUNBUFFERED=1
 FT=/scratch/kl02/$USER/Projv2v/FlowTok
 CFG=$FT/configs/Sat2Radar-i2i-cmp-xattn-B-bl128-cond3nan1_gadi.py
 WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_i2i_cmp_xattn_B_bl128_cond3nan1
-TARGET=200000
+TARGET=600000
 WALL_SEC=$((23*3600))
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs "$WD/ckpts"
 JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_i2i_cmp_xattn_full.log
