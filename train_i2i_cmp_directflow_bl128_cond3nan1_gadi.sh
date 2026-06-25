@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -P kl02
+#PBS -P ui54
 #PBS -q gpuhopper
 #PBS -l walltime=24:00:00
 #PBS -l storage=gdata/kl02+scratch/kl02
@@ -25,7 +25,7 @@ export PYTHONUNBUFFERED=1
 FT=/scratch/kl02/$USER/Projv2v/FlowTok
 CFG=$FT/configs/Sat2Radar-i2i-cmp-directflow-B-bl128-cond3nan1_gadi.py
 WD=/scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_flowtok_i2i_cmp_directflow_B_bl128_cond3nan1
-TARGET=200000
+TARGET=600000
 WALL_SEC=$((23*3600))
 mkdir -p /scratch/kl02/$USER/Projv2v/job_logs "$WD/ckpts"
 JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_i2i_cmp_directflow.log
@@ -49,7 +49,7 @@ if [ "$NEW" -ge "$TARGET" ]; then
   rm -f "$WD/RESUBMIT_STALLED"
   if [ ! -e "$WD/.holdout_queued" ]; then
     touch "$WD/.holdout_queued"
-    cd $FT && qsub holdout_test_i2i_cmp_directflow_bl128_cond3nan1_gadi.sh && echo "queued holdout"
+    cd $FT && qsub -v STEP=600000 holdout_test_i2i_cmp_directflow_bl128_cond3nan1_gadi.sh && echo "queued holdout"
   fi
 elif [ "$RC" = "124" ] || [ "$NEW" -gt "$STEP" ]; then
   echo "progress $STEP->$NEW (rc=$RC), re-qsub"

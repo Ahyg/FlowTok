@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -P kl02
+#PBS -P ui54
 #PBS -q gpuhopper
 #PBS -l walltime=12:00:00
 #PBS -l storage=gdata/kl02+scratch/kl02
@@ -46,6 +46,7 @@ run_test () {
     --split test --mode i2i --filelist_path "$PKL" \
     --max_batches_metrics -1 --max_batches_images 6 \
     --batch_size 16 --metrics_json "$OUT/metrics.json" \
+    --dump_arrays --dump_pred_only --arrays_dir "$OUT/arrays" \
     --gpu "$CUDA_VISIBLE_DEVICES" >> "$JOBLOG" 2>&1
   echo "[$(date '+%F %T')] DONE $TAG" >> "$JOBLOG"
 }

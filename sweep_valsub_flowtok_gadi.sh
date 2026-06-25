@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -P kl02
+#PBS -P ui54
 #PBS -q gpuhopper
 #PBS -l walltime=14:00:00
 #PBS -l storage=gdata/kl02+scratch/kl02
