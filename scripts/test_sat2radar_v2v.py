@@ -511,11 +511,6 @@ def main():
         help="Override config.sample.sample_steps (flow-matching ODE NFE). NFE sweep.",
     )
     parser.add_argument(
-        "--x1_sampler", default="fixed_x0", choices=["fixed_x0", "canonical"],
-        help="radar_tokens(x1)-pred sampler: 'fixed_x0' (legacy=time-AVERAGE of preds, over-smooths) "
-             "| 'canonical' (FM data-prediction step v=(x1-x_t)/(1-t), converges to sharp x1_hat(t~1)).",
-    )
-    parser.add_argument(
         "--x1_snap_t", type=float, default=-1.0,
         help="EXPERIMENT (radar_tokens only): if >=0, OUTPUT the model's predicted clean radar x1_hat "
              "at the first eval node with t>=x1_snap_t (one-shot readout), replacing the rest of the "
@@ -854,7 +849,6 @@ def main():
                 nnet_ema,
                 step_size_type="step_in_dsigma",
                 guidance_scale=guidance_scale,
-                x1_sampler=args.x1_sampler,
                 x1_snap_t=args.x1_snap_t,
             )
             _sample_kwargs = dict(

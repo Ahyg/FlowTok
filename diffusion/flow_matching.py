@@ -452,14 +452,11 @@ class ODEEulerFlowMatchingSolver(Solver):
         self.step_size_type = kwargs.get("step_size_type", "step_in_dsigma")
         assert self.step_size_type in ["step_in_dsigma", "step_in_dt"]
         self.sample_timescale = 1.0 - 1e-5
-        # x1(radar_tokens)-prediction sampler:
-        #   "fixed_x0" (legacy default): velocity = x1_hat - x0_start(frozen) -> Euler telescopes to
-        #       mean_i x1_hat(t_i) (time-AVERAGE of predictions; over-smooths). Kept for back-compat.
-        #   "canonical": numerically-stable data-prediction step = the canonical FM Euler
-        #       v=(x1_hat-x_t)/(1-t), written as x <- x1_hat + ((1-t_next)/(1-t_cur))*(x - x1_hat),
-        #       converging to the sharp x1_hat(t~1). (NOT diffusion DDIM; just the same re-projection form.)
-        self.x1_sampler = kwargs.get("x1_sampler", "fixed_x0")
-        assert self.x1_sampler in ["fixed_x0", "canonical"]
+        # radar_tokens(x1)-prediction integration uses the legacy "fixed_x0" form: velocity =
+        # x1_hat - x0_start(frozen) -> Euler telescopes to mean_i x1_hat(t_i) (time-AVERAGE of
+        # predictions; over-smooths). An earlier opt-in "canonical" sampler was a confirmed no-op
+        # (never read in any integration) and has been retired; use x1_snap_t for a one-shot
+        # sharp x1_hat readout instead.
         # EXPERIMENT (opt-in, eval-only): one-shot clean-radar readout. If x1_snap_t >= 0 and
         # prediction_target=="radar_tokens", at the first model-eval node with t_i >= x1_snap_t we
         # OUTPUT the model's x1_hat (predicted clean radar) directly and stop -- replacing the
@@ -583,8 +580,6 @@ class ODEEulerFlowMatchingSolver(Solver):
 
         self.num_time_steps = kwargs.get("sample_steps")
         self.x_T_uncon = kwargs.get("x_T_uncon")
-        # defensive: honor x1_sampler if passed to sample() too (constructor value preserved otherwise)
-        self.x1_sampler = kwargs.get("x1_sampler", getattr(self, "x1_sampler", "fixed_x0"))
         self.x1_snap_t = float(kwargs.get("x1_snap_t", getattr(self, "x1_snap_t", -1.0)))
         self.prediction_target = kwargs.get("prediction_target", "velocity")
         self.flow_cond_mode = kwargs.get("flow_cond_mode", "none")

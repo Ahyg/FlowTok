@@ -11,12 +11,12 @@
 #PBS -M auhuyg@gmail.com
 #PBS -m abe
 #PBS -N x1snap_fct600
-# Full-set snap099 + canonical inference on the fact-v2v @600k ckpt (current best v2v-fact, avg_fss 0.4787).
-# Two extra samplers vs the standard Euler baseline (test_holdout_600000_nofilt):
-#   snap099   : --x1_snap_t 0.99   (at last step output model's clean-radar x1_hat, skip remaining integration)
-#   canonical : --x1_sampler canonical (FM data-prediction step v=(x1-x_t)/(1-t), converges to sharp x1_hat)
+# Full-set snap099 inference on the fact-v2v @600k ckpt (current best v2v-fact, avg_fss 0.4787).
+# One extra sampler vs the standard Euler baseline (test_holdout_600000_nofilt = fixed_x0):
+#   snap099 : --x1_snap_t 0.99   (at last step output model's clean-radar x1_hat, skip remaining integration)
 # Replicates the production holdout invocation EXACTLY (max_batches_metrics=-1, gen metrics ON, same
-# nofilt filelist/batch); differs ONLY in the sampler flag. Compares each against the Euler baseline.
+# nofilt filelist/batch); differs ONLY in the snap flag. Compares snap099 against the fixed_x0 Euler baseline.
+# (The earlier "canonical" sampler was a confirmed no-op == Euler and has been retired.)
 set -uo pipefail
 export HF_HOME="/scratch/kl02/$USER/hf_cache"; export TRANSFORMERS_CACHE="$HF_HOME"
 export TORCH_HOME="$HF_HOME"; export XDG_CACHE_HOME="$HF_HOME"; export HF_HUB_OFFLINE=1; export WANDB_MODE=disabled
@@ -34,10 +34,9 @@ STEP=600000; MODE=v2v; BS=8
 PKL=$NF/dataset_filelist_v2v_test_202407_202507_nofilter_nan1_clip16.pkl
 
 CKPT=$WD/ckpts/${STEP}.ckpt
-BASE_DIR=$WD/test_holdout_${STEP}_nofilt              # existing Euler baseline (compare target, avg_fss 0.4787)
+BASE_DIR=$WD/test_holdout_${STEP}_nofilt              # existing fixed_x0 Euler baseline (compare target, avg_fss 0.4787)
 SNAP_DIR=$WD/test_holdout_${STEP}_nofilt_snap099      # snap099 output
-CANON_DIR=$WD/test_holdout_${STEP}_nofilt_canonical   # canonical output
-mkdir -p "$SNAP_DIR" "$CANON_DIR" /scratch/kl02/$USER/Projv2v/job_logs
+mkdir -p "$SNAP_DIR" /scratch/kl02/$USER/Projv2v/job_logs
 JOBLOG=/scratch/kl02/$USER/Projv2v/job_logs/${PBS_JOBID}_x1snap_factv2v600k.log
 exec > "$JOBLOG" 2>&1
 cd $FT
@@ -57,7 +56,6 @@ run_one () {  # OUTDIR  EXTRA_FLAG...
 }
 
 run_one "$SNAP_DIR"  --x1_snap_t 0.99
-run_one "$CANON_DIR" --x1_sampler canonical
 
 compare () {  # LABEL SNAPJSON
   echo "[$(date '+%F %T')] === COMPARE $1 vs Euler baseline (fact-v2v @${STEP}) ==="
@@ -94,5 +92,4 @@ for k in sorted(set(gb)|set(gs)):
 PY
 }
 compare "snap099"   "$SNAP_DIR/metrics.json"
-compare "canonical" "$CANON_DIR/metrics.json"
-echo "[$(date '+%F %T')] DONE fact-v2v @${STEP} snap099+canonical"
+echo "[$(date '+%F %T')] DONE fact-v2v @${STEP} snap099"
