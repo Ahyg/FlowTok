@@ -328,7 +328,12 @@ class FlowTok(nn.Module):
             ])
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
         if self.use_cross_attention:
-            self.context_embedder = nn.Linear(config.channels, hidden_size, bias=True)
+            # cond_channels lets the conditioning (sat) tokens have a different channel
+            # width than the radar tokens. Needed for pixel-space ablation ("pixfact"),
+            # where sat patches are C_sat*P^2 (=704) but radar patches are C_radar*P^2 (=64).
+            # Defaults to config.channels -> every existing token-space config unchanged.
+            self.context_embedder = nn.Linear(
+                getattr(config, "cond_channels", config.channels), hidden_size, bias=True)
             _sat_ctx_layers = getattr(config, "sat_context_encoder_layers", 0)
             self.use_sat_context_encoder = _sat_ctx_layers > 0
             if self.use_sat_context_encoder:

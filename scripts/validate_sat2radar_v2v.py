@@ -414,24 +414,34 @@ def main():
     if radar_in_ch is None or radar_out_ch is None:
         radar_in_ch, radar_out_ch = 1, 1
 
-    sat_ae_config = _ae_config(config, sat_in_ch, sat_out_ch)
-    radar_ae_config = _ae_config(config, radar_in_ch, radar_out_ch)
+    if getattr(config, "pixel_space", False):
+        # Ablation 1 ("pixfact"): pixel patchify in place of FlowTiTok (no checkpoint).
+        from libs.patchify_tokenizer import PixelPatchifier
+        _P = int(getattr(config, "patch_size", 8))
+        _crop = int(getattr(config, "ae_image_size", 128))
+        sat_autoencoder = PixelPatchifier(_P, sat_in_ch, crop_size=_crop).to(device)
+        radar_autoencoder = PixelPatchifier(_P, radar_in_ch, crop_size=_crop).to(device)
+        sat_autoencoder.eval(); sat_autoencoder.requires_grad_(False)
+        radar_autoencoder.eval(); radar_autoencoder.requires_grad_(False)
+    else:
+        sat_ae_config = _ae_config(config, sat_in_ch, sat_out_ch)
+        radar_ae_config = _ae_config(config, radar_in_ch, radar_out_ch)
 
-    sat_autoencoder = FlowTiTok(sat_ae_config).to(device)
-    sat_autoencoder.load_state_dict(
-        torch.load(config.sat_tokenizer_checkpoint, map_location="cpu"),
-        strict=False,
-    )
-    sat_autoencoder.eval()
-    sat_autoencoder.requires_grad_(False)
+        sat_autoencoder = FlowTiTok(sat_ae_config).to(device)
+        sat_autoencoder.load_state_dict(
+            torch.load(config.sat_tokenizer_checkpoint, map_location="cpu"),
+            strict=False,
+        )
+        sat_autoencoder.eval()
+        sat_autoencoder.requires_grad_(False)
 
-    radar_autoencoder = FlowTiTok(radar_ae_config).to(device)
-    radar_autoencoder.load_state_dict(
-        torch.load(config.radar_tokenizer_checkpoint, map_location="cpu"),
-        strict=False,
-    )
-    radar_autoencoder.eval()
-    radar_autoencoder.requires_grad_(False)
+        radar_autoencoder = FlowTiTok(radar_ae_config).to(device)
+        radar_autoencoder.load_state_dict(
+            torch.load(config.radar_tokenizer_checkpoint, map_location="cpu"),
+            strict=False,
+        )
+        radar_autoencoder.eval()
+        radar_autoencoder.requires_grad_(False)
 
     clip_encoder, clip_tokenizer = _load_clip_text_encoder(device)
 
@@ -562,7 +572,11 @@ def main():
             else:
                 _flow_cond_mode = getattr(config, "flow_cond_mode", "none")
                 if _flow_cond_mode == "token_concat":
-                    x_T_init = torch.randn_like(sat_tokens)
+                    _c_out = int(config.nnet.model_args.channels)
+                    x_T_init = torch.randn(
+                        sat_tokens.shape[0], sat_tokens.shape[1], _c_out,
+                        device=sat_tokens.device, dtype=sat_tokens.dtype,
+                    )
                 else:
                     x_T_init = x0
                 ode_solver = ODEEulerFlowMatchingSolver(

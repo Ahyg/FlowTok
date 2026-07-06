@@ -1,10 +1,16 @@
 """Diffi2i-style DDPM/DDIM operating on FlowTiTok latent tokens [B, L, C].
 
 Mirrors Diffi2i-shrimp-proj2/src/diffusion.py (linear/cosine schedule,
-q_sample, pred_x0/pred_eps target, DDIM/DDPM reverse). Conditioning is a
-channel-concat of sat tokens with the noisy radar tokens (faithful to Diffi2i's
-`torch.cat((x_t, cond), dim=1)`); the DiT must therefore be built with
-cond_concat_channels=True so in_channels == 2*C and out_channels == C.
+q_sample, pred_x0/pred_eps target, DDIM/DDPM reverse). Conditioning is one of:
+  - "chn_concat" (M3): channel-concat sat with noisy radar (Diffi2i-faithful);
+    the DiT must be built with cond_concat_channels=True (in_channels == 2*C).
+  - "token_concat" (M5): seq-concat [sat | radar_t]; supervise the radar half.
+  - "cross_attention": sat tokens enter the DiT via cross-attention (queries from
+    radar, keys/values from sat) -- the fact-v2v conditioning. The DiT is built
+    exactly like the flow fact-v2v model (in_channels == C, use_cross_attention=True,
+    optionally use_factorized_attn=True); this is the "flow -> diu-DDPM" leave-one-out
+    ablation of fact-v2v (only the generative algorithm changes; DiT/tokenizer/cross-
+    attn/v2v are untouched).
 
 Opt-in only: selected via config.generation_algorithm == "diffusion". The flow
 path is untouched, so existing runs/ckpts are unaffected.
@@ -26,7 +32,7 @@ class TokenDiffusion(nn.Module):
         # cond_mode == "chn_concat" (M3): inp = cat([z_t, cond], dim=-1) -> [B,L,2C]
         # cond_mode == "token_concat" (M5): inp = cat([cond, z_t], dim=1)  -> [B,2L,C],
         # output's radar half (last L tokens) is supervised.
-        assert cond_mode in ("chn_concat", "token_concat")
+        assert cond_mode in ("chn_concat", "token_concat", "cross_attention")
         self.T = int(train_timesteps)
         self.schedule, self.target, self.gamma = schedule, target, gamma
         self.cond_mode = cond_mode
@@ -67,10 +73,12 @@ class TokenDiffusion(nn.Module):
         if self.cond_mode == "chn_concat":
             inp = torch.cat([z_t, cond], dim=-1)            # [B,L,2C]
             pred = nnet(inp, t=t_cont, null_indicator=null_ind)[0]
-        else:  # token_concat
+        elif self.cond_mode == "token_concat":
             inp = torch.cat([cond, z_t], dim=1)             # [B,2L,C], sat first
             pred_full = nnet(inp, t=t_cont, null_indicator=null_ind)[0]
             pred = pred_full[:, L:, :]                      # supervise radar half only
+        else:  # cross_attention: sat as context; supervise all L radar tokens
+            pred = nnet(z_t, t=t_cont, null_indicator=null_ind, context=cond)[0]
         target = z1 if self.target == "pred_x0" else eps
         ld = (0.5 * (pred - target).pow(2).flatten(1).mean(dim=-1)).mean()
         zero = z1.new_zeros([])
@@ -89,10 +97,13 @@ class TokenDiffusion(nn.Module):
             if self.cond_mode == "chn_concat":
                 out = nnet(torch.cat([z, cond], dim=-1),
                            t=ts_b.float() / self.T, null_indicator=null_ind)[0]
-            else:  # token_concat: [sat | radar_t] -> take radar half of output
+            elif self.cond_mode == "token_concat":  # [sat | radar_t] -> radar half
                 out_full = nnet(torch.cat([cond, z], dim=1),
                                 t=ts_b.float() / self.T, null_indicator=null_ind)[0]
                 out = out_full[:, L:, :]
+            else:  # cross_attention: sat as context, z is radar-only
+                out = nnet(z, t=ts_b.float() / self.T,
+                           null_indicator=null_ind, context=cond)[0]
             if self.target == "pred_x0":
                 pred_x0 = out
                 pred_eps = (z - self._a(ts_b) * pred_x0) / self._s(ts_b).clamp(min=1e-6)

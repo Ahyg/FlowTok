@@ -535,26 +535,38 @@ def train(config):
             cfg.ae_image_size = ae_img_size
         return cfg
 
-    sat_ae_config = _ae_config(config, role="sat")
-    radar_ae_config = _ae_config(config, role="radar")
+    if getattr(config, "pixel_space", False):
+        # Ablation 1 ("pixfact"): bypass the learned FlowTiTok tokenizer with a
+        # parameter-free, exactly-invertible pixel patchify/unpatchify (no checkpoint).
+        from libs.patchify_tokenizer import PixelPatchifier
+        _P = int(getattr(config, "patch_size", 8))
+        _crop = int(getattr(config, "ae_image_size", 128))
+        sat_autoencoder = PixelPatchifier(_P, getattr(config, "sat_in_channels", 11), crop_size=_crop)
+        radar_autoencoder = PixelPatchifier(_P, getattr(config, "radar_in_channels", 1), crop_size=_crop)
+        sat_autoencoder.eval(); sat_autoencoder.requires_grad_(False); sat_autoencoder.to(device)
+        radar_autoencoder.eval(); radar_autoencoder.requires_grad_(False); radar_autoencoder.to(device)
+        logging.info(f"[pixfact] pixel-space patchify P={_P} (sat C=11, radar C=1); FlowTiTok bypassed.")
+    else:
+        sat_ae_config = _ae_config(config, role="sat")
+        radar_ae_config = _ae_config(config, role="radar")
 
-    sat_autoencoder = FlowTiTok(sat_ae_config)
-    sat_autoencoder.load_state_dict(
-        torch.load(config.sat_tokenizer_checkpoint, map_location="cpu"),
-        strict=False,
-    )
-    sat_autoencoder.eval()
-    sat_autoencoder.requires_grad_(False)
-    sat_autoencoder.to(device)
+        sat_autoencoder = FlowTiTok(sat_ae_config)
+        sat_autoencoder.load_state_dict(
+            torch.load(config.sat_tokenizer_checkpoint, map_location="cpu"),
+            strict=False,
+        )
+        sat_autoencoder.eval()
+        sat_autoencoder.requires_grad_(False)
+        sat_autoencoder.to(device)
 
-    radar_autoencoder = FlowTiTok(radar_ae_config)
-    radar_autoencoder.load_state_dict(
-        torch.load(config.radar_tokenizer_checkpoint, map_location="cpu"),
-        strict=False,
-    )
-    radar_autoencoder.eval()
-    radar_autoencoder.requires_grad_(False)
-    radar_autoencoder.to(device)
+        radar_autoencoder = FlowTiTok(radar_ae_config)
+        radar_autoencoder.load_state_dict(
+            torch.load(config.radar_tokenizer_checkpoint, map_location="cpu"),
+            strict=False,
+        )
+        radar_autoencoder.eval()
+        radar_autoencoder.requires_grad_(False)
+        radar_autoencoder.to(device)
 
     # ========= Text guidance encoder for FlowTiTok decoder（基于文件名的弱描述）=========
     clip_model_name = "ViT-L-14-336"
@@ -1288,7 +1300,14 @@ def train(config):
                 _flow_cond_mode = getattr(config, "flow_cond_mode", "none")
                 _is_tc = _flow_cond_mode in ("token_concat", "token_concat_interleaved", "token_concat_modality", "cross_attention")
                 if _is_tc:
-                    x_T_init = torch.randn_like(sat_tokens)
+                    # Init noise with the RADAR/output token dim, not sat's: sat & radar
+                    # token dims differ in pixel-space ("pixfact", sat=C_sat*P^2 vs radar=C_radar*P^2).
+                    # For token models sat-dim==channels so this is shape-identical to before.
+                    _c_out = int(config.nnet.model_args.channels)
+                    x_T_init = torch.randn(
+                        sat_tokens.shape[0], sat_tokens.shape[1], _c_out,
+                        device=sat_tokens.device, dtype=sat_tokens.dtype,
+                    )
                 else:
                     x_T_init = x0
                 ode_solver = ODEEulerFlowMatchingSolver(
