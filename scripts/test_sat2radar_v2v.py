@@ -1340,7 +1340,7 @@ def main():
         else:
             np.save(os.path.join(arrays_dir, "gt_dbz.npy"), all_gt.astype(np.float32))
             np.save(pred_path, all_pred.astype(np.float32))
-        print(f"[ARRAYS] dumped {gt_path}, {pred_path} "
+        print(f"[ARRAYS] dumped -> {arrays_dir} "
               f"(shape {all_gt.shape}, ~{all_gt.nbytes / 1e9:.2f} GB each)")
 
     print(f"\nSaved sat2radar {args.mode} predictions to {args.out_dir}")

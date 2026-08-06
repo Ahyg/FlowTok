@@ -1,0 +1,6 @@
+[gt] i2i/nofilt ready: shape=(46400, 128, 128)
+[pred] /scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_diffi2i_i2i_diu_full_ir320/models/xmode_arrays_diu-i2i-full_ir320_ns20/pred_dbz.npy shape=(46400, 128, 128)
+/scratch/kl02/yh0308/miniconda3/envs/flowtok/lib/python3.10/site-packages/torchmetrics/utilities/prints.py:43: UserWarning: Metric `Kernel Inception Distance` will save all extracted features in buffer. For large datasets this may lead to large memory footprint.
+  warnings.warn(*args, **kwargs)
+[compute] i2i/nofilt added={'fvd': 7.104353427886963, 'kvd': {'mean': 0.005832905415445566, 'std': 0.003602855373173952}, 'tc_dbz_sq': 8.798620996650609, 'tc_count_pairs': 43500} (275s)
+[merge] /scratch/kl02/yh0308/Projv2v/Experiments/sat2radar_diffi2i_i2i_diu_full_ir320/models/test_holdout_metrics_diu-i2i-full_ir320_step600000_ns20_nofilt.json  +['fvd', 'kvd', 'tc_count_pairs', 'tc_dbz_sq']
