@@ -33,12 +33,19 @@ except ImportError:
     i3d_r50 = None
 
 try:
-    from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+    from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
     RAFT_OK = True
 except ImportError:
     RAFT_OK = False
-    raft_small = None
-    Raft_Small_Weights = None
+    raft_large = None
+    Raft_Large_Weights = None
+
+# --- canonical replacements for the previously non-standard sFID / FVD backbones ---
+# (sibling modules in this dir; make sure this dir is importable regardless of cwd)
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _sfid_features import SpatialInceptionFeatures   # true spatial-FID (ADM/Nash), 2023-d
+from _fvd_i3d import I3DCanonicalFeatures              # canonical Kinetics I3D (i3d_torchscript.pt), 400-d
 
 
 I3D_MIN_T = 8  # I3D-R50 temporal max-pool needs T >= 8
@@ -119,9 +126,13 @@ def make_i2i_metrics(
     if use_fid:
         out["fid"] = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
     if use_sfid:
-        # sFID: FID computed on InceptionV3 intermediate (smaller, spatially-preserving)
-        # feature pool, following the DiT / ADM convention.
-        out["sfid"] = FrechetInceptionDistance(feature=192, normalize=True).to(device)
+        # sFID (spatial FID, Nash et al. 2021 / ADM guided-diffusion): Frechet distance on
+        # the intermediate SPATIAL Inception activation (Mixed_6d = TF mixed_6/conv, first 7
+        # channels, 17x17 grid, flattened WITHOUT global pooling -> 2023-d). Reuses the same
+        # cached FID Inception weights. (Was FrechetInceptionDistance(feature=192) — a shallow
+        # globally-pooled stem vector that is NOT spatial-FID.)
+        out["sfid"] = FrechetInceptionDistance(
+            feature=SpatialInceptionFeatures(), normalize=True).to(device)
     if use_kid:
         out["kid"] = KernelInceptionDistance(
             feature=2048, normalize=True,
@@ -141,11 +152,11 @@ def make_v2v_metrics(
     if not TORCHMETRICS_OK:
         warnings.warn("torchmetrics missing — v2v FVD/KVD disabled")
         return {}
-    if not PYTORCHVIDEO_OK:
-        warnings.warn("pytorchvideo missing — v2v FVD/KVD disabled")
-        return {}
-    # Single shared I3D backbone for both metrics (saves GPU memory & weight loading)
-    i3d = I3DFeatures().to(device)
+    # Canonical Kinetics-400 I3D (i3d_torchscript.pt) — the de-facto FVD network (StyleGAN-V /
+    # common_metrics_on_video_quality), 400-d features, shared by FVD & KVD. Replaces the
+    # non-canonical pytorchvideo I3D-ResNet-50 (2048-d, not literature-comparable). No
+    # pytorchvideo dependency needed anymore.
+    i3d = I3DCanonicalFeatures().to(device)
     out: Dict[str, object] = {"_i3d": i3d}
     if use_fvd:
         out["fvd"] = FrechetInceptionDistance(feature=i3d, normalize=True).to(device)
@@ -170,9 +181,11 @@ class TemporalConsistency:
             raise RuntimeError("torchvision RAFT not available")
         self.device = device
         self.dbz_scale = dbz_scale
-        weights = Raft_Small_Weights.DEFAULT
+        # RAFT-large (C_T_V2, Chairs+Things — same training lineage as the previous raft_small
+        # C_T_V2, just the larger/more-accurate optical-flow model) for temporal-consistency flow.
+        weights = Raft_Large_Weights.C_T_V2
         self.transforms = weights.transforms()
-        m = raft_small(weights=weights, progress=False)
+        m = raft_large(weights=weights, progress=False)
         m.train(False)
         for p in m.parameters():
             p.requires_grad_(False)
